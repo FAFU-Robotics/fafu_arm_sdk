@@ -1,0 +1,12 @@
+# Runtime dependencies for fafu_robot_sdk
+#
+# - numpy: 用于 get_joint_values()/get_joint_velocities() 返回 ndarray, 以及
+#          move_jntspace_path 的 path 数组校验.
+# - pybind11: 只有当你要重新构建 fafu_motor*.pyd 时才需要. 仅用 SDK
+#             (即 .pyd 已经在仓库里) 不需要装.
+#
+# 可选 (按需):
+#   wrs                 : 启用 move_jntspace_path 的 TOPPRA 时间最优插值
+#   pinocchio / kdl      : 自行接入 IK/FK 后让 move_p / move_l 可用
+numpy>=1.19
+pybind11>=2.10

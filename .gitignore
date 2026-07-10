@@ -1,0 +1,47 @@
+# =============================================================================
+# fafu_arm_sdk .gitignore
+# 说明: 运行时分发产物 (fafu_motor.cp*-win_amd64.pyd 与 serial_cmake.dll)
+#       是本仓库的一部分, 特意 *不* 忽略.
+# =============================================================================
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+*.pyo
+*$py.class
+
+# ---- 构建目录 (build/, build38/, build310/, build-py310/, build_linux/ ...) ----
+build*/
+**/build*/
+
+# ---- MSVC / CMake 中间产物 ----
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.lib
+*.tlog
+*.recipe
+*.lastbuildstate
+
+# ---- IDE / 编辑器 ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# ---- 运行时生成数据 ----
+fafu_robot_python/tests/recordings/
+
+# ---- 日志 / 临时 / 系统 ----
+*.log
+*.tmp
+*.bak
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

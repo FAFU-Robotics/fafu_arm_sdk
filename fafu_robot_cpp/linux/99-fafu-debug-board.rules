@@ -1,0 +1,46 @@
+# =============================================================================
+#  99-fafu-debug-board.rules
+#
+#  把调试板 USB 串口固定到 /dev/fafu_debug_board, 设置全用户可读写.
+#
+#  装完后:
+#    - robot.cfg 里可以写 port = /dev/fafu_debug_board, 换 USB 口不用改配置
+#    - 不需要 sudo 就能打开串口 (MODE=0666)
+#    - 用户即使没加入 dialout 组也能用
+#
+#  覆盖的 USB VID (常见 USB-Serial 桥芯片):
+#    0483  ST Micro (STM32 内置 USB-CDC) ← Fafu 调试板用这个
+#    0403  FTDI
+#    1a86  WinChipHead (CH340 / CH341)
+#    10c4  Silicon Labs (CP2102 / CP2104)
+#    067b  Prolific (PL2303)
+#
+#  如果你的调试板 VID 不在上面:
+#      lsusb                     # 看 ID 字段的前 4 位
+#      udevadm info -a -n /dev/ttyUSB0 | grep -m1 idVendor
+#  然后照葫芦画瓢加一行, 重跑 setup_udev.sh.
+#
+#  安装:  bash linux/setup_udev.sh
+#  卸载:  bash linux/setup_udev.sh --uninstall
+# =============================================================================
+
+# --- ST Micro (STM32 USB-CDC) ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"
+
+# --- FTDI ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"
+
+# --- CH340 / CH341 ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"
+
+# --- Silicon Labs CP210x ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"
+
+# --- Prolific PL2303 ---
+SUBSYSTEM=="tty", ATTRS{idVendor}=="067b", MODE="0666", GROUP="dialout", SYMLINK+="fafu_debug_board", TAG+="uaccess"
+
+# 说明:
+#   MODE=0666       — 任何用户都能读写, 不必加 dialout 组
+#   GROUP=dialout   — 双保险, 已在 dialout 组的用户也能正常工作
+#   SYMLINK         — 创建固定路径 /dev/fafu_debug_board → /dev/ttyUSBx
+#   TAG=uaccess     — systemd-logind 会授给"当前登录用户"独占访问 (POLKIT)
