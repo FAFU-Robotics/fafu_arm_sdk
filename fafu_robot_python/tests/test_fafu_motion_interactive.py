@@ -383,6 +383,7 @@ class App:
         #   "movej"  -> move_j 固件位置模式, 固定用 linear (官方 jointsSyncArrival
         #               风格, 多次实测重复精度好); 默认.
         #   "mithold"-> MIT(servo_j) 逼近后持续发帧保持, Ctrl+C -> 刹车.
+        #   "servoj" -> servo_j 流式逼近目标, 到位后结束会话 (不持续保持).
         self.move_mode = "movej"
         # 示教: 最近一次录制的轨迹文件路径 (jsonl), 供 [p] 复现默认使用
         self.taught_file: Optional[str] = None
@@ -477,19 +478,33 @@ class App:
         - mithold: MIT(servo_j, kp/kd + 重力前馈) 逼近后 **持续发帧保持**
                    (~100Hz 不停发), 靠不断刷新维持位置. 保持直到 Ctrl+C,
                    **暂停后进入刹车模式 (阻尼保持)**.
+        - servoj : servo_j (~100Hz, use_mit=False / 0x8090) 流式逼近,
+                   结束后 move_j(linear) 回锁持稳 (0x8090 停发会下垂, 不能只消看门狗).
+        - servohold: servo_j (~100Hz, use_mit=False / 0x8090) 流式逼近, 到位后
+                   **持续发位置帧保持** (不停刷新喂看门狗). Ctrl+C 结束 -> 清看门狗
+                   留在 0x0A 保持最后一帧 (位置环带积分, 不残留 0x0B).
         """
         cur = self.move_mode
-        default_map = {"movej": "1", "mithold": "2"}
+        default_map = {"movej": "1", "mithold": "2", "servoj": "3",
+                       "servohold": "4"}
         default_tag = default_map.get(cur, "1")
         s = prompt(f"  控制模式 [1] moveJ(linear)  "
-                   f"[2] MIT持续保持(Ctrl+C->刹车) (默认 {default_tag}): ").strip()
+                   f"[2] MIT持续保持(Ctrl+C->刹车)  "
+                   f"[3] ServoJ(到位结束)  "
+                   f"[4] ServoJ持续保持(Ctrl+C结束) (默认 {default_tag}): ").strip()
         if s == "1":
             self.move_mode = "movej"
         elif s == "2":
             self.move_mode = "mithold"
+        elif s == "3":
+            self.move_mode = "servoj"
+        elif s == "4":
+            self.move_mode = "servohold"
         # 其它输入(含回车) -> 沿用上次
         tag = {"movej": "moveJ(linear)",
-               "mithold": "MIT(持续保持->刹车)"}[self.move_mode]
+               "mithold": "MIT(持续保持->刹车)",
+               "servoj": "ServoJ(到位结束)",
+               "servohold": "ServoJ(持续保持->0x0A)"}[self.move_mode]
         print(f"  -> 使用 {tag}")
         return self.move_mode
 
@@ -497,10 +512,16 @@ class App:
         """按指定模式移动到目标关节角 (target_rad: 弧度数组).
 
         - "mithold"-> MIT 逼近 + 到位后持续发帧保持 (Ctrl+C 结束 -> 刹车保持);
+        - "servoj" -> servo_j 流式逼近, 到位后结束会话;
+        - "servohold"-> servo_j 位置通道逼近 + 到位后持续发位置帧保持 (Ctrl+C 结束);
         - 其它("movej") -> move_j 固件位置模式, 固定 linear 风格.
         """
         if mode == "mithold":
             self._move_MIT_to(target_rad, speed)
+        elif mode == "servoj":
+            self._move_servo_j_to(target_rad, speed)
+        elif mode == "servohold":
+            self._move_servo_hold_to(target_rad, speed)
         else:
             self.arm.move_j(target_rad, is_radians=True, speed=speed,
                             block=True, style="linear")
@@ -580,6 +601,168 @@ class App:
         print("  已结束保持, 进入刹车模式. 继续运动前请先 [y] 软重启 / [r] 恢复 / [h] 回零.")
         return True
 
+    def _move_servo_j_to(self, target_rad, speed: int) -> bool:
+        """ServoJ 到位结束: servo_j (~100Hz, use_mit=False / 0x8090) 流式逼近,
+        清看门狗结束会话后, 再用 move_j(linear) 回锁目标持稳.
+
+        为何不能只消看门狗就停:
+          0x8090 (pos_vel_MAXtqe) 是**流式**通道且无积分; 停发帧后重关节
+          (J2/J3) 在重力下会下垂. move_j(linear) 会持续发最终目标直到到位,
+          固件位置环才能稳住 — 这和 [1] moveJ 持稳方式一致.
+        """
+        from fafu_robot_controller import ServoOpts
+
+        target = np.asarray(target_rad, dtype=float)
+        q0 = np.asarray(self.arm.get_joint_values(), dtype=float)
+        max_dq = float(np.max(np.abs(target - q0)))
+        if max_dq < math.radians(0.1):
+            print("  已在目标位姿附近, 无需移动")
+            return True
+
+        rate = 100.0
+        vel_rad_s = max(0.05, (speed / 100.0) * math.radians(90.0))
+        opts = ServoOpts(
+            watchdog_ms=100, rate_hz=rate,
+            max_vel=vel_rad_s,
+            max_step_rad=vel_rad_s / rate,
+            max_lag_rad=math.radians(30.0),
+            is_radians=True,
+            use_mit=False,                          # 与 move_j 同通道 (0x8090)
+            # ★ 关键: 关掉速度前馈 (见 _move_servo_hold_to 说明). feedforward_vel=True
+            #   在 commanded 目标追上终点后会把 vel 归零, 本固件 0x8090 里 vel=0 = "别动",
+            #   导致电机冻在物理滞后处到不了位. =False -> 每拍恒定 max_vel 持续驱动到位.
+            feedforward_vel=False,
+        )
+        dt = 1.0 / rate
+        tol = math.radians(2.0)
+        deadline = time.monotonic() + max(5.0, max_dq / vel_rad_s + 3.0)
+
+        print(f"  servo_j(pos/0x8090) 逼近目标 (speed={speed}%, "
+              f"~{math.degrees(vel_rad_s):.0f}°/s) -> 结束会话后 move_j 回锁")
+        self.arm.servo_start(opts)
+        settle = 0
+        reached = False
+        try:
+            while True:
+                self.arm.servo_j(target)
+                # ★ 必须用缓存 (async_rx 维护): 若在这里做阻塞 read_motor_state,
+                #   循环周期会超过 watchdog_ms, 固件看门狗在两帧之间刹车 ->
+                #   剧烈抖动 + 重关节爬不动. 缓存读几乎零耗时, 循环保持 ~100Hz.
+                cur = np.asarray(
+                    self.arm.get_joint_values(prefer_cache=True), dtype=float)
+                near = float(np.max(np.abs(cur - target))) <= tol
+                settle = settle + 1 if near else 0
+                if settle >= 5:
+                    reached = True
+                    # 到位后再流式钉住一小段, 减少立刻清看门狗时的瞬时下垂
+                    hold_until = time.monotonic() + 0.3
+                    while time.monotonic() < hold_until:
+                        self.arm.servo_j(target)
+                        time.sleep(dt)
+                    break
+                if time.monotonic() > deadline:
+                    print("  逼近超时, 结束 ServoJ 会话并改用 move_j 回锁")
+                    break
+                time.sleep(dt)
+        except KeyboardInterrupt:
+            print("\n  [中断 ServoJ]")
+        finally:
+            # 只清看门狗 + 结束会话; 真正持稳交给下面的 move_j
+            self.arm.servo_end("hold")
+
+        # ★ servo_end 的 set_timeout(mid,0) 是即发即忘, 重关节上可能残留
+        #   ~100ms 看门狗; 若紧接着 move_j (发帧+阻塞读, 间隙偶尔>100ms) 就会
+        #   被看门狗刹车 -> J4 下垂 / J2/J3 不动. 这里显式再清一遍所有关节看门狗
+        #   并停顿, 让残留看门狗彻底失效后再回锁 (等效于隔几秒手动按 [1] moveJ).
+        for mid in self.arm.joint_motor_ids:
+            try:
+                self.arm._ht.set_timeout(mid, 0)
+            except Exception:
+                pass
+        time.sleep(0.5)
+
+        print("  ServoJ 逼近结束, move_j(linear) 回锁目标持稳 ...")
+        try:
+            self.arm.move_j(target, is_radians=True, speed=speed,
+                            block=True, style="linear")
+        except Exception as e:
+            print(f"  move_j 回锁失败: {e}")
+            return False
+        if not reached:
+            print("  (ServoJ 段未完全到位, 已由 move_j 补到位)")
+        return True
+
+    def _move_servo_hold_to(self, target_rad, speed: int) -> bool:
+        """ServoJ 持续保持: servo_j (~100Hz, use_mit=False / 0x8090 位置通道)
+        流式逼近目标, 到位后 **持续发位置帧保持** (不停刷新喂看门狗 -> 不被刹车,
+        重关节靠固件位置环顶住). 保持期间每秒打印一次当前角度. 一直保持到用户
+        按 Ctrl+C; 结束时 servo_end('hold') 清看门狗并留在位置模式 (0x0A) 保持
+        最后一帧 (位置环带积分, 不残留 0x0B, 后续 moveJ/回零可直接用).
+
+        与 [2] MIT持续保持的区别: 走 move_j 同一条位置通道 (非 MIT), 结束后
+        直接 0x0A 持稳, 不进刹车、不残留 0x0B, 无需 [y] 软重启.
+        """
+        from fafu_robot_controller import ServoOpts
+
+        target = np.asarray(target_rad, dtype=float)
+        q0 = np.asarray(self.arm.get_joint_values(), dtype=float)
+        max_dq = float(np.max(np.abs(target - q0)))
+
+        rate = 100.0
+        vel_rad_s = max(0.05, (speed / 100.0) * math.radians(90.0))
+        opts = ServoOpts(
+            watchdog_ms=100, rate_hz=rate,
+            max_vel=vel_rad_s,
+            max_step_rad=vel_rad_s / rate,
+            max_lag_rad=math.radians(30.0),
+            is_radians=True,
+            use_mit=False,                          # 与 move_j 同通道 (0x8090)
+            # ★ 关键: 关掉速度前馈. feedforward_vel=True 时, 一旦 commanded 目标
+            #   追上终点, vel=(target-filtered)/dt -> 0; 而本固件 0x8090 里 vel 是
+            #   驱动/限速项, vel=0 = "别动", 电机会冻在物理滞后处(到不了位).
+            #   =False -> 每拍发恒定 max_vel, 像 move_j 一样持续驱动到位.
+            feedforward_vel=False,
+        )
+        dt = 1.0 / rate
+        tol = math.radians(2.0)
+        deadline = time.monotonic() + max(5.0, max_dq / vel_rad_s + 3.0)
+
+        print(f"  servo_j(pos/0x8090) 逼近目标 (speed={speed}%, "
+              f"~{math.degrees(vel_rad_s):.0f}°/s) -> 到位后持续发帧保持")
+        self.arm.servo_start(opts)
+        settle = 0
+        reached = False
+        last_report = 0.0
+        try:
+            while True:
+                self.arm.servo_j(target)
+                cur = np.asarray(
+                    self.arm.get_joint_values(prefer_cache=True), dtype=float)
+                near = float(np.max(np.abs(cur - target))) <= tol
+                settle = settle + 1 if near else 0
+                # 连续接近几拍 = 到位; 逼近超时也算到位, 都转入持续保持
+                if not reached and (settle >= 5 or time.monotonic() > deadline):
+                    reached = True
+                    head = "已到位" if settle >= 5 else "逼近超时, 转为"
+                    print(f"  {head} 持续发位置帧保持中 (0x8090, ~100Hz). "
+                          "按 Ctrl+C 结束 -> 留在位置模式(0x0A)保持")
+                    last_report = time.monotonic()
+                if reached:
+                    now = time.monotonic()
+                    if now - last_report >= 1.0:
+                        last_report = now
+                        print(f"  [保持中] 当前 (deg): {deg_str(cur)}")
+                time.sleep(dt)
+        except KeyboardInterrupt:
+            print("\n  [结束保持]")
+        finally:
+            # 位置通道结束: servo_end('hold') 清看门狗 + 留在 0x0A 保持最后一帧.
+            # 与 MIT 不同, 这里不残留 0x0B, 后续 moveJ/回零可直接用.
+            self.arm.servo_end("hold")
+
+        print("  已结束保持, 停在位置模式(0x0A). 可直接 [h] 回零 / 继续运动.")
+        return True
+
     def move_one_joint(self):
         n = self.arm.num_joints
         s = prompt(f"  动哪个关节 (0..{n - 1}, 默认 {n - 1}): ")
@@ -616,7 +799,9 @@ class App:
         time.sleep(0.2)
         q1 = self.arm.get_joint_values()
         err = math.degrees(q1[idx] - target[idx])
-        tag = "MIT-hold" if mode == "mithold" else "moveJ:linear"
+        tag = {"mithold": "MIT-hold", "servoj": "ServoJ",
+               "servohold": "ServoJ-hold",
+               "movej": "moveJ:linear"}.get(mode, mode)
         print(f"  到位 (deg): {deg_str(q1)}  关节 {idx} 误差 {err:+.3f}° [{tag}]")
 
     # ----- 多关节运动 -----
@@ -650,9 +835,78 @@ class App:
             print(f"  [失败] {e}"); return
         time.sleep(0.2)
         q1 = self.arm.get_joint_values()
-        tag = "MIT-hold" if mode == "mithold" else "moveJ:linear"
+        tag = {"mithold": "MIT-hold", "servoj": "ServoJ",
+               "servohold": "ServoJ-hold",
+               "movej": "moveJ:linear"}.get(mode, mode)
         print(f"  到位 (deg): {deg_str(q1)}  [{tag}]")
         print(f"  各关节误差 (deg): {deg_str(np.asarray(q1) - np.asarray(target))}")
+
+    # ----- 关节空间路径 (move_jntspace_path) -----
+
+    def move_jntspace_path_menu(self):
+        """输入多组关节角度, 用 move_jntspace_path 按序经过, 停在最后一点并打印误差."""
+        n = self.arm.num_joints
+        print(f"\n  关节空间路径 (move_jntspace_path / TOPPRA + move_j)")
+        print(f"  每行输入 {n} 个角度 (度, 空格或逗号分隔); 至少 1 组.")
+        print("  空行结束输入.")
+
+        waypoints_deg: List[List[float]] = []
+        while True:
+            s = prompt(f"  路径点 {len(waypoints_deg) + 1}> ")
+            if not s:
+                break
+            try:
+                vals = parse_floats(s)
+            except ValueError as e:
+                print(f"  {e}; 重新输入该点"); continue
+            if len(vals) != n:
+                print(f"  需要 {n} 个值, 给了 {len(vals)} 个; 重新输入该点")
+                continue
+            waypoints_deg.append(vals)
+
+        if not waypoints_deg:
+            print("  未输入任何路径点, 取消."); return
+
+        s = prompt(f"  speed (默认 {self.default_speed}): ")
+        speed = int(s) if s else self.default_speed
+
+        print(f"\n  共 {len(waypoints_deg)} 个路径点:")
+        for i, wp in enumerate(waypoints_deg, 1):
+            print(f"    [{i}] {deg_str(np.radians(wp))}")
+        q0 = self.arm.get_joint_values()
+        print(f"  当前 (deg): {deg_str(q0)}")
+        print(f"  终点 (deg): {deg_str(np.radians(waypoints_deg[-1]))}")
+        if not yes(prompt("  执行? [Y/n]: ")):
+            print("  取消."); return
+
+        # 当前位姿接到路径前, 让 TOPPRA 从实际起点平滑起步;
+        # start_frame_id=1 跳过插值后的首帧 (即当前位姿附近).
+        path = np.vstack([
+            np.asarray(q0, dtype=float),
+            np.radians(np.asarray(waypoints_deg, dtype=float)),
+        ])
+        goal = path[-1].copy()
+
+        try:
+            self.arm.move_jntspace_path(
+                path, is_radians=True, speed=speed, start_frame_id=1)
+        except NotImplementedError as e:
+            print(f"  [失败] TOPPRA/wrs 不可用: {e}")
+            print("         请安装 wrs, 或改用 [a] 逐点 move_j.")
+            return
+        except Exception as e:
+            traceback.print_exc()
+            print(f"  [失败] {e}"); return
+
+        # 流式 move_j(block=False) 结束后稍等到位再读反馈
+        time.sleep(0.4)
+        _refresh_all_motor_states(self.arm)
+        q1 = self.arm.get_joint_values()
+        err = np.asarray(q1, dtype=float) - goal
+        print(f"  到位 (deg): {deg_str(q1)}  [move_jntspace_path]")
+        print(f"  目标终点 (deg): {deg_str(goal)}")
+        print(f"  各关节误差 (deg): {deg_str(err)}")
+        print(f"  最大 |误差|: {math.degrees(float(np.max(np.abs(err)))):+.3f}°")
 
     def go_home(self):
         s = prompt(f"  speed (默认 {self.default_speed}): ")
@@ -1538,8 +1792,9 @@ MENU = """
 |  FafuRobotController 交互式测试                  |
 +--------------------------------------------------+
   [s]  显示当前状态 (角度 / 速度 / 夹爪 / 统计)
-  [j]  单关节移动 (选编号 + 目标角度; 控制模式 moveJ(linear) / MIT持续保持)
-  [a]  全部关节移动 (输入 N 个角度; 控制模式 moveJ(linear) / MIT持续保持)
+  [j]  单关节移动 (选编号 + 目标角度; 模式 moveJ / MIT保持 / ServoJ / ServoJ保持)
+  [a]  全部关节移动 (输入 N 个角度; 模式 moveJ / MIT保持 / ServoJ / ServoJ保持)
+  [w]  关节路径 (多组角度 -> move_jntspace_path 按序经过, 停终点并打印误差)
   [y]  软重启 (motor_reset 所有关节电机 + 切回位置模式; MIT保持后用它复位)
   [h]  回零 (go_home)
   [g]  夹爪子菜单
@@ -1652,6 +1907,8 @@ def main() -> int:
                 app.move_one_joint()
             elif cmd in ("a", "all"):
                 app.move_all_joints()
+            elif cmd in ("w", "path", "waypoints"):
+                app.move_jntspace_path_menu()
             elif cmd == "y":
                 app.soft_reboot()
             elif cmd in ("h", "home"):

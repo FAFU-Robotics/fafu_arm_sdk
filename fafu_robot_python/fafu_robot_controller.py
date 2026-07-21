@@ -489,8 +489,21 @@ class FafuRobotController:
 
         # Order is significant: set_motor_mode MUST run before
         # enable_async_rx so that the SDK can verify the mode echo.
+        #
+        # enable() failure is NON-FATAL at construction: if a few motors
+        # are stuck (e.g. MIT 0x0B that only a hard power-cycle clears),
+        # crashing here locks the user out of the menu entirely — they
+        # can't even run diagnostics, retry, or operate the other joints.
+        # So warn loudly and continue; the offending joints simply won't
+        # move until recovered ([y] soft-reboot / power-cycle).
         if auto_enable:
-            self.enable()
+            try:
+                self.enable()
+            except Exception as e:
+                print(f"[FafuRobot] warning: enable() failed at startup: {e}")
+                print("[FafuRobot] continuing anyway so you can run diagnostics "
+                      "/ operate other joints; stuck joints won't move until "
+                      "recovered.")
 
         use_async = async_rx if async_rx is not None else bool(cfg.use_async_rx)
         if use_async:
@@ -726,20 +739,75 @@ class FafuRobotController:
                     self._ht.motor_reset(mid)
                 except Exception as e:
                     print(f"  motor {mid}: motor_reset failed: {e}")
-            # 重启期间电机三相悬空 (进入 STOP), 机械臂自由下垂 -> settle 越短掉得越少.
-            # 实测 ~0.6s 足够软重启完成; 若个别电机还没起来, 下面的 _switch_mode_all
-            # 带 3 次重试兜底.
-            time.sleep(0.6)
+            # 与 stage-2 一致用 1.0s: 上次日志 J2/J3/J4 在 0.6s 后仍卡在 0x0B.
+            time.sleep(1.0)
             if self._switch_mode_all(self.MODE_POSITION,
                                      label="position (post-MIT-reset)", max_retry=3):
                 time.sleep(0.05)
                 print("[FafuRobot] all motors enabled (recovered via motor_reset).")
                 return
-            self._print_motor_diagnostic(prefix="enable: post-MIT-reset failed; ")
-            raise RuntimeError(
-                "enable failed after MIT motor_reset; check the diagnostic "
-                "above (latched fault / bus / mechanical jam)."
-            )
+
+            # 部分电机 reset 后仍卡在 0x0B -> 对这些电机做几轮更"用力"的重试:
+            # 每轮对每个卡住电机 stop()(踢一下) + 连发 3 次 motor_reset (文本
+            # 后门命令 fire-and-forget, 可能丢帧, 多发几次更稳), 再等 1.2s.
+            for rnd in range(1, 4):
+                still_mit: List[int] = []
+                for mid in self._cfg.motor_ids:
+                    try:
+                        s = self._ht.read_motor_state(mid, 0.2)
+                        if s is not None and int(s.mode) == self.MODE_MIT:
+                            still_mit.append(mid)
+                    except Exception:
+                        still_mit.append(mid)
+                if not still_mit:
+                    break
+                print(f"[FafuRobot] enable: motors {still_mit} still in MIT 0x0B; "
+                      f"aggressive motor_reset round {rnd} (stop + reset x3) ...")
+                for mid in still_mit:
+                    try:
+                        self._ht.stop(mid)
+                    except Exception:
+                        pass
+                    for _ in range(3):
+                        try:
+                            self._ht.motor_reset(mid)
+                        except Exception as e:
+                            print(f"  motor {mid}: motor_reset failed: {e}")
+                        time.sleep(0.05)
+                time.sleep(1.2)
+                if self._switch_mode_all(self.MODE_POSITION,
+                                         label=f"position (post-MIT-reset-{rnd + 1})",
+                                         max_retry=3):
+                    time.sleep(0.05)
+                    print(f"[FafuRobot] all motors enabled "
+                          f"(recovered via motor_reset round {rnd + 1}).")
+                    return
+
+            # 反复软重启仍有电机卡在 0x0B -> 本固件把 MIT 模式锁死, 纯软件救不回,
+            # 直接给出断电指引 (落到 stage-2 也只是再白等一遍).
+            stuck = []
+            for mid in self._cfg.motor_ids:
+                try:
+                    s = self._ht.read_motor_state(mid, 0.2)
+                    if s is not None and int(s.mode) == self.MODE_MIT:
+                        stuck.append(mid)
+                except Exception:
+                    pass
+            if stuck:
+                self._print_motor_diagnostic(
+                    prefix="enable: MIT 0x0B stuck after repeated motor_reset; ")
+                raise RuntimeError(
+                    f"enable failed: motors {stuck} stuck in MIT mode (0x0B) and "
+                    f"will not respond to motor_reset. This firmware locks the MIT/"
+                    f"运控 mode so tightly that only a HARD POWER-CYCLE of the arm "
+                    f"clears it. Please power the arm off and on, then rerun. "
+                    f"(To avoid this: after using MIT/持续保持, press [y] 软重启 "
+                    f"before quitting so motors are left in position mode 0x0A.)"
+                )
+
+            # (理论上到不了这里) 快速路径没完全恢复 -> 落到 stage-2 全量 reset.
+            print("[FafuRobot] enable: MIT fast-path reset incomplete; "
+                  "falling through to full motor_reset recovery ...")
 
         if self._switch_mode_all(self.MODE_POSITION, label="position", max_retry=3):
             time.sleep(0.05)
@@ -955,20 +1023,13 @@ class FafuRobotController:
         start_frame_id: int = 1,
         speed: int = 50,
         control_frequency: float = 0.05,
-        kp: "float | Iterable[float] | None" = None,
-        kd: "float | Iterable[float] | None" = None,
-        gravity_ff: bool = True,
     ) -> None:
-        """Follow a joint-space waypoint path via **group MIT** streaming.
+        """Follow a joint-space waypoint path via ``move_j`` streaming.
 
         TOPPRA time-parametrises ``path`` into a dense, uniformly-spaced
-        (``control_frequency``) waypoint stream; each frame is then sent on
-        the one-to-many MIT channel (:meth:`move_MIT`, CAN ID ``0x8093``)
-        carrying per-joint **target position + velocity (finite-difference)
-        + gravity feed-forward + kp/kd**.  This replaces the earlier
-        ``move_j(block=False)`` firmware-position streaming: MIT tracking is
-        smoother (velocity feed-forward + gravity handled) and matches the
-        vendor's ``pos_vel_tqe_kp_kd`` trajectory playback.
+        (``control_frequency``) waypoint stream; each frame is then sent
+        with :meth:`move_j` (``block=False``) on the firmware position
+        channel (``pos_vel_MAXtqe`` / ``0x8090``).
 
         Parameters
         ----------
@@ -983,20 +1044,10 @@ class FafuRobotController:
             Skip the first ``start_frame_id`` interpolated frames
             (typically used to skip the robot's current configuration).
         speed : int, optional
-            Kept for signature compatibility; **ignored** in MIT mode
-            (trajectory timing comes from TOPPRA + ``control_frequency``).
+            Speed percentage forwarded to each :meth:`move_j` call.
         control_frequency : float, optional
             ``ctrl_freq`` passed to TOPPRA (seconds); also the per-frame
-            stream period.
-        kp, kd : float or iterable, optional
-            Per-joint MIT PD gains in **physical vendor units** (see
-            :meth:`move_MIT`).  ``None`` (default) uses the vendor replay
-            gains for a 6-DoF arm (``kp=[30,40,55,15,7,5]``,
-            ``kd=[3,4,5.5,1.5,0.7,0.5]``); scalar otherwise.
-        gravity_ff : bool, optional
-            Add gravity feed-forward torque per frame (needs
-            :meth:`setup_dynamics`).  Default ``True``; silently falls back
-            to zero feed-forward (kp/kd-only tracking) when no model loaded.
+            stream period (``sleep`` between ``move_j`` frames).
 
         Raises
         ------
@@ -1018,9 +1069,99 @@ class FafuRobotController:
                 f"path must have shape (N, {self.num_joints}); got {path_arr.shape}"
             )
 
+        tpply = pwp.PiecewisePolyTOPPRA()
+        interpolated = tpply.interpolate_by_max_spdacc(
+            path=path_arr,
+            ctrl_freq=control_frequency,
+            max_vels=max_jntvel,
+            max_accs=max_jntacc,
+            toggle_debug=False,
+        )
+        interpolated = interpolated[start_frame_id:]
+        for jnt_values in interpolated:
+            self.move_j(
+                joint_angles=jnt_values,
+                is_radians=is_radians,
+                speed=speed,
+                block=False,
+            )
+            time.sleep(max(0.005, control_frequency))
+
+    def move_jntspace_path_mit(
+        self,
+        path,
+        *,
+        is_radians: bool = True,
+        max_jntvel: Optional[List[float]] = None,
+        max_jntacc: Optional[List[float]] = None,
+        start_frame_id: int = 1,
+        speed: int = 50,
+        control_frequency: float = 0.05,
+        kp: "float | Iterable[float] | None" = None,
+        kd: "float | Iterable[float] | None" = None,
+        gravity_ff: bool = True,
+    ) -> None:
+        """Follow a joint-space waypoint path via **group MIT** streaming.
+
+        Same TOPPRA time-parametrisation as :meth:`move_jntspace_path`, but
+        each interpolated frame is sent on the one-to-many MIT channel
+        (:meth:`move_MIT`, CAN ID ``0x8093``) with per-joint **target
+        position + finite-difference velocity + gravity feed-forward +
+        kp/kd**.  Prefer this when you want MIT tracking / gravity FF;
+        use :meth:`move_jntspace_path` for firmware position (``move_j``).
+
+        Parameters
+        ----------
+        path : array_like, shape (N, num_joints)
+            Sequence of joint configurations to traverse in order.
+        is_radians : bool, optional
+            Interpret ``path`` in radians (default) or degrees.
+        max_jntvel, max_jntacc : list of float, optional
+            Per-joint velocity and acceleration limits (passed to TOPPRA).
+        start_frame_id : int, optional
+            Skip the first ``start_frame_id`` interpolated frames.
+        speed : int, optional
+            Kept for signature compatibility with
+            :meth:`move_jntspace_path`; **ignored** here (timing comes
+            from TOPPRA + ``control_frequency``).
+        control_frequency : float, optional
+            ``ctrl_freq`` passed to TOPPRA (seconds); also the per-frame
+            stream period.
+        kp, kd : float or iterable, optional
+            Per-joint MIT PD gains in **physical vendor units** (see
+            :meth:`move_MIT`).  ``None`` uses vendor replay defaults for a
+            6-DoF arm (``kp=[30,40,55,15,7,5]``,
+            ``kd=[3,4,5.5,1.5,0.7,0.5]``); scalar otherwise.
+        gravity_ff : bool, optional
+            Add gravity feed-forward torque per frame (needs
+            :meth:`setup_dynamics`).  Default ``True``; falls back to
+            zero feed-forward when no model is loaded.
+
+        Raises
+        ------
+        NotImplementedError
+            When the optional ``wrs`` dependency is not available.
+        RuntimeError
+            When ``num_joints > 6`` (one MIT frame holds at most 6 motors).
+        """
+        if not _TOPPRA_EXIST:
+            raise NotImplementedError(
+                "TOPPRA-based interpolation requires "
+                "`wrs.motion.trajectory.piecewisepoly_toppra`; "
+                "install it or use a custom interpolator."
+            )
+        if path is None:
+            raise ValueError("path must not be None")
+
+        path_arr = np.asarray(path, dtype=float)
+        if path_arr.ndim != 2 or path_arr.shape[1] != self.num_joints:
+            raise ValueError(
+                f"path must have shape (N, {self.num_joints}); got {path_arr.shape}"
+            )
+
         if self.num_joints > 6:
             raise RuntimeError(
-                f"move_jntspace_path (MIT mode) needs <=6 joints, but "
+                f"move_jntspace_path_mit needs <=6 joints, but "
                 f"num_joints={self.num_joints}. Exclude the gripper "
                 f"(gripper_motor_id) so only manipulator joints stream.")
 
@@ -1037,18 +1178,16 @@ class FafuRobotController:
             return
 
         n = self.num_joints
-        # Default MIT gains = vendor replay values for a 6-DoF arm; scalar else.
         if kp is None:
             kp = ([30.0, 40.0, 55.0, 15.0, 7.0, 5.0][:n] if n == 6 else 20.0)
         if kd is None:
             kd = ([3.0, 4.0, 5.5, 1.5, 0.7, 0.5][:n] if n == 6 else 2.0)
         if gravity_ff and not self.has_dynamics:
-            print("[FafuRobot] move_jntspace_path: gravity_ff requested but no "
-                  "dynamics model; streaming kp/kd only (setup_dynamics to add "
-                  "gravity feed-forward).")
+            print("[FafuRobot] move_jntspace_path_mit: gravity_ff requested but "
+                  "no dynamics model; streaming kp/kd only (setup_dynamics to "
+                  "add gravity feed-forward).")
 
-        # Make sure motors are in active (0x0A) mode so the 0x8093 MIT frame
-        # is actuated (position streaming left them here; brake/stop would not).
+        # Active mode so 0x8093 MIT frames are actuated.
         self.enable()
 
         dt = max(0.005, control_frequency)
@@ -1056,7 +1195,6 @@ class FafuRobotController:
         prev = None
         for jnt_values in interpolated:
             jv = np.asarray(jnt_values, dtype=float)
-            # Finite-difference velocity (same unit as jv: rad/s or deg/s).
             vel = np.zeros(n) if prev is None else (jv - prev) / dt
             prev = jv
             if gravity_ff and self.has_dynamics:
@@ -1068,8 +1206,7 @@ class FafuRobotController:
                 jv, vel, tau, kp=kp, kd=kd,
                 is_radians=is_radians, apply_torque_scale=True, timeout=0.0)
             time.sleep(dt)
-        # Path done: the last MIT frame latches (kp holds final pose). Re-assert
-        # it briefly so the arm settles on target instead of coasting.
+        # Re-assert the final pose briefly so the arm settles on target.
         for _ in range(3):
             jv = np.asarray(interpolated[-1], dtype=float)
             if gravity_ff and self.has_dynamics:
