@@ -945,17 +945,26 @@ class App:
             if cmd in ("b", "back", "q", "exit", ""):
                 return
             elif cmd == "o":
-                self.arm.open_gripper(effort=self.gripper_effort)
+                try:
+                    self.arm.open_gripper(effort=self.gripper_effort)
+                except Exception as e:
+                    print(f"  [失败] {e}")
             elif cmd == "c":
-                self.arm.close_gripper(effort=self.gripper_effort)
+                try:
+                    self.arm.close_gripper(effort=self.gripper_effort)
+                except Exception as e:
+                    print(f"  [失败] {e}")
             elif cmd == "a":
                 s = prompt("  目标角度 (度): ")
                 try:
                     deg = float(s)
                 except ValueError:
                     print("  非法数字"); continue
-                self.arm.gripper_control(angle=math.radians(deg),
-                                         effort=self.gripper_effort)
+                try:
+                    self.arm.gripper_control(angle=math.radians(deg),
+                                             effort=self.gripper_effort)
+                except Exception as e:
+                    print(f"  [失败] {e}")
             elif cmd == "t":
                 self._edit_gripper_effort()
             else:
@@ -1399,10 +1408,12 @@ class App:
             except Exception:
                 pass
 
-        # 固件看门狗: 上位机崩溃 / Ctrl+C 后, 电机 100ms 内没新帧就自动停.
-        for mid in self.arm.joint_motor_ids:
+        # 武装固件看门狗: 回放期间上位机崩溃 / Ctrl+C 后 100ms 内自动刹车.
+        # (group-MIT 会话 API 已移除; move_MIT 直接循环下发即可。)
+        _WD_MS = 100
+        for _mid in self.arm._joint_motor_ids:
             try:
-                self.arm._ht.set_timeout(mid, 100)
+                self.arm._ht.set_timeout(_mid, _WD_MS)
             except Exception:
                 pass
 
@@ -1466,11 +1477,18 @@ class App:
                     print(f"\r  [{i + 1}/{len(samples)}] {deg_str(cur)}   ",
                           end="", flush=True)
         finally:
+            # 清看门狗 + 刹车保持 (-> DISABLED). group-MIT 残留模式 (0x0B) 下
+            # 刹车 (0x0F) 可直接切到, 无需 motor_reset.
+            for _mid in self.arm._joint_motor_ids:
+                try:
+                    self.arm._ht.set_timeout(_mid, 0)
+                except Exception:
+                    pass
             try:
                 self.arm.brake()
                 print("\n  回放结束, 已刹车保持.")
             except Exception as e:
-                print(f"\n  brake 失败: {e}")
+                print(f"\n  刹车失败: {e}")
         print("  回放完成")
 
     def _replay_trajectory_file(self, samples: List[dict],
@@ -1901,38 +1919,51 @@ def main() -> int:
             cmd = prompt("  >>> ").lower()
             if cmd in ("q", "quit", "exit"):
                 break
-            elif cmd == "s":
-                app.show_state()
-            elif cmd == "j":
-                app.move_one_joint()
-            elif cmd in ("a", "all"):
-                app.move_all_joints()
-            elif cmd in ("w", "path", "waypoints"):
-                app.move_jntspace_path_menu()
-            elif cmd == "y":
-                app.soft_reboot()
-            elif cmd in ("h", "home"):
-                app.go_home()
-            elif cmd == "g":
-                app.gripper_menu()
-            elif cmd == "l":
-                app.limit_menu()
-            elif cmd == "t":
-                app.teach_record()
-            elif cmd == "p":
-                app.teach_replay()
-            elif cmd == "v":
-                app.servo_menu()
-            elif cmd == "m":
-                app.monitor()
-            elif cmd == "e":
-                app.estop()
-            elif cmd == "r":
-                app.resume()
-            elif cmd == "":
-                continue
-            else:
-                print(f"  未识别 {cmd!r}")
+            # Per-command guard: a handler raising (e.g. RobotStateError
+            # when a motion is issued while the arm is braked / estopped /
+            # not enabled) should only print a message and keep the menu
+            # alive, not tear down the whole session.  KeyboardInterrupt is
+            # NOT caught here so Ctrl+C still routes to the outer handler
+            # (emergency_stop + clean exit).
+            try:
+                if cmd == "s":
+                    app.show_state()
+                elif cmd == "j":
+                    app.move_one_joint()
+                elif cmd in ("a", "all"):
+                    app.move_all_joints()
+                elif cmd in ("w", "path", "waypoints"):
+                    app.move_jntspace_path_menu()
+                elif cmd == "y":
+                    app.soft_reboot()
+                elif cmd in ("h", "home"):
+                    app.go_home()
+                elif cmd == "g":
+                    app.gripper_menu()
+                elif cmd == "l":
+                    app.limit_menu()
+                elif cmd == "t":
+                    app.teach_record()
+                elif cmd == "p":
+                    app.teach_replay()
+                elif cmd == "v":
+                    app.servo_menu()
+                elif cmd == "m":
+                    app.monitor()
+                elif cmd == "e":
+                    app.estop()
+                elif cmd == "r":
+                    app.resume()
+                elif cmd == "":
+                    continue
+                else:
+                    print(f"  未识别 {cmd!r}")
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                traceback.print_exc()
+                print(f"  [命令 {cmd!r} 出错] {e}  (菜单继续; 若为状态错误请先 "
+                      "enable / resume)")
     except KeyboardInterrupt:
         print("\n\n[INTERRUPT] Ctrl+C, 紧急停止..")
         try:

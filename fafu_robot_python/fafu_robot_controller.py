@@ -70,11 +70,13 @@ Example
 
 from __future__ import annotations
 
+import functools
 import math
 import os
 import sys
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -128,6 +130,96 @@ MODE_BRAKE    = 0x0F   # short-circuit braking (no torque to spin)
 MODE_STOP     = 0x00   # PWM off, free to move by hand
 MODE_MIT      = 0x0B   # MIT residual mode left by set_many_mit (0x8093);
                        # on this firmware only motor_reset can leave it
+
+
+# ============================================================================
+#  High-level controller state machine
+# ============================================================================
+class RobotState(Enum):
+    """High-level lifecycle state of :class:`FafuRobotController`.
+
+    This is a *software* flow-control state (distinct from the per-motor
+    hardware ``mode`` byte, see ``MODE_*``).  It gates which high-level
+    API calls are legal at any moment so that mistakes like "``move_j``
+    while not enabled" or "issue motion after an emergency stop" fail
+    loudly with a clear message instead of silently doing the wrong
+    thing on the hardware.
+
+    Transition map (arrows are the *only* legal transitions)::
+
+        DISCONNECTED --open--> DISABLED
+        DISABLED  --enable()-->  IDLE
+        IDLE      --disable()-->  DISABLED
+        IDLE      --brake()---->  BRAKED
+        BRAKED/DISABLED --enable()--> IDLE
+        IDLE      --move_j/move_p/...-->  MOVING     --(done)--> IDLE
+        IDLE      --servo_start()------>  SERVOING   --servo_end("hold")--> IDLE
+                                                     --servo_end("brake")--> BRAKED
+                                                     --servo_end("stop")--> DISABLED
+        IDLE      --grasp()/gripper---->  GRASPING   --(done)--> IDLE
+        IDLE      --start_gravity_comp->  GRAVITY_COMP --(exit)--> BRAKED
+        <any connected> --emergency_stop()--> ESTOP  --resume()--> IDLE
+        <any connected> --power/CAN lost---> DEAD     --recover()--> DISABLED
+        <any>     --close_connection()-->  DISCONNECTED
+    """
+
+    DISCONNECTED  = "disconnected"   # serial port closed (initial / after close_connection)
+    DISABLED      = "disabled"       # connected, motors free-spin (MODE_STOP 0x00), hand-movable
+    BRAKED        = "braked"         # connected, short-circuit brake (MODE_BRAKE 0x0F), resists motion
+    IDLE          = "idle"           # connected + enabled (MODE_POSITION), ready & not busy
+    MOVING        = "moving"         # blocking joint / cartesian / gripper motion in progress
+    SERVOING      = "servoing"       # servo_start .. servo_end streaming session open
+    GRASPING      = "grasping"       # force-aware grasp() in progress
+    GRAVITY_COMP  = "gravity_comp"   # start_gravity_compensation() float/drag-teach loop running
+    ESTOP         = "estop"          # emergency_stop() latched — sticky until resume()
+    DEAD          = "dead"           # motor power / CAN link lost — latched; recover() after restore
+
+    def __str__(self) -> str:  # nicer prints
+        return self.value
+
+
+class RobotStateError(RuntimeError):
+    """Raised when a high-level API call is illegal in the current
+    :class:`RobotState` (e.g. ``move_j`` before ``enable``, or any
+    motion while the controller is latched in ``ESTOP``)."""
+
+
+# States in which the arm is actively executing an operation and must
+# not accept a *new* one.  emergency_stop() is the only exception.
+_BUSY_STATES = frozenset(
+    {
+        RobotState.MOVING,
+        RobotState.SERVOING,
+        RobotState.GRASPING,
+        RobotState.GRAVITY_COMP,
+    }
+)
+
+
+def _guard_operation(action: str, busy_state: "RobotState"):
+    """Decorator: gate a call-scoped, blocking operation behind the
+    controller state machine.
+
+    On entry it verifies the controller is :attr:`RobotState.IDLE`
+    (via :meth:`FafuRobotController._enter_operation`) and switches to
+    ``busy_state``; on exit it restores ``IDLE``.  Re-entrant: a guarded
+    method that internally calls another guarded method (e.g.
+    ``go_home`` -> ``move_j``, ``move_l`` -> ``move_jntspace_path``)
+    nests cleanly without the inner guard rejecting the outer one.
+    """
+
+    def deco(fn: Callable) -> Callable:
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            owns = self._enter_operation(action, busy_state)
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                self._exit_operation(owns)
+
+        return wrapper
+
+    return deco
 
 # S-curve trajectory tuning (matches arm_multi_joint_example.py).
 _VEL_AVG_MAX_TPS = 0.5    # absolute cap for average velocity (turns/s)
@@ -417,6 +509,11 @@ class FafuRobotController:
     MODE_STOP     = MODE_STOP
     MODE_MIT      = MODE_MIT
 
+    # High-level state machine (exposed for convenience so callers can do
+    # ``if arm.state is arm.State.IDLE`` / ``except arm.StateError``).
+    State      = RobotState
+    StateError = RobotStateError
+
     # ------------------------------------------------------------------
     #  Construction / teardown
     # ------------------------------------------------------------------
@@ -477,6 +574,22 @@ class FafuRobotController:
             ) from e
         self._port = port_to_use
         self._baudrate = baud_to_use
+
+        # ---- High-level state machine (see RobotState) ----
+        # Port is open but motors are not yet in position control, so we
+        # start in DISABLED.  auto_enable below promotes us to IDLE.
+        # ``_op_depth`` tracks nested guarded operations for re-entrancy
+        # (e.g. go_home -> move_j); ``_state_verbose`` toggles transition
+        # logging (off by default to avoid spamming per-move_j).
+        self._state: RobotState = RobotState.DISABLED
+        self._op_depth: int = 0
+        self._state_verbose: bool = False
+        # DEAD (motor power / CAN loss) detection. During a live session
+        # (async RX / polling on) a growing ``Stats.last_rx_age_ms`` beyond
+        # this threshold is treated as motors losing power mid-stream ->
+        # latch DEAD and stop sending, so power-return cannot resume motion.
+        self._dead_rx_timeout_ms: float = 500.0
+        self._dead_reason: Optional[str] = None
 
         # Push soft limits configured in robot.cfg into the driver.
         try:
@@ -648,6 +761,318 @@ class FafuRobotController:
         """Escape hatch to the underlying ``HightorqueSerial`` instance."""
         return self._ht
 
+    # ------------------------------------------------------------------
+    #  State machine
+    # ------------------------------------------------------------------
+    @property
+    def state(self) -> RobotState:
+        """Current high-level :class:`RobotState` of the controller.
+
+        This is the software flow-control state that gates the motion
+        API (see :class:`RobotState`).  It is *not* a live hardware read;
+        use :meth:`is_enabled` / :meth:`get_motor_states` for that.
+        """
+        return self._state
+
+    @property
+    def state_verbose(self) -> bool:
+        """Whether state transitions are printed to stdout (default off)."""
+        return self._state_verbose
+
+    @state_verbose.setter
+    def state_verbose(self, value: bool) -> None:
+        self._state_verbose = bool(value)
+
+    def _set_state(self, new: RobotState) -> None:
+        old = self._state
+        if old is new:
+            return
+        self._state = new
+        if self._state_verbose:
+            print(f"[FafuRobot] state: {old} -> {new}")
+
+    def _require_ready(self, action: str, *, allow_disabled: bool = False) -> None:
+        """Raise :class:`RobotStateError` unless the controller can accept
+        the motion command ``action``.
+
+        ``allow_disabled=True`` permits starting from ``DISABLED`` for
+        calls that enable the motors themselves (e.g. ``servo_start``).
+        When state is ``DISABLED`` we first reconcile against the live
+        hardware (motors may actually be in position mode already, e.g.
+        left holding by a previous program) before rejecting.
+        """
+        st = self._state
+        if st is RobotState.IDLE:
+            # Cheap power/link check: if the motors dropped off the bus while
+            # we thought we were idle (brown-out / power cycle), latch DEAD
+            # rather than blindly re-commanding a possibly-sagged arm.
+            if not self._stream_link_ok():
+                raise RobotStateError(
+                    f"{action} 被拒绝: 检测到掉电/通信丢失 (DEAD)。"
+                    f" 电源恢复后调用 recover(confirm=True)。"
+                )
+            return
+        if st is RobotState.DEAD:
+            raise RobotStateError(
+                f"{action} 被拒绝: 掉电/通信丢失锁定 (DEAD)"
+                + (f": {self._dead_reason}" if self._dead_reason else "")
+                + "。电源恢复后调用 recover(confirm=True)，再 enable()。"
+            )
+        if st in (RobotState.DISABLED, RobotState.BRAKED):
+            if allow_disabled:
+                return
+            # Reconcile: the motors may in fact be energised even though
+            # our software state lagged behind (previous ``servo_end("hold")``
+            # / external enable). Promote to IDLE instead of falsely rejecting.
+            try:
+                if self.is_enabled:
+                    self._set_state(RobotState.IDLE)
+                    return
+            except Exception:
+                pass
+            raise RobotStateError(
+                f"{action} 需要电机已使能 (position control)，当前 state={st.name}。"
+                f" 请先调用 enable()。"
+            )
+        if st is RobotState.DISCONNECTED:
+            raise RobotStateError(
+                f"{action} 失败: 连接已关闭 (state=DISCONNECTED)。"
+            )
+        if st is RobotState.ESTOP:
+            raise RobotStateError(
+                f"{action} 被拒绝: 处于急停状态 (ESTOP)。请先调用 resume() 解除急停。"
+            )
+        # One of the busy states.
+        raise RobotStateError(
+            f"{action} 被拒绝: 机械臂正忙 (state={st})，"
+            f"当前操作结束前不能启动新动作。"
+        )
+
+    def _require_gripper_ready(self, action: str) -> None:
+        """Guard for gripper commands (``gripper_control`` / ``open`` /
+        ``close``).
+
+        The gripper (motor M7) is an **independent** actuator from the 6
+        arm joints, so — unlike joint motion — it is allowed to run
+        *during* a joint-streaming session (``SERVOING``) and does not
+        change the joint state.  It is blocked only when the arm is
+        disconnected, estopped, not enabled, already doing a
+        force-``grasp`` (``GRASPING``), or floating in gravity comp.
+        """
+        st = self._state
+        if st in (RobotState.IDLE, RobotState.MOVING, RobotState.SERVOING):
+            return
+        if st in (RobotState.DISABLED, RobotState.BRAKED):
+            try:
+                if self.is_enabled:
+                    return   # leave the joint state as-is; gripper is orthogonal
+            except Exception:
+                pass
+            raise RobotStateError(
+                f"{action} 需要电机已使能, 当前 state={st.name}。请先调用 enable()。"
+            )
+        if st is RobotState.DISCONNECTED:
+            raise RobotStateError(f"{action} 失败: 连接已关闭 (state=DISCONNECTED)。")
+        if st is RobotState.DEAD:
+            raise RobotStateError(
+                f"{action} 被拒绝: 掉电/通信丢失锁定 (DEAD)。"
+                "电源恢复后调用 recover(confirm=True)。"
+            )
+        if st is RobotState.ESTOP:
+            raise RobotStateError(
+                f"{action} 被拒绝: 处于急停状态 (ESTOP)。请先调用 resume()。"
+            )
+        if st is RobotState.GRASPING:
+            raise RobotStateError(f"{action} 被拒绝: 正在力控抓取 (grasp) 中。")
+        if st is RobotState.GRAVITY_COMP:
+            raise RobotStateError(f"{action} 被拒绝: 重力补偿 / 拖动示教中。")
+        raise RobotStateError(f"{action} 被拒绝: state={st}。")
+
+    def _enter_operation(self, action: str, busy_state: RobotState) -> bool:
+        """Begin a call-scoped guarded operation.
+
+        Returns ``True`` if this call *owns* the operation (outermost)
+        and is responsible for restoring ``IDLE`` on exit; ``False`` for
+        a nested internal call (which must not touch the state).
+        """
+        if self._op_depth > 0:
+            # Already inside an operation we started -> nested call, allow.
+            self._op_depth += 1
+            return False
+        self._require_ready(action)
+        self._op_depth = 1
+        self._set_state(busy_state)
+        return True
+
+    def _exit_operation(self, owns: bool) -> None:
+        if self._op_depth > 0:
+            self._op_depth -= 1
+        if owns and self._op_depth == 0:
+            # Only restore IDLE if we are still in a call-scoped busy
+            # state.  An out-of-band transition (emergency_stop from a
+            # signal handler, close_connection) must not be clobbered.
+            if self._state in (RobotState.MOVING, RobotState.GRASPING):
+                self._set_state(RobotState.IDLE)
+
+    # ------------------------------------------------------------------
+    #  Power / link loss -> DEAD (latched, survives power-return)
+    # ------------------------------------------------------------------
+    @property
+    def dead_reason(self) -> Optional[str]:
+        """Why the controller latched :attr:`RobotState.DEAD` (or ``None``)."""
+        return self._dead_reason
+
+    def _enter_dead(self, reason: str) -> None:
+        """Latch ``DEAD``: kill any streaming session so no further frames go
+        out, remember the reason, and transition.  Sticky (like ESTOP): only
+        :meth:`recover` leaves it.  This is the safety guarantee that a power
+        blip cannot silently resume motion when power returns — the moment we
+        notice the link is gone we stop commanding and refuse to restart until
+        the user explicitly recovers.
+        """
+        if self._state in (RobotState.DEAD, RobotState.DISCONNECTED):
+            return
+        # Kill any streaming session so its loop stops sending immediately.
+        self._servo_active = False
+        self._last_cmd_turns = None
+        self._dead_reason = reason
+        self._set_state(RobotState.DEAD)
+        print(f"[FafuRobot] DEAD latched: {reason}\n"
+              "           Motion is disabled and all streaming stopped. The arm "
+              "will NOT move on power-return; call recover(confirm=True) after "
+              "power / CAN is restored.")
+
+    def _stream_link_ok(self) -> bool:
+        """Cheap per-tick liveness check for high-rate loops (servo_j /
+        move_MIT / gravity comp).
+
+        Uses the driver's ``Stats.last_rx_age_ms``: while async RX is running,
+        motors losing power stop replying and the age climbs.  If it exceeds
+        :attr:`_dead_rx_timeout_ms` we latch ``DEAD`` and return ``False`` so
+        the caller stops streaming.  If async RX is off we cannot cheaply tell,
+        so we return ``True`` (use :meth:`check_alive` at boundaries instead).
+        """
+        try:
+            if not self._ht.is_async_rx():
+                return True
+            age = float(getattr(self._ht.get_stats(), "last_rx_age_ms", 0.0))
+        except Exception:
+            return True
+        if age > self._dead_rx_timeout_ms:
+            self._enter_dead(
+                f"no CAN RX for {age:.0f} ms (motor power / USB / bus lost mid-stream?)")
+            return False
+        return True
+
+    def check_alive(self, *, fresh: bool = True, timeout: float = 0.1) -> bool:
+        """Probe the joint motors for a live power / CAN link.
+
+        Returns ``True`` if at least one joint motor answers a state read.  If
+        **none** answer — the signature of a full power loss / USB unplug / bus
+        down — the controller latches :attr:`RobotState.DEAD` (sticky) so no
+        motion can be issued, and returns ``False``.  Call :meth:`recover`
+        after restoring power.  No-op (returns ``False``) if already
+        disconnected.
+        """
+        if self._state is RobotState.DISCONNECTED:
+            return False
+        alive = False
+        for mid in self._joint_motor_ids:
+            try:
+                s = (self._ht.read_motor_state(mid, timeout) if fresh
+                     else self._ht.get_cached_state(mid))
+            except Exception:
+                s = None
+            if s is not None:
+                alive = True
+                break
+        if not alive:
+            self._enter_dead("no motor responded to a state read "
+                             "(power off / USB unplugged / CAN down?)")
+        return alive
+
+    def recover(self, *, confirm: bool = False) -> bool:
+        """Leave ``DEAD`` after motor power / CAN has been restored.
+
+        ★ SAFETY ★ This never moves the arm.  It verifies the motors respond
+        again, restarts background RX / polling if needed, forces every motor
+        to the safe non-energised ``STOP`` (``0x00``) mode, and transitions to
+        ``DISABLED`` — **not** ``IDLE``.  You must then call :meth:`enable`
+        explicitly to re-arm; ``enable`` holds the *current* measured pose (no
+        jump), so the arm cannot lurch toward a stale pre-blackout target.
+
+        ``confirm=True`` is required because this re-touches the bus after a
+        fault; make sure the workspace is clear first.
+
+        Returns ``True`` if the link is back and we moved to ``DISABLED``;
+        ``False`` if the motors are still unresponsive (stays ``DEAD``).
+        """
+        if self._state is not RobotState.DEAD:
+            print(f"[FafuRobot] recover: not in DEAD (state={self._state}); ignored.")
+            return self._state is not RobotState.DEAD
+        if not confirm:
+            raise RuntimeError(
+                "recover(confirm=True) required (safety): confirm the arm is "
+                "powered and the workspace is clear before re-touching the bus.")
+        # Restart background tasks if they dropped.
+        try:
+            if not self._ht.is_async_rx():
+                self._ht.enable_async_rx()
+                time.sleep(0.1)
+        except Exception as e:
+            print(f"[FafuRobot] recover: enable_async_rx failed: {e}")
+        try:
+            if not self._ht.is_polling():
+                hz = float(self._cfg.control_rate_hz) if self._cfg.control_rate_hz else 50.0
+                self._ht.start_state_polling(list(self._cfg.motor_ids), max(10.0, hz))
+        except Exception as e:
+            print(f"[FafuRobot] recover: start_state_polling failed: {e}")
+        # Probe: read fresh; if still nothing, stay DEAD.
+        alive = False
+        for mid in self._joint_motor_ids:
+            try:
+                if self._ht.read_motor_state(mid, 0.2) is not None:
+                    alive = True
+                    break
+            except Exception:
+                pass
+        if not alive:
+            print("[FafuRobot] recover: motors still unresponsive; "
+                  "check power / USB / CAN and retry. (state stays DEAD)")
+            return False
+        # Link is back. Force a known-safe non-energised state; never move.
+        for mid in self._cfg.motor_ids:
+            try:
+                self._ht.stop(mid)
+            except Exception:
+                pass
+        self._last_cmd_turns = None
+        self._dead_reason = None
+        self._set_state(RobotState.DISABLED)
+        print("[FafuRobot] recover: link restored; motors left in STOP (0x00, "
+              "free). Call enable() to re-arm (holds current pose, no jump) "
+              "before commanding motion.")
+        return True
+
+    def sync_state(self) -> RobotState:
+        """Reconcile the software state with live motor hardware and
+        return the (possibly updated) :class:`RobotState`.
+
+        Only reconciles the quiescent states (``IDLE`` <-> ``DISABLED``)
+        based on :meth:`is_enabled`; the busy / latched states
+        (``MOVING`` / ``SERVOING`` / ``GRASPING`` / ``GRAVITY_COMP`` /
+        ``ESTOP`` / ``DISCONNECTED``) are left untouched.  Useful after a
+        firmware watchdog trip or a manual driver poke.
+        """
+        if self._state in (RobotState.IDLE, RobotState.DISABLED):
+            try:
+                self._set_state(
+                    RobotState.IDLE if self.is_enabled else RobotState.DISABLED
+                )
+            except Exception:
+                pass
+        return self._state
+
     @property
     def is_enabled(self) -> bool:
         """``True`` iff every motor is currently in position-control mode."""
@@ -663,6 +1088,30 @@ class FafuRobotController:
     #  Power management
     # ------------------------------------------------------------------
     def enable(self, *, allow_motor_reset: bool = True) -> None:
+        """Switch every motor to position control and mark the controller
+        :attr:`RobotState.IDLE` on success.
+
+        Thin state-machine wrapper around :meth:`_enable_impl` (which
+        holds the full recovery-path documentation).  Legal from
+        ``DISABLED`` / ``IDLE`` / ``ESTOP`` (``resume`` routes here);
+        rejected when disconnected or while a blocking operation is in
+        flight.  If :meth:`_enable_impl` raises, the state is left
+        unchanged (e.g. still ``DISABLED``) so the failure is visible.
+        """
+        if self._state is RobotState.DISCONNECTED:
+            raise RobotStateError("enable 失败: 连接已关闭 (state=DISCONNECTED)。")
+        if self._state is RobotState.DEAD:
+            raise RobotStateError(
+                "enable 被拒绝: 掉电/通信丢失锁定 (DEAD)。请先 recover(confirm=True)。"
+            )
+        if self._state in _BUSY_STATES:
+            raise RobotStateError(
+                f"enable 被拒绝: 机械臂正忙 (state={self._state})。"
+            )
+        self._enable_impl(allow_motor_reset=allow_motor_reset)
+        self._set_state(RobotState.IDLE)
+
+    def _enable_impl(self, *, allow_motor_reset: bool = True) -> None:
         """Switch every motor to position control (mode ``0x0A``).
 
         Resolution path (cheapest to most aggressive):
@@ -877,22 +1326,31 @@ class FafuRobotController:
 
     def disable(self) -> None:
         """Switch every motor to free-spin mode (mode ``0x00``)."""
+        if self._state is RobotState.DISCONNECTED:
+            raise RobotStateError("disable 失败: 连接已关闭 (state=DISCONNECTED)。")
         # Commanded position is now meaningless (the user may hand-drag
         # the arm); force the next move to start from the measured pose.
         self._last_cmd_turns = None
         ok = self._switch_mode_all(self.MODE_STOP, label="stop", max_retry=2)
         if ok:
             print("[FafuRobot] all motors disabled (free spin).")
+        self._set_state(RobotState.DISABLED)
 
     def brake(self) -> None:
         """Engage short-circuit braking on every motor (mode ``0x0F``)."""
+        if self._state is RobotState.DISCONNECTED:
+            raise RobotStateError("brake 失败: 连接已关闭 (state=DISCONNECTED)。")
         ok = self._switch_mode_all(self.MODE_BRAKE, label="brake", max_retry=2)
         if ok:
             print("[FafuRobot] all motors braked.")
+        # Short-circuit brake (0x0F): not position control, but distinct from
+        # free-spin DISABLED (0x00) — the arm resists motion. Track as BRAKED.
+        self._set_state(RobotState.BRAKED)
 
     # ------------------------------------------------------------------
     #  Joint-space motion
     # ------------------------------------------------------------------
+    @_guard_operation("move_j", RobotState.MOVING)
     def move_j(
         self,
         joint_angles: Iterable[float],
@@ -1013,6 +1471,7 @@ class FafuRobotController:
             block=block,
         )
 
+    @_guard_operation("move_jntspace_path", RobotState.MOVING)
     def move_jntspace_path(
         self,
         path,
@@ -1087,6 +1546,7 @@ class FafuRobotController:
             )
             time.sleep(max(0.005, control_frequency))
 
+    @_guard_operation("move_jntspace_path_mit", RobotState.MOVING)
     def move_jntspace_path_mit(
         self,
         path,
@@ -1277,6 +1737,11 @@ class FafuRobotController:
             print("[FafuRobot] servo_start: already servoing; call servo_end first")
             return
 
+        # State-machine guard. ``allow_disabled`` because servo_start
+        # enables the motors itself below; but reject if disconnected /
+        # estopped / busy with another operation.
+        self._require_ready("servo_start", allow_disabled=True)
+
         opts = ServoOpts(**vars(opts)) if opts is not None else ServoOpts()
         if opts.watchdog_ms < 0:
             opts.watchdog_ms = 0
@@ -1407,6 +1872,7 @@ class FafuRobotController:
         self._servo_max_motor_id = int(max(self._cfg.motor_ids))
         self._servo_max_torque = int(self._cfg.max_torque_raw)
         self._servo_active = True
+        self._set_state(RobotState.SERVOING)
         self._servo_tick_count = 0
         self._servo_clamp_count = 0
         self._servo_lag_count = 0
@@ -1464,6 +1930,11 @@ class FafuRobotController:
             return False
         if not self._servo_active or self._servo_opts is None:
             print("[FafuRobot] servo_j: not in a servo session; call servo_start first")
+            return False
+        # Power/CAN-loss guard: if the motors have gone silent mid-stream,
+        # latch DEAD and stop sending so a power-return cannot resume motion.
+        # (_enter_dead clears _servo_active, so subsequent ticks return early.)
+        if not self._stream_link_ok():
             return False
 
         opts = self._servo_opts
@@ -1578,13 +2049,14 @@ class FafuRobotController:
         # (f) Defense 4 — soft limits handled inside set_many_pos_vel_tqe_partial.
 
         # (g) Send one frame on the configured channel.
-        #   - default (use_mit=False): 0x8090 position+vel+maxtqe partial.
+        #   - use_mit=True (DEFAULT): 0x8093 group MIT (kp/kd + gravity
+        #     feed-forward). pos/vel here are already in turns / turns-per-sec,
+        #     exactly what set_many_mit wants (PosUnit.Turns); kp/kd raw
+        #     precomputed in servo_start; gravity tau computed from the target
+        #     pose each tick.
+        #   - use_mit=False (fallback): 0x8090 position+vel+maxtqe partial.
         #     Firmware position loop tracks; hold motors held at cached pos.
         #     Hot path is entirely C++ (numpy memcpy), ~5us per tick.
-        #   - use_mit=True: 0x8093 group MIT (kp/kd + gravity feed-forward).
-        #     pos/vel here are already in turns / turns-per-sec, exactly what
-        #     set_many_mit wants (PosUnit.Turns); kp/kd raw precomputed in
-        #     servo_start; gravity tau computed from the target pose each tick.
         try:
             if opts.use_mit:
                 if opts.mit_gravity_ff and self.has_dynamics:
@@ -1731,6 +2203,15 @@ class FafuRobotController:
               f"(~{rate:.1f} Hz){warn_tag}")
 
         self._servo_active = False
+        # State machine: "hold" -> position control (IDLE, ready to chain
+        # another move); "brake" -> short-circuit brake (BRAKED); "stop" ->
+        # free-spin (DISABLED). Do not clobber a latched ESTOP.
+        if self._state is RobotState.SERVOING:
+            self._set_state(
+                RobotState.IDLE if finish_mode == "hold"
+                else RobotState.BRAKED if finish_mode == "brake"
+                else RobotState.DISABLED
+            )
         # NOTE: tick_count / clamp_count / lag_count / aborted_reason
         # are intentionally NOT zeroed here so user code can read them
         # via :attr:`servo_lag_count` etc. *after* the loop ends.
@@ -2558,6 +3039,11 @@ class FafuRobotController:
                 f"move_MIT: group MIT frame holds <=6 motors, but "
                 f"num_joints={n}. Use --gripper-id so the gripper is excluded, "
                 f"or drive extra joints on a separate frame.")
+        # Power/CAN-loss guard for the MIT replay / teleop hot loop: if the
+        # motors went silent mid-stream, latch DEAD and send nothing so power
+        # returning cannot resume the trajectory.
+        if not self._stream_link_ok():
+            return {}
         pos = np.asarray(list(pos), dtype=float)
         vel = np.asarray(list(vel), dtype=float)
         tau = np.asarray(list(tau), dtype=float)
@@ -2798,7 +3284,13 @@ class FafuRobotController:
             after braking).
         """
         self._require_dynamics()
-        if not self.is_enabled:
+        # State-machine guard. A dry-run only computes/prints torque and
+        # never touches the motors, so it is allowed from any live state;
+        # a live run enables the motors itself (allow_disabled) but must
+        # not start while disconnected / estopped / busy.
+        if not dry_run:
+            self._require_ready("start_gravity_compensation", allow_disabled=True)
+        if not dry_run and not self.is_enabled:
             print("[FafuRobot] start_gravity_compensation: enabling motors ...")
             self.enable()
 
@@ -2897,11 +3389,17 @@ class FafuRobotController:
         last_t = t0
         last_log = t0
         self._gravity_comp_active = True
+        if not dry_run:
+            self._set_state(RobotState.GRAVITY_COMP)
         try:
             while True:
                 tick_start = time.monotonic()
                 if abort_check is not None and abort_check():
                     print("[FafuRobot] gravity-comp: abort_check -> stop")
+                    break
+                # Power/CAN-loss guard: stop feeding torque the instant the
+                # link drops so power-return cannot resume the float loop.
+                if not self._stream_link_ok():
                     break
                 if duration is not None and (tick_start - t0) >= duration:
                     break
@@ -2994,6 +3492,12 @@ class FafuRobotController:
             print("\n[FafuRobot] gravity-comp interrupted by user")
         finally:
             self._gravity_comp_active = False
+            # Leave the GRAVITY_COMP busy-state NOW (before the teardown
+            # below, which calls guarded methods like enable()/go_home()
+            # that would otherwise be rejected as "arm busy"). Preserve a
+            # latched ESTOP if one fired mid-loop.
+            if self._state is RobotState.GRAVITY_COMP:
+                self._set_state(RobotState.DISABLED)
             # SAFER teardown: instead of dropping to free-spin (limp -> heavy
             # links fall), re-engage *position hold* at the current pose via
             # the verified position channel (set_pos_vel_acc, NOT a torque
@@ -3041,6 +3545,12 @@ class FafuRobotController:
                 # every joint (freeze-in-place, no stiff grab jolt).
                 self._brake_joints()
                 print("[FafuRobot] gravity-comp stopped (joints braked).")
+            # Final resting state: joints are braked (or homed+braked) via
+            # _brake_joints() (mode 0x0F) -> BRAKED. The transient enable()/
+            # go_home() inside home_on_exit may have flipped us to IDLE, so
+            # correct it here. Do not clobber a latched ESTOP / DEAD.
+            if not dry_run and self._state not in (RobotState.ESTOP, RobotState.DEAD):
+                self._set_state(RobotState.BRAKED)
 
     @property
     def is_gravity_compensating(self) -> bool:
@@ -3067,6 +3577,7 @@ class FafuRobotController:
     # ------------------------------------------------------------------
     #  Cartesian motion (placeholders)
     # ------------------------------------------------------------------
+    @_guard_operation("move_p", RobotState.MOVING)
     def move_p(
         self,
         pos: Iterable[float],
@@ -3123,6 +3634,7 @@ class FafuRobotController:
         self.move_j(q, is_radians=True, speed=speed, block=block)
         return q
 
+    @_guard_operation("move_l", RobotState.MOVING)
     def move_l(
         self,
         pos: Iterable[float],
@@ -3352,6 +3864,7 @@ class FafuRobotController:
             raise RuntimeError(
                 "FafuRobotController was constructed without a gripper"
             )
+        self._require_gripper_ready("gripper_control")
         pos_turns = self._rad_to_turns(angle) if is_radians else angle / 360.0
 
         if effort is None:
@@ -3534,6 +4047,7 @@ class FafuRobotController:
     _GRASP_VEL_DEFAULT = 0.15            # turns/s (~ 54 deg/s)
     _GRASP_FORCE_THRESHOLD_DEFAULT = 500 # raw int16, conservative
 
+    @_guard_operation("grasp", RobotState.GRASPING)
     def grasp(
         self,
         *,
@@ -3761,16 +4275,40 @@ class FafuRobotController:
     #  Safety
     # ------------------------------------------------------------------
     def emergency_stop(self) -> None:
-        """Immediately stop every motor (free-spin mode)."""
+        """Immediately stop every motor (free-spin mode) and latch ESTOP.
+
+        Legal from **any** connected state (this is the one call allowed
+        to interrupt a blocking operation, e.g. from a signal handler).
+        Latches :attr:`RobotState.ESTOP`; all subsequent motion calls are
+        rejected until :meth:`resume` is called.  The latch also survives
+        an in-flight guarded operation finishing (its ``finally`` will
+        not overwrite ESTOP).
+        """
         for mid in self._cfg.motor_ids:
             try:
                 self._ht.stop(mid)
             except Exception:
                 pass
+        self._last_cmd_turns = None
+        self._servo_active = False
+        # Preserve a latched DEAD (needs recover(), not resume()); otherwise latch ESTOP.
+        if self._state is not RobotState.DEAD:
+            self._set_state(RobotState.ESTOP)
         print("[FafuRobot] EMERGENCY STOP issued (all motors → mode 0x00).")
 
     def resume(self) -> None:
-        """Re-enable position control after an emergency stop."""
+        """Clear an emergency stop and re-enable position control.
+
+        Routes through :meth:`enable`, which transitions the state back
+        to ``IDLE`` on success.
+        """
+        if self._state is RobotState.DEAD:
+            print("[FafuRobot] resume: state is DEAD (power/CAN lost); use "
+                  "recover(confirm=True) after restoring power, not resume().")
+            return
+        if self._state is not RobotState.ESTOP:
+            print(f"[FafuRobot] resume: not in ESTOP (state={self._state}); "
+                  "re-enabling anyway.")
         self.enable()
 
     # ------------------------------------------------------------------
@@ -3876,6 +4414,7 @@ class FafuRobotController:
             self._ht.close()
         except Exception:
             pass
+        self._set_state(RobotState.DISCONNECTED)
         print(f"[FafuRobot] connection closed "
               f"(joints={joint_release}, gripper={gripper_release}).")
 

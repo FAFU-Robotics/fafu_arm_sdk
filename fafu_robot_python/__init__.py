@@ -64,11 +64,15 @@ if _HERE not in _sys.path:
 from fafu_robot_controller import (  # noqa: E402
     FafuRobotController,
     GraspResult,
+    RobotState,
+    RobotStateError,
 )
 
 __all__ = [
     "FafuRobotController",
     "GraspResult",
+    "RobotState",
+    "RobotStateError",
 ]
 
 __version__ = "0.1.0"
