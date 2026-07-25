@@ -42,6 +42,34 @@ double monotonic_seconds() {
     return std::chrono::duration<double>(clk::now() - t0).count();
 }
 
+fafu::core::FinishMode to_finish_mode(ReleaseMode mode) {
+    switch (mode) {
+        case ReleaseMode::Stop:  return fafu::core::FinishMode::Stop;
+        case ReleaseMode::Brake: return fafu::core::FinishMode::Brake;
+        case ReleaseMode::Hold:  return fafu::core::FinishMode::Hold;
+    }
+    return fafu::core::FinishMode::Stop;
+}
+
+class CoreLease {
+public:
+    CoreLease(fafu::core::RobotCore& core, fafu::core::OperationKind kind)
+        : core_(&core), token_(core.begin_operation(kind)) {}
+
+    ~CoreLease() {
+        if (core_ != nullptr) {
+            try { core_->end_operation(token_); } catch (...) {}
+        }
+    }
+
+    CoreLease(const CoreLease&) = delete;
+    CoreLease& operator=(const CoreLease&) = delete;
+
+private:
+    fafu::core::RobotCore* core_;
+    std::uint64_t token_;
+};
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -141,34 +169,27 @@ FafuRobotController::FafuRobotController(const std::string& cfg_path,
     // 6) 通信预检 (每个电机读一次状态)
     precheck_communication_();
 
-    // 7) auto_enable (先 enable_async_rx 之前必须 set_motor_mode, 不能颠倒)
+    fafu::core::CoreConfig core_cfg;
+    core_cfg.all_motor_ids = cfg_.motor_ids;
+    core_cfg.joint_motor_ids = joint_motor_ids_;
+    core_cfg.joint_motor_models.assign(joint_motor_ids_.size(), "");
+    core_cfg.max_torque_raw = cfg_.max_torque_raw;
+    core_cfg.stale_feedback_timeout_ms = 500.0;
+    core_cfg.polling_rate_hz =
+        std::max(10.0, cfg_.control_rate_hz > 0.0
+            ? cfg_.control_rate_hz : 50.0);
+    core_ = std::make_unique<fafu::core::RobotCore>(*ht_, core_cfg);
+
+    // 7) enable before asynchronous receive, then start the owned transport.
     if (opts.auto_enable) enable();
 
-    // 8) async_rx
-    bool use_async = opts.async_rx.has_value() ? *opts.async_rx : cfg_.use_async_rx;
-    if (use_async) {
-        try {
-            ht_->enable_async_rx();
-            owns_rx_ = true;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            for (int mid : cfg_.motor_ids) {
-                ht_->read_motor_state(mid, 0.1);
-            }
-        } catch (const std::exception& e) {
-            log_warn(std::string("enable_async_rx 失败: ") + e.what());
-        }
-    }
-
-    // 9) auto_polling
-    if (opts.auto_polling) {
-        try {
-            double hz = cfg_.control_rate_hz > 0 ? cfg_.control_rate_hz : 50.0;
-            if (hz < 10.0) hz = 10.0;
-            ht_->start_state_polling(cfg_.motor_ids, hz);
-            owns_polling_ = true;
-        } catch (const std::exception& e) {
-            log_warn(std::string("start_state_polling 失败: ") + e.what());
-        }
+    const bool use_async =
+        opts.async_rx.has_value() ? *opts.async_rx : cfg_.use_async_rx;
+    try {
+        core_->start_transport(
+            use_async, opts.auto_polling, core_cfg.polling_rate_hz);
+    } catch (const std::exception& error) {
+        log_warn(std::string("start_transport failed: ") + error.what());
     }
 
     std::ostringstream oss;
@@ -191,63 +212,64 @@ FafuRobotController::~FafuRobotController() {
 //  状态
 // ============================================================================
 bool FafuRobotController::is_enabled() {
-    if (!ht_) return false;
+    if (!ht_ || !ht_->is_open()) return false;
     for (int mid : cfg_.motor_ids) {
-        auto s = ht_->get_state(mid);
-        if (!s) s = ht_->read_motor_state(mid, 0.05);
-        if (!s || s->mode != static_cast<int>(MODE_POSITION)) return false;
+        auto state = ht_->get_state(mid);
+        if (!state) state = ht_->read_motor_state(mid, 0.05);
+        if (!state || state->mode != static_cast<int>(MODE_POSITION)) {
+            return false;
+        }
     }
     return true;
+}
+
+fafu::core::RobotState FafuRobotController::state() const {
+    return core_ ? core_->state() : fafu::core::RobotState::Disconnected;
+}
+
+fafu::core::HealthSnapshot FafuRobotController::health() const {
+    if (!core_) return {};
+    return core_->health();
+}
+
+bool FafuRobotController::check_alive(bool fresh, double timeout_s) {
+    return core_ && core_->check_alive(fresh, timeout_s);
+}
+
+bool FafuRobotController::recover(bool confirm, double timeout_s) {
+    if (!confirm) {
+        throw std::invalid_argument(
+            "recover requires confirm=true after checking the workspace");
+    }
+    return core_ && core_->recover(true, timeout_s);
 }
 
 // ============================================================================
 //  电源管理
 // ============================================================================
 void FafuRobotController::enable() {
-    if (!switch_mode_all_(MODE_POSITION, "position", 3)) {
-        throw std::runtime_error(
-            "enable 失败: 至少有一个电机拒绝 mode 0x0A; 请重新上电后重试");
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+    const auto result = core_->enable();
+    if (!result.success) {
+        std::ostringstream message;
+        message << "enable failed: " << result.message;
+        if (!result.failed_motor_ids.empty()) {
+            message << " (motors";
+            for (int id : result.failed_motor_ids) message << ' ' << id;
+            message << ')';
+        }
+        throw std::runtime_error(message.str());
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    log_info("all motors enabled (position control hold).");
 }
 
 void FafuRobotController::disable() {
-    if (switch_mode_all_(MODE_STOP, "stop", 2)) {
-        log_info("all motors disabled (free spin).");
-    }
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+    core_->disable();
 }
 
 void FafuRobotController::brake() {
-    if (switch_mode_all_(MODE_BRAKE, "brake", 2)) {
-        log_info("all motors braked.");
-    }
-}
-
-bool FafuRobotController::switch_mode_all_(uint8_t mode, const char* label, int max_retry) {
-    bool overall_ok = true;
-    for (int mid : cfg_.motor_ids) {
-        bool ok = false;
-        for (int attempt = 0; attempt < std::max(1, max_retry); ++attempt) {
-            try {
-                auto st = ht_->set_motor_mode(mid, mode);
-                if (st && st->mode == static_cast<int>(mode)) {
-                    ok = true;
-                    break;
-                }
-            } catch (const std::exception&) {
-                // 重试
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        }
-        if (!ok) {
-            std::ostringstream oss;
-            oss << "switch_mode_all(" << label << "): motor " << mid << " 未确认 mode";
-            log_warn(oss.str());
-            overall_ok = false;
-        }
-    }
-    return overall_ok;
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+    core_->brake();
 }
 
 // ============================================================================
@@ -255,6 +277,11 @@ bool FafuRobotController::switch_mode_all_(uint8_t mode, const char* label, int 
 // ============================================================================
 bool FafuRobotController::move_j(const std::vector<double>& joint_angles,
                                  const MoveOpts& opts) {
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+    CoreLease operation(*core_, fafu::core::OperationKind::JointMotion);
+    if (!core_->stream_link_ok()) {
+        throw fafu::core::StateError(core_->dead_reason());
+    }
     auto angles_turns = validate_joint_angles_(joint_angles, opts.is_radians);
     if (angles_turns.empty()) return false;
 
@@ -282,7 +309,9 @@ bool FafuRobotController::move_j(const std::vector<double>& joint_angles,
     int max_mid = 0;
     for (int mid : cfg_.motor_ids) max_mid = std::max(max_mid, mid);
     try {
-        ht_->set_many_pos_vel_tqe(cmds, hightorque::PosUnit::Turns, max_mid, 0.05);
+        auto command = core_->command_guard();
+        ht_->set_many_pos_vel_tqe(
+            cmds, hightorque::PosUnit::Turns, max_mid, 0.05);
     } catch (const std::exception& e) {
         log_warn(std::string("move_j (no block) 失败: ") + e.what());
         return false;
@@ -303,208 +332,55 @@ bool FafuRobotController::go_home(int speed, bool block) {
 //  Servo (online streaming)
 // ============================================================================
 void FafuRobotController::servo_start(const ServoOpts& opts) {
-    if (!ht_) throw std::runtime_error("ht_ is null");
-    if (servo_active_) {
-        log_warn("servo_start: 已经在 servo 会话里, 先 servo_end() 再重启");
-        return;
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+
+    if (!opts.motor_models.empty()) {
+        core_->set_joint_motor_models(opts.motor_models);
     }
 
-    // 复制 opts, 检查/夹一些值
-    servo_opts_ = opts;
-    if (servo_opts_.watchdog_ms < 0) servo_opts_.watchdog_ms = 0;
-    if (servo_opts_.watchdog_ms == 0) {
-        log_warn("servo_start: watchdog_ms=0, 已禁用固件看门狗! "
-                 "上位机崩溃 / Ctrl-C 后电机会失控冲到限位. 仅用于离线测试.");
-    } else if (servo_opts_.watchdog_ms < 30) {
-        log_warn("servo_start: watchdog_ms 太小 (<30ms), 100Hz 控制下可能误触发. "
-                 "建议至少 50ms.");
-    }
-    if (servo_opts_.max_vel <= 0.0)      servo_opts_.max_vel = 1.0;
-    if (servo_opts_.max_step_rad <= 0.0) servo_opts_.max_step_rad = 0.05;
-    // max_lag_rad <= 0 表示禁用, 保留
-
-    // 1) 确保关节电机都处于 ACTIVE 模式. 如果用户没 enable, 帮他做.
-    if (!is_enabled()) {
-        log_info("servo_start: motors not enabled, calling enable() ...");
-        enable();
-    }
-
-    // 2) 强制 async_rx — servo 频率不能容忍同步 RX 的 5-15ms 串口等待
-    if (!ht_->is_async_rx()) {
-        try {
-            ht_->enable_async_rx();
-            owns_rx_ = true;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        } catch (const std::exception& e) {
-            throw std::runtime_error(std::string("servo_start: enable_async_rx 失败: ") + e.what());
-        }
-    }
-
-    // 3) 抓当前位置作为 last_target_, 避免首次 servo_j 触发 step clamp
-    servo_last_target_turns_.assign(joint_motor_ids_.size(), 0.0);
-    for (size_t i = 0; i < joint_motor_ids_.size(); ++i) {
-        int mid = joint_motor_ids_[i];
-        auto s = ht_->get_state(mid);
-        if (!s) s = ht_->read_motor_state(mid, 0.1);
-        if (!s) {
-            throw std::runtime_error("servo_start: 无法读取电机 " + std::to_string(mid)
-                                     + " 起始位置");
-        }
-        servo_last_target_turns_[i] = s->position;
-    }
-
-    // 4) 写固件 watchdog 到每个关节电机 (★ 不写夹爪 ★)
-    if (servo_opts_.watchdog_ms > 0) {
-        for (int mid : joint_motor_ids_) {
-            try {
-                ht_->set_timeout(mid, static_cast<int16_t>(servo_opts_.watchdog_ms));
-            } catch (const std::exception& e) {
-                log_warn(std::string("servo_start: set_timeout(") + std::to_string(mid)
-                         + ") 失败: " + e.what());
-            }
-        }
-    }
-
-    servo_active_     = true;
-    servo_tick_count_ = 0;
-    servo_started_at_ = std::chrono::steady_clock::now();
-
-    std::ostringstream oss;
-    oss << "servo_start: watchdog=" << servo_opts_.watchdog_ms << "ms"
-        << ", max_vel=" << servo_opts_.max_vel << "rad/s"
-        << ", max_step=" << servo_opts_.max_step_rad << "rad"
-        << ", max_lag=" << servo_opts_.max_lag_rad << "rad";
-    log_info(oss.str());
+    fafu::core::ServoOptions native;
+    native.watchdog_ms = opts.watchdog_ms;
+    native.max_velocity_rad_s = opts.max_vel;
+    native.max_step_rad = opts.max_step_rad;
+    native.max_lag_rad = opts.max_lag_rad;
+    native.nominal_rate_hz = opts.rate_hz;
+    native.input_is_radians = opts.is_radians;
+    native.feedforward_velocity = opts.feedforward_vel;
+    native.lookahead_time_s = opts.lookahead_time;
+    native.lag_abort_consecutive = opts.lag_abort_consecutive;
+    native.channel = opts.use_mit
+        ? fafu::core::ServoChannel::Mit
+        : fafu::core::ServoChannel::Position;
+    native.mit_kp = opts.mit_kp;
+    native.mit_kd = opts.mit_kd;
+    core_->servo_start(native);
 }
 
-bool FafuRobotController::servo_j(const std::vector<double>& target_angles) {
-    if (!servo_active_) {
-        log_warn("servo_j: 没在 servo 会话里, 先调 servo_start()");
-        return false;
+bool FafuRobotController::servo_j(
+        const std::vector<double>& target_angles) {
+    if (!core_) return false;
+    const auto result = core_->servo_tick(target_angles);
+    if (!result.sent && !result.message.empty()) {
+        log_warn("servo_j: " + result.message);
     }
-    if (target_angles.size() != joint_motor_ids_.size()) {
-        std::ostringstream oss;
-        oss << "servo_j: 入参长度 " << target_angles.size() << " != num_joints "
-            << joint_motor_ids_.size();
-        log_warn(oss.str());
-        return false;
-    }
-
-    const size_t N = joint_motor_ids_.size();
-
-    // (a) 转 turns + NaN 检查
-    std::vector<double> target_turns(N);
-    for (size_t i = 0; i < N; ++i) {
-        double a = target_angles[i];
-        if (std::isnan(a) || std::isinf(a)) {
-            log_warn("servo_j: target 含 NaN/Inf, 拒绝发送");
-            return false;
-        }
-        target_turns[i] = servo_opts_.is_radians ? rad_to_turns_(a) : (a / 360.0);
-    }
-
-    // (b) 防线 2: 单步限幅 (跟上次 target 比)
-    const double max_step_turns = std::abs(servo_opts_.max_step_rad) / kTwoPi;
-    bool was_clamped = false;
-    for (size_t i = 0; i < N; ++i) {
-        double delta = target_turns[i] - servo_last_target_turns_[i];
-        if (std::abs(delta) > max_step_turns) {
-            target_turns[i] = servo_last_target_turns_[i]
-                            + std::copysign(max_step_turns, delta);
-            was_clamped = true;
-        }
-    }
-    if (was_clamped) {
-        log_warn("servo_j: 单步幅度超过 max_step_rad, 已 clamp. "
-                 "通常说明上层规划周期 / 速度配错了.");
-    }
-
-    // (c) 防线 3: 跟踪误差 (实测 vs target). 0 / 负 = 禁用
-    if (servo_opts_.max_lag_rad > 0.0) {
-        const double max_lag_turns = servo_opts_.max_lag_rad / kTwoPi;
-        for (size_t i = 0; i < N; ++i) {
-            int mid = joint_motor_ids_[i];
-            auto s = ht_->get_state(mid);
-            if (!s) continue;   // 缓存还没数据, 不卡死, 下个 tick 再说
-            double lag = std::abs(s->position - target_turns[i]);
-            if (lag > max_lag_turns) {
-                std::ostringstream oss;
-                oss << "servo_j: motor " << mid << " 跟踪误差 "
-                    << (lag * kTwoPi) << " rad > max_lag_rad "
-                    << servo_opts_.max_lag_rad << " rad. "
-                    << "检查机械负载 / max_vel / 上层规划频率.";
-                log_warn(oss.str());
-                return false;
-            }
-        }
-    }
-
-    // (d) 防线 4: 软限位由底层 set_many_pos_vel_tqe 内 apply_position_limit_ 处理,
-    //     这里不重复 clamp.
-
-    // (e) 组帧: 关节电机走 target, 夹爪不动 (保持当前位置 hold)
-    const double vel_rps = servo_opts_.max_vel / kTwoPi;
-    std::map<int, double> targets_map;
-    for (size_t i = 0; i < N; ++i) {
-        targets_map[joint_motor_ids_[i]] = target_turns[i];
-    }
-    auto cmds = build_many_cmds_holding_others_(targets_map, vel_rps);
-
-    int max_mid = 0;
-    for (int mid : cfg_.motor_ids) max_mid = std::max(max_mid, mid);
-
-    try {
-        // timeout 给 0: async 模式下底层不阻塞等回包, 立即返回; servo 周期
-        // 由上层负责 (sleep_until next_tick)
-        ht_->set_many_pos_vel_tqe(cmds, hightorque::PosUnit::Turns, max_mid, 0.0);
-    } catch (const std::exception& e) {
-        log_warn(std::string("servo_j: 发送失败: ") + e.what());
-        return false;
-    }
-
-    // 更新 last_target 必须放到成功 send 之后, 否则 step clamp 会基于
-    // "曾经想发但失败了的点"再 clamp.
-    servo_last_target_turns_ = target_turns;
-    ++servo_tick_count_;
-    return true;
+    return result.sent && !result.aborted;
 }
 
 void FafuRobotController::servo_end(ReleaseMode finish_mode) {
-    if (!servo_active_) {
-        log_warn("servo_end: 不在 servo 会话里, 直接返回");
-        return;
+    if (!core_) return;
+    const auto summary = core_->servo_end(to_finish_mode(finish_mode));
+    std::ostringstream message;
+    message << "servo_end (" << release_mode_name_(finish_mode) << "): "
+            << summary.tick_count << " ticks in " << summary.elapsed_s
+            << "s (~" << summary.average_rate_hz << " Hz)";
+    if (!summary.aborted_reason.empty()) {
+        message << " [aborted: " << summary.aborted_reason << ']';
     }
+    log_info(message.str());
+}
 
-    // 1) 先清掉 watchdog (set_timeout 0 = 禁用), 避免在切 mode 期间被自动 brake
-    if (servo_opts_.watchdog_ms > 0) {
-        for (int mid : joint_motor_ids_) {
-            try { ht_->set_timeout(mid, 0); } catch (...) {}
-        }
-    }
-
-    // 2) 按 finish_mode 处理. 关节走 finish_mode, 夹爪不动 (servo 不管夹爪)
-    for (int mid : joint_motor_ids_) {
-        try {
-            switch (finish_mode) {
-                case ReleaseMode::Stop:  ht_->stop(mid);                       break;
-                case ReleaseMode::Brake: ht_->set_motor_mode(mid, MODE_BRAKE); break;
-                case ReleaseMode::Hold:  /* 保持 MODE_ACTIVE + 最后一帧 */    break;
-            }
-        } catch (...) {}
-    }
-
-    double elapsed = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - servo_started_at_).count();
-    double rate = elapsed > 0 ? servo_tick_count_ / elapsed : 0.0;
-    std::ostringstream oss;
-    oss << "servo_end (" << release_mode_name_(finish_mode) << "): "
-        << servo_tick_count_ << " ticks in " << elapsed << "s "
-        << "(~" << rate << " Hz)";
-    log_info(oss.str());
-
-    servo_active_     = false;
-    servo_tick_count_ = 0;
-    servo_last_target_turns_.clear();
+bool FafuRobotController::is_servoing() const {
+    return core_ && core_->is_servoing();
 }
 
 // ============================================================================
@@ -553,12 +429,18 @@ FafuRobotController::get_motor_states(bool prefer_cache) {
 // ============================================================================
 std::optional<GraspResult>
 FafuRobotController::gripper_control(double angle, const GripperOpts& opts) {
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+    CoreLease operation(*core_, fafu::core::OperationKind::GripperMotion);
     if (!has_gripper_)
         throw std::runtime_error("FafuRobotController was constructed without a gripper");
+    if (!core_->stream_link_ok()) {
+        throw fafu::core::StateError(core_->dead_reason());
+    }
 
     double pos_turns = opts.is_radians ? rad_to_turns_(angle) : (angle / 360.0);
 
-    try {
+    {
+        auto command = core_->command_guard();
         if (opts.effort.has_value()) {
             ht_->set_pos_vel_tqe(gripper_motor_id_, pos_turns, opts.vel,
                                  *opts.effort, hightorque::PosUnit::Turns);
@@ -566,9 +448,6 @@ FafuRobotController::gripper_control(double angle, const GripperOpts& opts) {
             ht_->set_pos_vel_acc(gripper_motor_id_, pos_turns, opts.vel,
                                  opts.acc, hightorque::PosUnit::Turns);
         }
-    } catch (const std::exception& e) {
-        log_warn(std::string("gripper_control send 失败: ") + e.what());
-        return std::nullopt;
     }
 
     if (!opts.block) return std::nullopt;
@@ -589,6 +468,9 @@ bool FafuRobotController::open_gripper(std::optional<double> angle,
                                        const GripperOpts& opts) {
     if (!has_gripper_)
         throw std::runtime_error("FafuRobotController was constructed without a gripper");
+    if (!core_->stream_link_ok()) {
+        throw fafu::core::StateError(core_->dead_reason());
+    }
 
     double target_turns;
     if (angle.has_value()) {
@@ -626,6 +508,8 @@ bool FafuRobotController::close_gripper(std::optional<double> angle,
 }
 
 GraspResult FafuRobotController::grasp(const GraspOpts& opts) {
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+    CoreLease operation(*core_, fafu::core::OperationKind::Grasp);
     if (!has_gripper_)
         throw std::runtime_error("FafuRobotController was constructed without a gripper");
 
@@ -638,7 +522,8 @@ GraspResult FafuRobotController::grasp(const GraspOpts& opts) {
         target_turns = lim ? lim->first : kGripperFallbackCloseTurns;
     }
 
-    try {
+    {
+        auto command = core_->command_guard();
         if (opts.effort.has_value()) {
             ht_->set_pos_vel_tqe(gripper_motor_id_, target_turns, opts.vel,
                                  *opts.effort, hightorque::PosUnit::Turns);
@@ -646,8 +531,6 @@ GraspResult FafuRobotController::grasp(const GraspOpts& opts) {
             ht_->set_pos_vel_acc(gripper_motor_id_, target_turns, opts.vel,
                                  opts.acc, hightorque::PosUnit::Turns);
         }
-    } catch (const std::exception& e) {
-        log_warn(std::string("grasp send 失败: ") + e.what());
     }
 
     double min_progress_turns = std::max(0.0, opts.min_close_deg) / 360.0;
@@ -699,14 +582,15 @@ void FafuRobotController::clear_limits() {
 //  急停 / 状态
 // ============================================================================
 void FafuRobotController::emergency_stop() {
-    for (int mid : cfg_.motor_ids) {
-        try { ht_->stop(mid); } catch (...) {}
-    }
+    if (core_) core_->emergency_stop();
     log_warn("EMERGENCY STOP issued — all motors PWM off");
 }
 
 void FafuRobotController::resume() {
-    enable();
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+    if (!core_->resume()) {
+        throw std::runtime_error("resume failed to enable all motors");
+    }
 }
 
 hightorque::CanStatus FafuRobotController::get_can_status() {
@@ -718,6 +602,14 @@ void FafuRobotController::reset_zero(int motor_id, bool confirm) {
         log_warn("reset_zero: confirm=false, 跳过. 这是硬件级永久标定, 请显式 confirm=true.");
         return;
     }
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+    if (std::find(cfg_.motor_ids.begin(), cfg_.motor_ids.end(), motor_id) ==
+        cfg_.motor_ids.end()) {
+        throw std::invalid_argument("reset_zero motor is not configured");
+    }
+
+    CoreLease operation(*core_, fafu::core::OperationKind::RawStream);
+    auto command = core_->command_guard();
     auto msg = ht_->reset_zero(motor_id);
     std::ostringstream oss;
     oss << "reset_zero motor " << motor_id << ": " << msg;
@@ -727,70 +619,51 @@ void FafuRobotController::reset_zero(int motor_id, bool confirm) {
 // ============================================================================
 //  close_connection
 // ============================================================================
-void FafuRobotController::close_connection(ReleaseMode joint_release,
-                                           ReleaseMode gripper_release) {
-    if (!ht_) return;
-
-    // 如果还在 servo 会话, 先优雅退出 (清看门狗, 关节按 joint_release 处理)
-    if (servo_active_) {
-        try { servo_end(joint_release); } catch (...) {}
+void FafuRobotController::close_connection(
+        ReleaseMode joint_release, ReleaseMode gripper_release) {
+    if (!ht_ || !core_ ||
+        core_->state() == fafu::core::RobotState::Disconnected) {
+        return;
     }
 
-    try {
-        if (ht_->is_polling()) ht_->stop_state_polling();
-    } catch (...) {}
+    core_->shutdown(
+        to_finish_mode(joint_release),
+        to_finish_mode(gripper_release),
+        5.0);
+    ht_->close();
 
-    try {
-        if (ht_->is_async_rx()) ht_->disable_async_rx();
-    } catch (...) {}
-
-    auto mode_for = [](ReleaseMode r) -> uint8_t {
-        switch (r) {
-            case ReleaseMode::Stop:  return MODE_STOP;
-            case ReleaseMode::Brake: return MODE_BRAKE;
-            case ReleaseMode::Hold:  return MODE_POSITION;
-        }
-        return MODE_STOP;
-    };
-
-    for (int mid : cfg_.motor_ids) {
-        ReleaseMode policy =
-            (has_gripper_ && mid == gripper_motor_id_) ? gripper_release : joint_release;
-        try {
-            if (policy == ReleaseMode::Stop) {
-                ht_->stop(mid);
-            } else {
-                ht_->set_motor_mode(mid, mode_for(policy));
-            }
-        } catch (...) {}
-    }
-
-    try { ht_->close(); } catch (...) {}
-
-    std::ostringstream oss;
-    oss << "connection closed (joints=" << release_mode_name_(joint_release)
-        << ", gripper=" << release_mode_name_(gripper_release) << ").";
-    log_info(oss.str());
-
-    ht_.reset();
+    std::ostringstream message;
+    message << "connection closed (joints="
+            << release_mode_name_(joint_release)
+            << ", gripper=" << release_mode_name_(gripper_release) << ").";
+    log_info(message.str());
 }
 
 // ============================================================================
 //  内部 helpers
 // ============================================================================
-std::string FafuRobotController::pick_serial_port_(const std::string& preferred) {
-    if (preferred.empty() || preferred == "auto") {
-        auto candidates = hightorque::find_likely_debug_boards();
-        if (candidates.empty())
-            throw std::runtime_error("auto: 未找到候选 USB 调试板, 检查 USB / 驱动");
-        if (candidates.size() > 1) {
-            std::ostringstream oss;
-            oss << "auto: 找到多个候选端口, 取第一个: " << candidates.front().port;
-            log_warn(oss.str());
-        }
-        return candidates.front().port;
+std::string FafuRobotController::pick_serial_port_(
+        const std::string& preferred) {
+    if (!preferred.empty() && preferred != "auto") {
+        return preferred;
     }
-    return preferred;
+
+    const auto candidates = hightorque::find_likely_debug_boards();
+    if (candidates.empty()) {
+        throw std::runtime_error(
+            "auto: no USB debug board found; specify an explicit port");
+    }
+    if (candidates.size() != 1) {
+        std::ostringstream message;
+        message << "auto: multiple USB debug boards found (";
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (i != 0) message << ", ";
+            message << candidates[i].port;
+        }
+        message << "); specify one port per SDK instance";
+        throw std::runtime_error(message.str());
+    }
+    return candidates.front().port;
 }
 
 void FafuRobotController::precheck_communication_() {
@@ -872,6 +745,14 @@ GraspResult FafuRobotController::wait_until_gripper_done_(
 
     while (true) {
         auto now = clk::now();
+        if (core_ &&
+            (core_->cancel_requested() || !core_->stream_link_ok())) {
+            const double elapsed =
+                std::chrono::duration<double>(now - t0).count();
+            return make_grasp_result_(
+                "cancelled", false, last_pos, start_pos,
+                peak_torque, elapsed);
+        }
         double elapsed_s = std::chrono::duration<double>(now - t0).count();
         if (now >= deadline) {
             return make_grasp_result_("timeout", false, last_pos, start_pos,
@@ -1050,12 +931,9 @@ void FafuRobotController::move_scurve_(const std::map<int, double>& targets_turn
             }
         }
 
-        try {
-            ht_->set_many_pos_vel_tqe(cmds, hightorque::PosUnit::Turns, max_mid, 0.0);
-        } catch (const std::exception& e) {
-            log_warn(std::string("move_scurve tick send 失败: ") + e.what());
-            return false;
-        }
+        auto command = core_->command_guard();
+        ht_->set_many_pos_vel_tqe(
+            cmds, hightorque::PosUnit::Turns, max_mid, 0.0);
         return true;
     };
 
@@ -1064,8 +942,18 @@ void FafuRobotController::move_scurve_(const std::map<int, double>& targets_turn
     loop_opts.stop_motor_ids      = cfg_.motor_ids;
     loop_opts.stop_on_finish      = false;   // 跟 Python 一致: 正常完成保持 mode=10
     loop_opts.stop_on_abort       = true;
+    loop_opts.abort_check = [this] {
+        return !core_ || core_->cancel_requested() ||
+               !core_->stream_link_ok();
+    };
 
-    ht_->run_control_loop(loop_opts, on_tick);
+    const int result = ht_->run_control_loop(loop_opts, on_tick);
+    if (result == 1) {
+        throw std::runtime_error("control loop was cancelled");
+    }
+    if (result == 2) {
+        throw std::runtime_error("control loop exited after a send error");
+    }
 }
 
 } // namespace fafu_robot

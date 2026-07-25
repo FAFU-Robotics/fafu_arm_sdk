@@ -36,7 +36,7 @@ bash linux/build.sh
 # 5) 跑原生 C++ 例程 (先跑 01_smoke 验证通信, 不动电机)
 ./build_linux/bin/01_smoke
 
-# 6) Python 侧验证 (确认 fafu_motor.so 能加载 libserial_cmake.so)
+# 6) Python 侧验证
 cd ../fafu_robot_python
 python3 -c "import fafu_motor; print(fafu_motor.__file__)"
 ```
@@ -52,7 +52,7 @@ linux/
 ├── install_deps.sh                      apt 装编译链 + Python + pybind11 + dialout 组
 ├── 99-fafu-debug-board.rules        udev 规则源文件
 ├── setup_udev.sh                        装 / 卸载 / 检查 udev 规则
-├── build.sh                             cmake 一键编译到 build_linux/, 含 Linux fixup
+├── build.sh                             cmake 一键编译到 build_linux/
 ├── build_module_only.sh                 快速重编 fafu_motor.so (换 Python 环境用)
 ├── run_rt.sh                            SCHED_FIFO + CPU affinity 启动 (servoJ 减抖必备)
 └── robot.linux.cfg                      Linux 版示例配置 (含 gripper_max_torque_raw)
@@ -70,7 +70,7 @@ linux/
 | python3-dev | **需要** (编 `fafu_motor.so`) |
 | 例程 | `01_smoke / 02_move_j / 03_gripper / 04_servo_j` |
 | 产物 | pybind11 模块 + 静态库 + 4 个 exe |
-| POST_BUILD 修复 | Linux 下 `build.sh` 会补 copy `libserial_cmake.so` 并设置 RPATH |
+| 串口依赖 | 静态链接，无额外 `.so` / RPATH 部署 |
 | RT 优先级 | **servoJ 100Hz 强烈建议** (超 watchdog_ms 会固件 brake) |
 
 ## 1. 安装依赖 `install_deps.sh`
@@ -129,7 +129,6 @@ build_linux/bin/
 ├── 02_move_j                    go_home + 多关节 S-curve (会运动)
 ├── 03_gripper                   open / close / grasp / release (会闭合)
 ├── 04_servo_j                   100Hz sin 跟踪 + 看门狗 (推荐配 run_rt.sh)
-├── libserial_cmake.so           跨平台串口库
 └── robot.cfg                    从 fafu_robot_python/robot.cfg copy 过来
 ```
 
@@ -138,28 +137,13 @@ build_linux/bin/
 ```
 fafu_robot_python/
 ├── fafu_motor.cpython-3xx-x86_64-linux-gnu.so   ← 由 build.sh 复制过来 (POST_BUILD)
-├── libserial_cmake.so                                ← 由 build.sh 复制过来 (Linux fixup)
 └── (你原来的 fafu_robot_controller.py 等)
 ```
 
-### ⚠ Linux 特有的 fixup
+### Linux 部署
 
-CMakeLists.txt 里的 POST_BUILD 只在 `if(WIN32)` 分支复制 `serial_cmake.dll` 到
-`../fafu_robot_python/`。**Linux 下这一步漏掉**，会导致：
-
-```
->>> import fafu_motor
-ImportError: libserial_cmake.so: cannot open shared object file: No such file or directory
-```
-
-`build.sh` 已经在 cmake 编译后自动做了两件事补救：
-
-1. `cp build_linux/bin/libserial_cmake.so ../fafu_robot_python/`
-2. `patchelf --set-rpath '$ORIGIN' ../fafu_robot_python/fafu_motor*.so`
-   —— 让动态加载器在 `.so` **自己的目录**里找依赖，跨机器可移植
-
-如果没装 `patchelf`（`sudo apt install patchelf`），会降级为提示手动 export
-`LD_LIBRARY_PATH`。装了最省心。
+`serial_cmake` 已静态链接进 `fafu_motor.so` 和原生 SDK，不需要复制
+`libserial_cmake.so`、设置 RPATH 或运行 `patchelf`。
 
 ## 4. Python 环境切换 (多 ABI)
 
@@ -190,7 +174,7 @@ bash linux/build_module_only.sh --python python3.11
 
 ```bash
 # 一次性授权 (推荐)
-sudo apt install patchelf util-linux
+sudo apt install util-linux
 sudo setcap cap_sys_nice=eip build_linux/bin/04_servo_j
 
 # 跑
@@ -254,32 +238,7 @@ sed -i 's|^port.*|port = /dev/fafu_debug_board|' ../fafu_robot_python/robot.cfg
 
 ## 8. 故障排查
 
-### 8.1 `import fafu_motor` 报 `libserial_cmake.so: cannot open shared object file`
-
-`build.sh` 的 Linux fixup 环节失败了。检查：
-
-```bash
-# 1. libserial_cmake.so 应该在 fafu_robot_python/
-ls -l ../fafu_robot_python/libserial_cmake.so
-
-# 2. fafu_motor.so 的 RPATH 应该是 $ORIGIN
-patchelf --print-rpath ../fafu_robot_python/fafu_motor*.so
-# 期望输出: $ORIGIN
-
-# 3. 缺什么就补什么
-sudo apt install patchelf
-cp build_linux/bin/libserial_cmake.so ../fafu_robot_python/
-patchelf --set-rpath '$ORIGIN' --force-rpath ../fafu_robot_python/fafu_motor*.so
-```
-
-万不得已（不能装 patchelf 时）：
-
-```bash
-export LD_LIBRARY_PATH="$PWD/../fafu_robot_python:$LD_LIBRARY_PATH"
-python3 -c "import fafu_motor; print('OK')"
-```
-
-### 8.2 `import fafu_motor` 报 `undefined symbol: _Py...`
+### 8.1 `import fafu_motor` 报 `undefined symbol: _Py...`
 
 Python ABI 不对：编 `.so` 时用的 Python 版本 ≠ import 时用的 Python 版本。
 
@@ -295,7 +254,7 @@ python3 --version                    # 应该跟上面 cpXX 匹配
 bash linux/build_module_only.sh --python python3.10
 ```
 
-### 8.3 `Permission denied: '/dev/ttyUSB0'`
+### 8.1 `Permission denied: '/dev/ttyUSB0'`
 
 三种方案任选（跟老 SDK 一样）：
 
@@ -305,7 +264,7 @@ bash linux/build_module_only.sh --python python3.10
 | B. 加入 dialout 组 | `sudo usermod -aG dialout $USER` + **重新登录** | 是 |
 | C. 临时 chmod | `sudo chmod 0666 /dev/ttyUSB0` | 重启失效 |
 
-### 8.4 编译报 `Could NOT find pybind11`
+### 8.1 编译报 `Could NOT find pybind11`
 
 pybind11 没装、装到别的 Python 里、或 build.sh 没找到：
 
@@ -320,7 +279,7 @@ python3 -m pip install --user pybind11
 bash linux/build.sh --python python3.10
 ```
 
-### 8.5 `04_servo_j` 跑到中途机器人突然 brake、没有报错
+### 8.1 `04_servo_j` 跑到中途机器人突然 brake、没有报错
 
 触发了固件看门狗（`watchdog_ms` 内没收到新指令，固件自动刹车）。原因：
 
@@ -331,7 +290,7 @@ bash linux/build.sh --python python3.10
   3. 关掉后台 CPU hog（浏览器 / Docker daemon / IDE）
   4. CPU governor 调 performance
 
-### 8.6 `04_servo_j` 报 `lag too large` 或 `servo_j returned false`
+### 8.1 `04_servo_j` 报 `lag too large` 或 `servo_j returned false`
 
 跟踪误差超过 `max_lag_rad`（默认 0.15 rad ≈ 8.6°）。原因：
 
@@ -340,12 +299,12 @@ bash linux/build.sh --python python3.10
 - `max_vel` 给太小
 - 应对：先 `move_j` 慢慢热身、调低 `max_vel`、加大 `max_lag_rad`
 
-### 8.7 `cmake configure` 报 `未找到 third_part/serial_cmake`
+### 8.1 `cmake configure` 报 `未找到 third_part/serial_cmake`
 
 按理不会发生（SDK 是 self-contained 的），如果发生了说明 vendor 的三方目录被误删。
 用底层串口库源码 (`third_part/serial_cmake/`) 覆盖回来即可。
 
-### 8.8 ModemManager 抢串口
+### 8.1 ModemManager 抢串口
 
 Ubuntu 桌面版常见坑：Network Manager 会自动 probe 串口看是不是 3G/4G modem，
 把调试板占住导致我们打不开。
@@ -364,7 +323,7 @@ sudo systemctl disable ModemManager               # 永久禁用 (不用 3G/4G �
 | `build.bat Debug` | `bash linux/build.sh --debug` |
 | `pip install pybind11` | 由 `install_deps.sh` 帮做 |
 | `build\bin\Release\01_smoke.exe` | `build_linux/bin/01_smoke` |
-| POST_BUILD copy `serial_cmake.dll` | `build.sh` 手动 copy `libserial_cmake.so` + `patchelf` |
+| 串口库静态链接 | 串口库静态链接 |
 | VS Console 的 UTF-8 (`/utf-8`) | Linux 终端原生 UTF-8 |
 
 ## 10. 卸载
@@ -373,9 +332,8 @@ sudo systemctl disable ModemManager               # 永久禁用 (不用 3G/4G �
 # 1. 删 build 产出
 rm -rf build_linux/
 
-# 2. 删 fafu_robot_python 里的 Linux 侧产物
+# 2. 删 fafu_robot_python 里的 Linux 扩展
 rm -f ../fafu_robot_python/fafu_motor*.so
-rm -f ../fafu_robot_python/libserial_cmake.so
 
 # 3. 卸载 udev 规则
 bash linux/setup_udev.sh --uninstall

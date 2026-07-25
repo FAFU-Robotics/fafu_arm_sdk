@@ -7,6 +7,9 @@ Fafu 机械臂的 **原生 C++ SDK**, 从 `fafu_robot_python/fafu_robot_controll
 > (move_p / move_l)、URDF / IK / Pinocchio 等. 笛卡尔规划留给 Python 侧
 > (用 wrs 等库做完之后, 把关节路径喂给本 SDK 执行).
 
+> 线程安全、多进程端口独占与多机械臂边界见
+> [P0_THREADING_AND_MULTI_ARM.md](../docs/P0_THREADING_AND_MULTI_ARM.md)。
+
 ---
 
 ## 目录
@@ -34,10 +37,10 @@ sdk/
 
 ```
 build/sdk/Release/fafu_robot_sdk.lib                ← 静态库, 上层可以链接它做自己的控制程序
-build/bin/Release/01_smoke.exe                       ← + robot.cfg + serial_cmake.dll
-build/bin/Release/02_move_j.exe                      ← + robot.cfg + serial_cmake.dll
-build/bin/Release/03_gripper.exe                     ← + robot.cfg + serial_cmake.dll
-build/bin/Release/04_servo_j.exe                     ← + robot.cfg + serial_cmake.dll
+build/bin/Release/01_smoke.exe                       ← + robot.cfg（串口库已静态链接）
+build/bin/Release/02_move_j.exe                      ← + robot.cfg（串口库已静态链接）
+build/bin/Release/03_gripper.exe                     ← + robot.cfg（串口库已静态链接）
+build/bin/Release/04_servo_j.exe                     ← + robot.cfg（串口库已静态链接）
 ```
 
 ---
@@ -298,6 +301,6 @@ arm.servo_end(ReleaseMode::Brake);   // 清看门狗 + brake
 | `[ERROR] auto: 未找到候选 USB 调试板, 检查 USB / 驱动` | 没插调试板 / 驱动没装 / VID 不在白名单. 把 cfg 里 `port = COM14` 写死也行 |
 | `[ERROR] 通信预检失败: 电机 N 不响应 (timeout 300ms)` | 电机没上电 / motor_id 配错 / CAN 总线断 |
 | 链接报 `LNK2019 hightorque::*` | 没 link `hightorque_serial_debug`. 你应该 link `fafu_robot_sdk`, 它会传递依赖 |
-| exe 启动报 `serial_cmake.dll 缺失` | 把 `serial_cmake.dll` 复制到 exe 同目录 (POST_BUILD 已经做了) |
+| 串口打开提示 already in use | 同一端口已被另一个 SDK 进程占用；为每个实例配置不同端口 |
 | `servo_j` 一直返回 false / lag 报警 | 上层周期太长 / `max_vel` 给太小 / 机械负载过大 / 改大 `max_lag_rad` 或先 `move_j` 慢慢热身 |
 | servoJ 中途机器突然 brake, 没有 Ctrl+C | 触发了固件看门狗 — 上层规划循环卡了 (磁盘 IO / GC / 调度抖动) 超过 `watchdog_ms`. 调大 watchdog 或加 RT 优先级 |

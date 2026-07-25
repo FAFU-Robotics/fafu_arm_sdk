@@ -125,7 +125,7 @@ struct RobotConfig {
             std::string val = trim_(content.substr(eq + 1));
             std::string key_lower = key;
             std::transform(key_lower.begin(), key_lower.end(), key_lower.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
             try {
                 if (key_lower == "port") {
@@ -137,7 +137,7 @@ struct RobotConfig {
                 } else if (key_lower == "pos_unit") {
                     std::string v = val;
                     std::transform(v.begin(), v.end(), v.begin(),
-                                   [](unsigned char c) { return std::tolower(c); });
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                     if      (v == "turns" || v == "turn")               cfg.pos_unit = PosUnit::Turns;
                     else if (v == "radians" || v == "radian" || v == "rad")
                                                                         cfg.pos_unit = PosUnit::Radians;
@@ -155,7 +155,7 @@ struct RobotConfig {
                 } else if (key_lower == "use_async_rx") {
                     std::string v = val;
                     std::transform(v.begin(), v.end(), v.begin(),
-                                   [](unsigned char c) { return std::tolower(c); });
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
                     cfg.use_async_rx = (v == "1" || v == "true" || v == "yes" || v == "on");
                 } else if (key_lower == "trajectory_dt_s") {
                     cfg.trajectory_dt_s = std::stod(val);

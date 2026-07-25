@@ -21,6 +21,7 @@
 
 #if defined(__linux__)
 # include <linux/serial.h>
+# include <sys/file.h>
 #endif
 
 #include <sys/select.h>
@@ -152,7 +153,25 @@ Serial::SerialImpl::open ()
     }
   }
 
-  reconfigurePort();
+#if defined(__linux__)
+  // Prevent two SDK processes from driving the same TTY. flock is released
+  // automatically when fd_ is closed, including abnormal process exit.
+  if (::flock(fd_, LOCK_EX | LOCK_NB) == -1) {
+    const int lock_errno = errno;
+    ::close(fd_);
+    fd_ = -1;
+    errno = lock_errno;
+    THROW (IOException, "Serial port is already in use by another process.");
+  }
+#endif
+
+  try {
+    reconfigurePort();
+  } catch (...) {
+    ::close(fd_);
+    fd_ = -1;
+    throw;
+  }
   is_open_ = true;
 }
 

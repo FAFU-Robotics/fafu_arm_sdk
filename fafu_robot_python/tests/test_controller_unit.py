@@ -25,6 +25,10 @@ class _PosUnit(Enum):
 # tests exercise Python policy only, so provide the smallest compatible module.
 _fake_motor = types.ModuleType("fafu_motor")
 _fake_motor.PosUnit = _PosUnit
+_fake_motor.gain_to_raw = lambda gain, _model: int(round(gain * 10.0 * 2.0 * np.pi))
+_fake_motor.torques_to_raw = lambda values, _models, scale=1.0: [
+    int(round(value * scale / 0.01)) for value in values
+]
 sys.modules["fafu_motor"] = _fake_motor
 
 _controller_path = Path(__file__).resolve().parents[1] / "fafu_robot_controller.py"
@@ -91,6 +95,42 @@ def _make_arm(*, state=None, ages=None, responses=None):
 
 
 class ControllerSafetyTests(unittest.TestCase):
+    def test_all_public_hardware_writers_are_guarded(self):
+        for name in (
+            "move_j",
+            "move_MIT",
+            "apply_compensation_torque",
+            "gripper_control",
+            "grasp",
+            "reset_zero",
+        ):
+            with self.subTest(method=name):
+                self.assertTrue(
+                    hasattr(getattr(controller.FafuRobotController, name),
+                            "__wrapped__"),
+                    f"{name} must hold the per-controller writer lease",
+                )
+
+    def test_servo_defaults_to_calibration_free_position_channel(self):
+        self.assertFalse(controller.ServoOpts().use_mit)
+
+    def test_motor_model_configuration_rejects_missing_names(self):
+        arm = _make_arm()
+        for bad in ([], ["M5036_02"], ["M5036_02", ""]):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(ValueError, "non-empty"):
+                    arm.set_motor_models(bad)
+
+    def test_torque_scale_rejects_unsafe_values(self):
+        arm = _make_arm()
+        for bad in (-1.0, np.nan, np.inf, [1.0, -0.1]):
+            with self.subTest(value=bad):
+                with self.assertRaisesRegex(ValueError, "finite|non-negative"):
+                    arm.set_torque_scale(bad)
+        arm.set_torque_scale([1.0, 2.0])
+        np.testing.assert_array_equal(
+            arm._dyn_torque_scale, np.array([1.0, 2.0]))
+
     def test_joint_validation_rejects_non_finite_and_wrong_shape(self):
         arm = _make_arm()
 

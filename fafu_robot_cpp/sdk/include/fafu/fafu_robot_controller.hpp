@@ -31,7 +31,10 @@
 //  线程模型:
 //    - 构造完成后内部有 1 个 RX 线程 (异步串口接收) + 1 个 polling 线程 (50Hz 缓存
 //      状态), 由底层 hightorque::HightorqueSerial 管理.
-//    - 对外 API 不保证线程安全; 同一实例不要在多个线程并发调用 move_j / grasp 等.
+//    - 状态读取可并发; 每个实例只允许一个写控制操作. 冲突立即抛
+//      fafu::core::BusyError, 不会交错发送控制帧.
+//    - emergency_stop / close_connection 可从另一线程请求取消.
+//    - 不同实例完全独立; 每个实例必须绑定不同串口.
 //
 //  错误处理:
 //    - 大部分方法在参数错 / 通信失败时 *返回 bool false* 或抛 std::runtime_error
@@ -41,9 +44,9 @@
 #pragma once
 
 #include "hightorque_serial.hpp"        // hightorque::HightorqueSerial, MotorState, ...
+#include "fafu/core/robot_core.hpp"      // shared thread-safe P0 control core
 #include "robot_config.hpp"             // hightorque::RobotConfig
 
-#include <chrono>
 #include <functional>
 #include <map>
 #include <optional>
@@ -182,6 +185,12 @@ public:
     // 当前是否所有电机都处于 MODE_POSITION
     bool is_enabled();
 
+    // 共享核心的线程安全生命周期状态与健康快照.
+    fafu::core::RobotState state() const;
+    fafu::core::HealthSnapshot health() const;
+    bool check_alive(bool fresh = true, double timeout_s = 0.1);
+    bool recover(bool confirm = false, double timeout_s = 0.2);
+
     // ----------------------------------------------------------------------
     //  电源管理
     // ----------------------------------------------------------------------
@@ -266,6 +275,18 @@ public:
         // 设为 0 / 负值 = 关闭检测.
         double max_lag_rad      = 0.2;
 
+        // 进阶选项由共享 C++ core 实现; 默认保持旧 C++ SDK 的 position 通道.
+        double rate_hz           = 100.0;
+        bool   feedforward_vel   = true;
+        double lookahead_time    = 0.0;
+        int    lag_abort_consecutive = 0;
+        bool   use_mit           = false;
+        std::vector<double> mit_kp;
+        std::vector<double> mit_kd;
+        // Required for non-zero MIT gains/torque. Unknown models are rejected
+        // instead of silently using an unsafe coefficient.
+        std::vector<std::string> motor_models;
+
         // joint_angles 单位 (true=弧度, false=度). 跟 move_j 一致.
         bool   is_radians       = true;
     };
@@ -288,7 +309,7 @@ public:
     void servo_end(ReleaseMode finish_mode = ReleaseMode::Brake);
 
     // 当前是否在 servo 会话中
-    bool is_servoing() const { return servo_active_; }
+    bool is_servoing() const;
 
     // ----------------------------------------------------------------------
     //  状态读取 (从 polling 缓存; prefer_cache=false 则现读)
@@ -414,9 +435,6 @@ private:
     // 给每个电机 read_motor_state 一次, 失败抛异常.
     void precheck_communication_();
 
-    // 一次性把所有电机切到 mode, 带重试. label 用于打印.
-    bool switch_mode_all_(uint8_t mode, const char* label, int max_retry);
-
     // 入参做长度 / NaN 校验, 返回归一到 turns 的 joint_angles (用于内部 set_many_*).
     std::vector<double> validate_joint_angles_(const std::vector<double>& angles,
                                                bool is_radians);
@@ -451,6 +469,7 @@ private:
     hightorque::RobotConfig                       cfg_;
     std::string                                   cfg_path_;
     std::unique_ptr<hightorque::HightorqueSerial> ht_;
+    std::unique_ptr<fafu::core::RobotCore>         core_;
 
     std::string                                   port_;
     uint32_t                                      baudrate_ = 0;
@@ -458,16 +477,6 @@ private:
     bool                                          has_gripper_      = false;
     int                                           gripper_motor_id_ = 0;
     std::vector<int>                              joint_motor_ids_; // = motor_ids - {gripper}
-
-    bool                                          owns_polling_ = false;
-    bool                                          owns_rx_      = false;
-
-    // ---- servo session ----
-    bool                                          servo_active_     = false;
-    ServoOpts                                     servo_opts_{};
-    std::vector<double>                           servo_last_target_turns_;   // size = num_joints
-    std::chrono::steady_clock::time_point         servo_started_at_{};
-    uint64_t                                      servo_tick_count_ = 0;
 
     // S-curve 调参 (与 Python 同步)
     static constexpr double VEL_AVG_MAX_TPS_ = 0.5;
