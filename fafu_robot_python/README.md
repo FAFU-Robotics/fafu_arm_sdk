@@ -23,9 +23,17 @@ fafu_robot_python/
 ├── fafu_motor.cpXY-win_amd64.pyd   底层 C++ 绑定 (由 ../fafu_robot_cpp/ 构建)
 ├── serial_cmake.dll                    Windows 运行时依赖 (同上)
 ├── requirements.txt
+├── requirements-build.txt               构建 C++ 扩展时使用
 ├── fafu_robot_description/             vendored follower URDF (FK/IK 用)
 ├── examples/
-│   └── visible_motion.py               视觉可见的最小运动 demo
+│   ├── README.md                        基础示例索引
+│   ├── 01_connect_and_read.py           连接并读取状态
+│   ├── 02_move_joint.py                 最小关节运动
+│   ├── 03_gripper.py                    夹爪开合
+│   ├── 04_enable_disable.py             使能 / 制动 / 释放
+│   ├── 05_servo_joint.py                Servo 流式控制
+│   ├── 06_emergency_stop.py             急停与恢复
+│   └── visible_motion.py                视觉可见的综合运动 demo
 └── tests/
     ├── smoke_test.py                   无硬件环境检查
     ├── test_one_joint.py               单关节 ±5° 安全测试
@@ -100,7 +108,8 @@ sys.path.insert(0, os.path.dirname(__file__))   # 指向 fafu_robot_python/
 from fafu_robot_controller import FafuRobotController
 ```
 
-`tests/` 和 `examples/` 下的脚本都按方式 B 写，方便直接 `python tests/xxx.py` 运行。
+`tests/` 和 `examples/` 下的脚本都按方式 B 写，可以直接运行。
+最简用法请从 [`examples/README.md`](examples/README.md) 和编号示例开始。
 
 ---
 
