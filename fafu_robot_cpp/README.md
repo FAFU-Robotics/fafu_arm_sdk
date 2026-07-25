@@ -13,7 +13,9 @@
 > vendor 进来了, 不引用任何外部仓库. 你可以把整个
 > `fafu_robot_sdk/` 拷到任何地方, 仍然能在本目录内独立编出 `.pyd`.
 
-> 架构 / 协议栈 / 力矩换算等实现细节见 [`../技术文档.md`](../技术文档.md).
+> 架构 / 协议栈 / 力矩换算等实现细节见 [`../技术文档.md`](../技术文档.md)；
+> 线程安全和多机械臂约定见
+> [`docs/P0_THREADING_AND_MULTI_ARM.md`](docs/P0_THREADING_AND_MULTI_ARM.md)。
 
 ```
 你的代码 (FafuRobotController, Python)
@@ -22,8 +24,8 @@
    fafu_motor.cpXY-win_amd64.pyd          ← 这个 .pyd 由本目录构建
               │  pybind11
               ▼
-   hightorque_serial_debug.lib                ← src/hightorque_serial.cpp (vendored)
-              │  serial_cmake.dll              ← third_part/serial_cmake/  (vendored)
+   fafu_robot_core + hightorque_serial         ← shared P0 control core
+              │  serial_cmake (static, vendored)
               ▼
               USB 串口  ──▶  调试板  ──▶  电机
 ```
@@ -41,7 +43,8 @@ fafu_robot_cpp/
 │
 ├── include/                                 ← vendored 头文件 (协议层, 双侧共用)
 │   ├── hightorque_serial.hpp                ← HightorqueSerial 类 + 数据结构
-│   └── robot_config.hpp                     ← robot.cfg 解析
+│   ├── robot_config.hpp                     ← robot.cfg 解析
+│   └── fafu/core/                           ← 共享状态机、Servo、安全与标定
 │
 ├── src/                                     ← vendored 实现 (协议层, 双侧共用)
 │   └── hightorque_serial.cpp                ← HightorqueSerial 实现
@@ -63,12 +66,11 @@ fafu_robot_cpp/
 
 ```
 build/bin/Release/fafu_motor.cpXY-win_amd64.pyd     ← 自动 copy 到 ../fafu_robot_python/
-build/bin/Release/serial_cmake.dll                       ← 自动 copy 到 ../fafu_robot_python/
 build/sdk/Release/fafu_robot_sdk.lib                     ← 原生 C++ SDK 静态库
-build/bin/Release/01_smoke.exe                           ← 已带 robot.cfg + serial_cmake.dll
-build/bin/Release/02_move_j.exe                          ← 已带 robot.cfg + serial_cmake.dll
-build/bin/Release/03_gripper.exe                         ← 已带 robot.cfg + serial_cmake.dll
-build/bin/Release/04_servo_j.exe                         ← 已带 robot.cfg + serial_cmake.dll
+build/bin/Release/01_smoke.exe                           ← 已带 robot.cfg（串口库已静态链接）
+build/bin/Release/02_move_j.exe                          ← 已带 robot.cfg（串口库已静态链接）
+build/bin/Release/03_gripper.exe                         ← 已带 robot.cfg（串口库已静态链接）
+build/bin/Release/04_servo_j.exe                         ← 已带 robot.cfg（串口库已静态链接）
 ```
 
 Python 侧不用配置 PYTHONPATH, 直接
@@ -103,8 +105,7 @@ build.bat Debug     REM Debug
 成功后会自动:
 
 1. 把 `fafu_motor.cpXY-win_amd64.pyd` copy 到 `..\fafu_robot_python\`
-2. 把 `serial_cmake.dll` copy 到 `..\fafu_robot_python\`
-3. 切到 `..\fafu_robot_python\` 跑一次 `import fafu_motor` 验证
+2. 切到 `..\fafu_robot_python\` 跑一次 `import fafu_motor` 验证
 
 ---
 
@@ -122,8 +123,9 @@ cmake --build build --config Release -j
 
 ## Ubuntu / Linux
 
-**推荐**：用 `linux/` 子目录里的一键脚本，涵盖装依赖、USB udev、libserial_cmake.so
-Linux fixup、servoJ 实时优先级等 Ubuntu 专属配套。详见 [`linux/README.md`](linux/README.md)。
+**推荐**：用 `linux/` 子目录里的一键脚本，涵盖装依赖、USB udev 和
+servoJ 实时优先级等 Ubuntu 配套。串口库静态链接，不需要额外部署 .so。
+详见 [`linux/README.md`](linux/README.md)。
 
 ```bash
 cd fafu_robot_sdk/fafu_robot_cpp
@@ -133,18 +135,12 @@ bash linux/build.sh                 # 编 fafu_motor.so + 静态库 + 4 个例�
 ./build_linux/bin/01_smoke          # 最小连通性测试
 ```
 
-> **⚠ Linux 特有的 fixup**：当前 CMakeLists 的 POST_BUILD 只在 `if(WIN32)` 分支
-> 复制 `serial_cmake.dll` 到 `../fafu_robot_python/`。Linux 下这一步漏掉，
-> `import fafu_motor` 会报 `libserial_cmake.so: cannot open shared object file`。
-> `linux/build.sh` 已经在编译后自动补做：`cp libserial_cmake.so` +
-> `patchelf --set-rpath '$ORIGIN'`。
-
 可选 cmake 参数:
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
 | `-Dpybind11_DIR=<cmake_dir>` | 由 build.bat 自动定位 | pybind11 cmake 配置目录 |
-| `-DFAFU_ROBOT_PYTHON_DIR=<path>` | `../fafu_robot_python` | 产物 (.pyd + dll) 复制目标 |
+| `-DFAFU_ROBOT_PYTHON_DIR=<path>` | `../fafu_robot_python` | Python 扩展复制目标 |
 | `-DCMAKE_BUILD_TYPE=Debug` | `Release` | 调试构建 |
 
 ---

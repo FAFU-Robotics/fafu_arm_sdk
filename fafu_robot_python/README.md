@@ -4,8 +4,12 @@
 底层是同仓库 `fafu_robot_cpp/` 用 pybind11 构建出来的 `fafu_motor` 扩展模块。
 
 ```
-你的脚本  ──Python──▶  FafuRobotController  ──pybind11──▶  HightorqueSerial (C++)  ──USB串口──▶  调试板
+你的脚本  ──Python──▶  FafuRobotController  ──pybind11──▶  RobotCore / HightorqueSerial (C++)  ──USB串口──▶  调试板
 ```
+
+Python 控制器要求统一扩展提供 `CORE_ABI_VERSION == 2`。状态机、单写者仲裁、
+Servo 安全、使能恢复和标定换算只在 C++ 核心维护一份。线程与多机械臂约定见
+[P0_THREADING_AND_MULTI_ARM.md](../fafu_robot_cpp/docs/P0_THREADING_AND_MULTI_ARM.md)。
 
 > SDK 总览见上一级目录 [`../README.md`](../README.md)；构建 `.pyd` 见同级 [`../fafu_robot_cpp/README.md`](../fafu_robot_cpp/README.md)；
 > 架构 / 协议栈 / 动力学等实现细节见 [`../技术文档.md`](../技术文档.md)。
@@ -18,10 +22,9 @@
 fafu_robot_python/
 ├── README.md                           ← 你正在看的文件
 ├── __init__.py                         包入口, 暴露 FafuRobotController / GraspResult
-├── fafu_robot_controller.py            主控制器 (约 1700 行)
+├── fafu_robot_controller.py            Python 高层 API 与规划/动力学
 ├── robot.cfg                           默认配置 (端口/波特率/电机ID/软限位/控制率)
 ├── fafu_motor.cpXY-win_amd64.pyd   底层 C++ 绑定 (由 ../fafu_robot_cpp/ 构建)
-├── serial_cmake.dll                    Windows 运行时依赖 (同上)
 ├── requirements.txt
 ├── requirements-build.txt               构建 C++ 扩展时使用
 ├── fafu_robot_description/             vendored follower URDF (FK/IK 用)
@@ -188,12 +191,15 @@ arm.grasp(force_threshold=500,                    # 力控抓取
           effort=None, vel=0.15, timeout=5.0)     # → GraspResult
 ```
 
+`grasp` 默认同时把 `force_threshold` 作为固件力矩上限；显式 `effort`
+可设置更低的硬上限，避免 Python 检测延迟造成过力。
+
 `GraspResult` 字段：
 
 | 字段 | 含义 |
 |---|---|
 | `grasped` | `True` = 抓到物体 |
-| `reason` | `'detected_object_force'` / `'detected_object_stall'` / `'reached_target'` / `'no_movement'` / `'timeout'` |
+| `reason` | `'detected_object_force'` / `'detected_object_stall'` / `'reached_target'` / `'no_movement'` / `'timeout'` / `'cancelled'` |
 | `angle_rad` | 停止时夹爪角度 |
 | `closed_deg` | 从起始位置闭合了多少度 |
 | `peak_torque_raw` | 整个过程力矩峰值（raw int16） |
@@ -261,7 +267,7 @@ arm.emergency_stop() / arm.resume()
 
 | 现象 | 处理 |
 |---|---|
-| `ImportError: DLL load failed`（导入 `fafu_motor` 时） | 看 `serial_cmake.dll` 是否在本目录；装 VC++ 2015-2022 Redistributable |
+| `ImportError: DLL load failed`（导入 `fafu_motor` 时） | 确认 Python ABI 与扩展文件名匹配，并安装 VC++ 2015-2022 Redistributable |
 | `ModuleNotFoundError: fafu_motor` | `.pyd` 不在本目录，或 ABI tag (cp310 / cp38) 与当前 Python 不匹配；去 `../fafu_robot_cpp/` 重 build |
 | 连接失败 / 串口打开失败 | `robot.cfg` 里 `port = auto`，或显式写 `COMxx`；端口被其它程序占着也会失败 |
 | 所有电机 `mode 0 / fault ≠ 0` | 调试板→电机的 CAN 没通：检查 24V / 终端电阻 / `motor_ids` 是否对得上 |

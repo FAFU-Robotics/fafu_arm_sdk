@@ -680,10 +680,18 @@ HightorqueSerial::~HightorqueSerial() {
 }
 
 void HightorqueSerial::close() {
-    if (ser_ && ser_->isOpen()) ser_->close();
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mtx_);
+    disable_async_rx_unlocked_();
+    stop_state_polling_unlocked_();
+
+    std::lock_guard<std::mutex> tx(tx_mtx_);
+    if (ser_ && ser_->isOpen()) {
+        ser_->close();
+    }
 }
 
 bool HightorqueSerial::is_open() const {
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mtx_);
     return ser_ && ser_->isOpen();
 }
 
@@ -1496,7 +1504,9 @@ namespace {
 
 CanFault classify_bus_str(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
     if (s == "ok" || s == "0")              return CanFault::Ok;
     if (s == "warn" || s == "warning")      return CanFault::ErrorWarning;
     if (s == "passive")                     return CanFault::ErrorPassive;
@@ -1539,7 +1549,9 @@ CanStatus HightorqueSerial::read_can_status() {
         std::string key = tok.substr(0, eq);
         std::string val = tok.substr(eq + 1);
         std::transform(key.begin(), key.end(), key.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
 
         try {
             if      (key == "lec")                 out.lec = std::stoi(val, nullptr, 0);
@@ -1586,9 +1598,9 @@ void parse_vid_pid(const std::string& hwid, std::string& vid, std::string& pid) 
         }
     }
     std::transform(vid.begin(), vid.end(), vid.begin(),
-                   [](unsigned char c) { return std::toupper(c); });
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     std::transform(pid.begin(), pid.end(), pid.begin(),
-                   [](unsigned char c) { return std::toupper(c); });
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
 }
 
 } // namespace
@@ -1612,7 +1624,7 @@ std::vector<PortInfo> find_likely_debug_boards(const std::vector<std::string>& k
     for (const auto& v : known_vids) {
         std::string u = v;
         std::transform(u.begin(), u.end(), u.begin(),
-                       [](unsigned char c) { return std::toupper(c); });
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
         vids_upper.push_back(std::move(u));
     }
 
@@ -1633,51 +1645,75 @@ std::vector<PortInfo> find_likely_debug_boards(const std::vector<std::string>& k
 void HightorqueSerial::start_state_polling(
         const std::vector<int>& motor_ids, double rate_hz,
         std::function<void(const std::vector<int>&)> on_update) {
-    stop_state_polling();   // 幂等: 重复调用先停旧的
+    std::lock_guard<std::mutex> lock(lifecycle_mtx_);
+    stop_state_polling_unlocked_();
 
-    if (motor_ids.empty() || rate_hz <= 0.0) return;
+    if (motor_ids.empty()) return;
+    if (!std::isfinite(rate_hz) || rate_hz <= 0.0) {
+        throw std::invalid_argument(
+            "polling rate must be positive and finite");
+    }
+    if (!ser_ || !ser_->isOpen()) {
+        throw std::runtime_error("cannot start polling on a closed serial port");
+    }
 
     poll_running_.store(true);
-    const auto period = std::chrono::microseconds(
-        static_cast<long long>(1'000'000.0 / rate_hz));
+    const auto period = std::chrono::microseconds(std::max<long long>(
+        1, static_cast<long long>(1'000'000.0 / rate_hz)));
     auto ids = motor_ids;
-    auto cb  = std::move(on_update);
+    auto callback = std::move(on_update);
 
-    poll_thread_ = std::thread([this, ids = std::move(ids), period, cb = std::move(cb)]() mutable {
-        while (poll_running_.load()) {
-            const auto t_start = std::chrono::steady_clock::now();
+    try {
+        poll_thread_ = std::thread(
+            [this, ids = std::move(ids), period,
+             callback = std::move(callback)]() mutable {
+            while (poll_running_.load()) {
+                const auto started = std::chrono::steady_clock::now();
+                std::vector<int> updated;
+                updated.reserve(ids.size());
 
-            std::vector<int> updated;
-            updated.reserve(ids.size());
-            for (int mid : ids) {
-                if (!poll_running_.load()) return;
-                auto st = read_motor_state(mid);
-                if (st) {
-                    std::lock_guard<std::mutex> lk(cache_mtx_);
-                    state_cache_[mid] = *st;
-                    state_update_time_[mid] = now_seconds();
-                    updated.push_back(mid);
+                for (int motor_id : ids) {
+                    if (!poll_running_.load()) return;
+                    try {
+                        auto state = read_motor_state(motor_id);
+                        if (state) {
+                            std::lock_guard<std::mutex> cache_lock(cache_mtx_);
+                            state_cache_[motor_id] = *state;
+                            state_update_time_[motor_id] = now_seconds();
+                            updated.push_back(motor_id);
+                        }
+                    } catch (...) {
+                        // A disconnect becomes stale feedback for RobotCore;
+                        // never let an exception escape a background thread.
+                    }
+                }
+                if (callback && !updated.empty()) {
+                    try { callback(updated); } catch (...) {}
+                }
+
+                const auto elapsed =
+                    std::chrono::steady_clock::now() - started;
+                if (elapsed < period) {
+                    std::this_thread::sleep_for(period - elapsed);
                 }
             }
-            if (cb && !updated.empty()) {
-                try { cb(updated); } catch (...) { /* 用户回调里炸了不让线程崩 */ }
-            }
-
-            // 控制周期
-            const auto t_now   = std::chrono::steady_clock::now();
-            const auto elapsed = t_now - t_start;
-            if (elapsed < period) {
-                std::this_thread::sleep_for(period - elapsed);
-            }
-        }
-    });
+            });
+    } catch (...) {
+        poll_running_.store(false);
+        throw;
+    }
 }
 
-void HightorqueSerial::stop_state_polling() {
+void HightorqueSerial::stop_state_polling_unlocked_() {
     poll_running_.store(false);
     if (poll_thread_.joinable()) {
         poll_thread_.join();
     }
+}
+
+void HightorqueSerial::stop_state_polling() {
+    std::lock_guard<std::mutex> lock(lifecycle_mtx_);
+    stop_state_polling_unlocked_();
 }
 
 bool HightorqueSerial::is_polling() const {
@@ -1826,22 +1862,39 @@ void HightorqueSerial::dispatch_rcv_line_(const std::string& line) {
 }
 
 void HightorqueSerial::enable_async_rx() {
-    if (async_rx_enabled_.load()) return;            // 幂等
+    std::lock_guard<std::mutex> lock(lifecycle_mtx_);
+    if (async_rx_enabled_.load()) return;
+    if (!ser_ || !ser_->isOpen()) {
+        throw std::runtime_error(
+            "cannot enable asynchronous receive on a closed serial port");
+    }
 
-    // 老的轮询线程跟 async RX 互斥 (它们都要读串口)
-    stop_state_polling();
-
+    // A legacy synchronous poller cannot be active while the RX thread is
+    // being installed. RobotCore starts async RX first, then its cache poller.
+    stop_state_polling_unlocked_();
     rx_running_.store(true);
     async_rx_enabled_.store(true);
-    rx_thread_ = std::thread(&HightorqueSerial::rx_loop_, this);
+    try {
+        rx_thread_ = std::thread(&HightorqueSerial::rx_loop_, this);
+    } catch (...) {
+        async_rx_enabled_.store(false);
+        rx_running_.store(false);
+        throw;
+    }
+}
+
+void HightorqueSerial::disable_async_rx_unlocked_() {
+    async_rx_enabled_.store(false);
+    rx_running_.store(false);
+    if (rx_thread_.joinable()) {
+        rx_thread_.join();
+    }
+    cache_cv_.notify_all();
 }
 
 void HightorqueSerial::disable_async_rx() {
-    if (!async_rx_enabled_.load()) return;
-    async_rx_enabled_.store(false);
-    rx_running_.store(false);
-    if (rx_thread_.joinable()) rx_thread_.join();
-    cache_cv_.notify_all();   // 唤醒所有 wait_state
+    std::lock_guard<std::mutex> lock(lifecycle_mtx_);
+    disable_async_rx_unlocked_();
 }
 
 // ---------------------------------------------------------------------------
@@ -1955,7 +2008,7 @@ void HightorqueSerial::set_debug_line_handler(std::function<void(const std::stri
 int HightorqueSerial::run_control_loop(const ControlLoopOptions& opt, ControlTickFn on_tick) {
     using namespace std::chrono;
     if (!on_tick) return 0;
-    if (opt.rate_hz <= 0.0) return 0;
+    if (!std::isfinite(opt.rate_hz) || opt.rate_hz <= 0.0) return 0;
 
     // ⚠️ 关键: Windows 上把系统时钟粒度从 15.6ms 临时调到 1ms.
     // 不这么干, std::this_thread::sleep_for(1ms) 实际会睡 ~15ms,
@@ -1963,18 +2016,22 @@ int HightorqueSerial::run_control_loop(const ControlLoopOptions& opt, ControlTic
     // RAII: 控制环退出时自动还原.
     HighResolutionTimer hr_timer;
 
-    // 自动启用 async RX (退出时根据是否本来开着决定要不要恢复)
+    // Polling already owns the receive path. Only create a temporary async
+    // receiver when neither receive mode was active, and undo only that
+    // temporary change on exit.
     const bool was_async = is_async_rx();
-    if (!was_async) enable_async_rx();
+    const bool was_polling = is_polling();
+    const bool temporary_async = !was_async && !was_polling;
+    if (temporary_async) enable_async_rx();
     reset_stats();
 
-    const auto period = microseconds(static_cast<long long>(1'000'000.0 / opt.rate_hz));
-    const double period_ms_target = 1000.0 / opt.rate_hz;
+    const auto period = microseconds(std::max<long long>(
+        1, static_cast<long long>(1'000'000.0 / opt.rate_hz)));
 
     int return_code = 0;
     int tick = 0;
     auto next_deadline = steady_clock::now() + period;
-    auto last_tick_t   = steady_clock::now();
+    auto last_tick_t = steady_clock::now();
 
     try {
         while (true) {
@@ -1983,29 +2040,29 @@ int HightorqueSerial::run_control_loop(const ControlLoopOptions& opt, ControlTic
                 break;
             }
 
-            const auto t_now = steady_clock::now();
-            const double dt_ms = duration<double, std::milli>(t_now - last_tick_t).count();
-            last_tick_t = t_now;
+            const auto now = steady_clock::now();
+            const double dt_ms =
+                duration<double, std::milli>(now - last_tick_t).count();
+            last_tick_t = now;
 
-            const bool keep_going = on_tick(tick, dt_ms);
-            tick++;
-            if (!keep_going) { return_code = 0; break; }
+            if (!on_tick(tick++, dt_ms)) {
+                break;
+            }
 
-            // 周期校准: sleep 到 next_deadline, 期间分多段查 abort
             while (true) {
                 if (opt.abort_check && opt.abort_check()) {
                     return_code = 1;
                     goto loop_exit;
                 }
-                const auto now = steady_clock::now();
-                if (now >= next_deadline) break;
-                const auto remain = next_deadline - now;
+                const auto current = steady_clock::now();
+                if (current >= next_deadline) break;
+                const auto remaining = next_deadline - current;
                 std::this_thread::sleep_for(std::min<microseconds>(
-                    duration_cast<microseconds>(remain),
+                    duration_cast<microseconds>(remaining),
                     microseconds(1000)));
             }
+
             next_deadline += period;
-            // 漂移补偿: 如果落后超过 2 个周期, 重置 deadline 避免追赶式狂发
             if (steady_clock::now() - next_deadline > period * 2) {
                 next_deadline = steady_clock::now() + period;
             }
@@ -2014,29 +2071,34 @@ int HightorqueSerial::run_control_loop(const ControlLoopOptions& opt, ControlTic
     } catch (const std::exception& e) {
         return_code = 2;
         if (opt.on_exception) {
-            try { opt.on_exception(e); } catch (...) {}
+            try {
+                opt.on_exception(e);
+            } catch (...) {
+            }
+        }
+    } catch (...) {
+        return_code = 2;
+        if (opt.on_exception) {
+            try {
+                const std::runtime_error error("unknown control-loop exception");
+                opt.on_exception(error);
+            } catch (...) {
+            }
         }
     }
 
-    // 收尾: 是否要 stop 看 return_code 和用户配置
-    //   return_code 0 (正常完成) → stop_on_finish (默认 false)
-    //   return_code 1 (Ctrl+Q)   → stop_on_abort  (默认 true)
-    //   return_code 2 (业务异常) → stop_on_abort  (默认 true)
-    //
-    // 不 stop 的好处: 电机保持 mode=10 + 最后位置 hold, 下次直接 set_many_pos_vel_tqe
-    // 即可继续控制 (一拖多 0x8090 不能再切 mode, stop 后 mode=0 ⇒ 下次命令电机不响应).
-    const bool should_stop = (return_code == 0) ? opt.stop_on_finish : opt.stop_on_abort;
-    if (should_stop && !opt.stop_motor_ids.empty()) {
-        const bool was_on = is_async_rx();
-        if (was_on) disable_async_rx();
-        for (int mid : opt.stop_motor_ids) {
-            try { stop(mid); } catch (...) {}
+    const bool should_stop =
+        return_code == 0 ? opt.stop_on_finish : opt.stop_on_abort;
+    if (should_stop) {
+        for (int motor_id : opt.stop_motor_ids) {
+            try {
+                stop(motor_id);
+            } catch (...) {
+            }
         }
-        if (was_on && was_async) enable_async_rx();   // 维持原状态
     }
 
-    if (!was_async) disable_async_rx();
-    (void)period_ms_target;   // 当前未使用, 留作上层期望对照
+    if (temporary_async) disable_async_rx();
     return return_code;
 }
 

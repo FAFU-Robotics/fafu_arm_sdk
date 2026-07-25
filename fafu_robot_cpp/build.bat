@@ -19,7 +19,7 @@ REM  不依赖任何外部仓库. 直接在本文件夹里就能编译.
 REM
 REM  产物会被 CMakeLists.txt 的 POST_BUILD 自动 copy 到:
 REM    ..\fafu_robot_python\fafu_motor.cpXY-win_amd64.pyd
-REM    ..\fafu_robot_python\serial_cmake.dll
+REM  serial_cmake 静态链接进模块, 不再需要单独 DLL.
 REM  之后从 fafu_robot_python 上下文里直接 `import fafu_motor` 就 work.
 REM ============================================================================
 setlocal EnableDelayedExpansion
@@ -53,6 +53,7 @@ if not exist build (
 cmake -S . -B build ^
     -G "Visual Studio 17 2022" -A x64 ^
     -Dpybind11_DIR="%PYBIND11_DIR%" ^
+    -DPython_EXECUTABLE="%PY_EXE%" ^
     -DPYTHON_EXECUTABLE="%PY_EXE%"
 if errorlevel 1 goto :fail
 

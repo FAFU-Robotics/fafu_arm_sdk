@@ -5,10 +5,7 @@
 #  与老版 (motor_example_debug/linux/build.sh) 差异:
 #    - 需要 pybind11 (默认编 fafu_motor.so, 可 --no-python 关掉)
 #    - 自动从 ~/.fafu_robot_cpp.env 读 FAFU_PYBIND11_DIR (由 install_deps.sh 生成)
-#    - POST_BUILD 阶段修 Linux 侧遗漏: 把 libserial_cmake.so 复制到
-#      ../fafu_robot_python/, 设 fafu_motor.so 的 RPATH=$ORIGIN
-#      (CMakeLists 里只在 WIN32 分支复制 dll, Linux 不复制, 会导致
-#       `import fafu_motor` 报 "libserial_cmake.so: cannot open shared object file")
+#    - serial_cmake 静态链接进模块/SDK, 不需要复制 .so 或设置 RPATH
 #
 #  用法:
 #      bash linux/build.sh                    # 全部: pybind11 + SDK + examples (Release)
@@ -125,6 +122,7 @@ if [ "$NO_PYTHON" -eq 0 ]; then
     fi
 
     CMAKE_ARGS+=(
+        "-DPython_EXECUTABLE=$(command -v "$PY_EXE")"
         "-DPython3_EXECUTABLE=$(command -v "$PY_EXE")"
         "-DPYTHON_EXECUTABLE=$(command -v "$PY_EXE")"
         "-Dpybind11_DIR=$PYBIND11_DIR"
@@ -169,54 +167,6 @@ fi
 echo ""
 echo "--- cmake build ---"
 cmake --build "$BUILD_DIR" --parallel "$JOBS"
-
-# ---- POST_BUILD 修复: 把 libserial_cmake.so 复制到 fafu_robot_python/ ----
-#
-# CMakeLists.txt 里只在 if(WIN32) 分支复制 serial_cmake.dll, Linux 下漏掉了
-# libserial_cmake.so. 结果 fafu_robot_python/ 目录只有 fafu_motor.so
-# 没有 libserial_cmake.so, Python `import fafu_motor` 会报:
-#     libserial_cmake.so: cannot open shared object file
-#
-# 修复策略:
-#   1. cp build_linux/bin/libserial_cmake.so 到 ../fafu_robot_python/
-#   2. 用 patchelf 把 fafu_motor.so 的 RPATH 设成 $ORIGIN,
-#      让动态加载器优先在 .so 自己的目录里找依赖 (跨机器可移植)
-#   3. 没装 patchelf 时降级: 提示用户手动 export LD_LIBRARY_PATH
-if [ "$NO_PYTHON" -eq 0 ]; then
-    echo ""
-    echo "--- POST_BUILD: 修复 Linux 侧动态库依赖 ---"
-
-    if [ ! -d "$PY_TARGET_DIR" ]; then
-        echo "[build] 警告: $PY_TARGET_DIR 不存在, 跳过 fixup"
-    else
-        # 1. libserial_cmake.so → ../fafu_robot_python/
-        SO_SRC="$BUILD_DIR/bin/libserial_cmake.so"
-        if [ -f "$SO_SRC" ]; then
-            cp -f "$SO_SRC" "$PY_TARGET_DIR/"
-            echo "  ✓ $SO_SRC → $PY_TARGET_DIR/libserial_cmake.so"
-        else
-            echo "  ✗ 没找到 $SO_SRC (构建失败?)"
-        fi
-
-        # 2. patchelf: fafu_motor*.so 的 RPATH = $ORIGIN
-        MOD_SO=$(find "$PY_TARGET_DIR" -maxdepth 1 -name 'fafu_motor*.so' | head -n1)
-        if [ -n "$MOD_SO" ]; then
-            if command -v patchelf >/dev/null 2>&1; then
-                # --force-rpath 保证使用 DT_RPATH (老系统兼容); 新系统 DT_RUNPATH 也 work
-                patchelf --set-rpath '$ORIGIN' --force-rpath "$MOD_SO"
-                CUR_RPATH=$(patchelf --print-rpath "$MOD_SO" 2>/dev/null || echo "?")
-                echo "  ✓ $MOD_SO  RPATH = $CUR_RPATH"
-            else
-                echo "  ! patchelf 没装, 无法设置 RPATH"
-                echo "    装法:  sudo apt install patchelf"
-                echo "    替代方案 (每次跑前 export):"
-                echo "        export LD_LIBRARY_PATH=$PY_TARGET_DIR:\$LD_LIBRARY_PATH"
-            fi
-        else
-            echo "  ✗ 没找到 fafu_motor*.so 在 $PY_TARGET_DIR (POST_BUILD 复制失败?)"
-        fi
-    fi
-fi
 
 # ---- 列出产出 ----
 echo ""

@@ -492,6 +492,8 @@ private:
     void dispatch_rcv_line_(const std::string& line);
     // TX 计数 + 周期/抖动统计 (由 send_can_and_recv_ 调用)
     void note_tx_();
+    void stop_state_polling_unlocked_();
+    void disable_async_rx_unlocked_();
 
     std::unique_ptr<serial::Serial> ser_;
 
@@ -499,6 +501,9 @@ private:
     // tx_mtx_:   保护对 ser_->write 的并发访问 (任何模式都用)
     // cache_mtx_: 保护 state_cache_ + update_seq_ + cv_
     // limits_mtx_/stats_mtx_: 各自独立, 见下
+    // Serial lifecycle is independent per instance. It serializes
+    // background-thread start/stop/close without covering control traffic.
+    mutable std::mutex              lifecycle_mtx_;
     std::mutex                      tx_mtx_;
     mutable std::mutex              cache_mtx_;
     std::condition_variable         cache_cv_;

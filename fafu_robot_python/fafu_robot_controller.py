@@ -28,9 +28,9 @@ Conventions
   (``0 - 100``); this is mapped to a peak average velocity in
   turns/second.
 * The Fafu arm is a chain of independent motors driven over a
-  USB-CAN debug board; there is no built-in inverse kinematics.
-  ``move_p`` / ``move_l`` therefore raise :class:`NotImplementedError`
-  unless an external IK solver is plugged in.
+  USB-CAN debug board. Cartesian motion uses the optional Pinocchio
+  model configured through :meth:`setup_dynamics`; joint-space motion
+  remains available without it.
 
 Example
 -------
@@ -72,8 +72,8 @@ from __future__ import annotations
 
 import functools
 import math
+from contextlib import nullcontext
 import os
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -83,13 +83,14 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 # ----------------------------------------------------------------------------
-#  Make sure fafu_motor.pyd next to this file is importable.
+#  Import the native extension as a package, with a direct-module fallback for
+#  legacy scripts that put this directory on sys.path.
 # ----------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-import fafu_motor as pm  # noqa: E402
+if __package__:
+    from . import fafu_motor as pm
+else:  # pragma: no cover - direct module import compatibility
+    import fafu_motor as pm
 
 # Optional: TOPPRA-based time-optimal interpolation (matches piper.py).
 try:
@@ -237,31 +238,6 @@ _CMD_CONTINUITY_TOL_T = 0.05
 # 1 turn = 2*pi rad
 _TWO_PI = 2.0 * math.pi
 
-# Per-motor torque coefficient (Nm per raw-int16 LSB), mirrors the C++
-# TORQUE_COEFF table in hightorque_serial.cpp.  The firmware torque command
-# is a raw int16; the driver converts a desired Nm to raw via
-# ``raw = round(tau_nm / coeff)``.  An unknown / empty model maps to coeff
-# 1.0 (raw == Nm, i.e. essentially unscaled -- see setup_dynamics warning).
-TORQUE_COEFF: Dict[str, float] = {
-    # ---- Fafu arm actual motors (measured, authoritative) ----
-    "M5036_02": 0.67,     # J1, J4
-    "M6036_02": 0.677,    # J2, J3
-    "M4438_30": 0.5256,   # J5, J6, J7  (vendor motor_tqe_adj value)
-    # ---- legacy / other Hightorque models ----
-    "M3536_32": 0.458105,
-    "M4438_32": 0.485565,
-    "M4538_19": 0.493835,
-    "M5043_20": 0.966,
-    "M5046_20": 0.533654,
-    "M5047_09": 0.547474,
-    "M5047_36": 0.803,
-    "M6056_36": 0.677,
-    "M7256_35": 0.676524,
-    "M60SG_35": 0.7942,
-    "M60BM_35": 0.7942,
-}
-
-
 # ============================================================================
 #  Public dataclasses
 # ============================================================================
@@ -286,6 +262,7 @@ class GraspResult:
         * ``'no_movement'``         — stalled but barely moved (command
           may not have taken effect, or jaws were already shut)
         * ``'timeout'``             — neither condition met within ``timeout``
+        * ``'cancelled'``           — safety stop, close, or link loss
     angle_rad : float
         Final gripper angle (radians).
     closed_deg : float
@@ -317,7 +294,7 @@ class ServoOpts:
     watchdog_ms : int, optional
         Firmware-side watchdog in milliseconds.  If the motor receives
         no new command for this long it automatically brakes.  Default
-        ``100``.  Set to ``0`` to disable (★ not recommended ★).
+        100. Set to 0 to disable (not recommended).
     max_vel : float, optional
         Per-joint velocity cap in **rad/s** written into every frame
         (``set_many_pos_vel_tqe`` ``vel`` field).  Default ``1.0``
@@ -351,10 +328,9 @@ class ServoOpts:
         written to each motor is the **true required velocity**
         ``(target[k] - target[k-1]) * rate_hz`` (clamped to
         ``±max_vel``), exactly like UR servoj's internal velocity
-        feedforward.  When ``False`` every frame uses the constant
-        ``max_vel`` as ``vel``, which makes the motor "always sprint"
-        toward each target and is the dominant source of high-frequency
-        whine in joystick / teleop scenarios.
+        feedforward. When ``False``, position-channel frames use
+        ``max_vel`` as a positive velocity limit, while MIT frames use zero
+        desired velocity (MIT velocity is signed, not a limit).
     lookahead_time : float, optional
         Default ``0.0`` (no smoothing).  When ``> 0``, an exponential
         moving average (first-order low-pass) with time constant
@@ -394,18 +370,16 @@ class ServoOpts:
     # for production safety, but not for diagnostic scripts).
     lag_abort_consecutive: int = 0
     # ---- control channel ----
-    # True (default): send on the group-MIT channel (0x8093, kp/kd + gravity
-    #   feed-forward, like move_MIT) -- impedance tracking, softer feel, matches
-    #   the vendor pos_vel_tqe_kp_kd streaming. Uses kp/kd (mit_kp/mit_kd) and,
-    #   for heavy joints, a dynamics model for gravity feed-forward.
-    # False: send on the position channel (0x8090 set_many_pos_vel_tqe_partial)
-    #   -- firmware position loop tracks; robust, no gain tuning (fallback).
-    use_mit: bool = True
+    # False (default): position channel; no motor calibration is needed.
+    # True: group-MIT impedance channel. Non-zero MIT gains/torque require
+    # exact per-joint motor_models; unknown coefficients are rejected.
+    use_mit: bool = False
     # Per-joint MIT PD gains (physical vendor units, same as move_MIT). None =>
     # vendor replay defaults for 6-DoF (kp=[30,40,55,15,7,5], kd=[3,4,5.5,1.5,
     # 0.7,0.5]); scalar otherwise. Only used when use_mit=True.
     mit_kp: "float | Iterable[float] | None" = None
     mit_kd: "float | Iterable[float] | None" = None
+    motor_models: "Optional[List[str]]" = None
     # Add gravity feed-forward each MIT tick (needs setup_dynamics; silently
     # falls back to kp/kd-only when no model). Only used when use_mit=True.
     mit_gravity_ff: bool = True
@@ -446,8 +420,8 @@ class FrictionParams:
     def reference_6dof() -> "FrictionParams":
         """Starting values from the reference friction model.
 
-        ★ These are a *starting point only* — friction is arm- and
-        wear-specific and MUST be re-identified on your hardware. ★
+        These are starting values only. Friction is arm- and wear-specific
+        and must be re-identified on the actual hardware.
         """
         return FrictionParams(
             fc=np.array([0.20, 0.15, 0.15, 0.15, 0.04, 0.04]),
@@ -588,9 +562,9 @@ class FafuRobotController:
         self._op_owner_thread_id: Optional[int] = None
         self._state_verbose: bool = False
         self._gravity_comp_owner_thread_id: Optional[int] = None
-        # Per-motor feedback freshness.  The C++ driver also tracks this in
-        # recent builds; keeping a Python-side mirror preserves safety when an
-        # older prebuilt binding is used.
+        self._gravity_core_token: Optional[int] = None
+        # Python-side timestamps support the hardware-free policy tests and
+        # diagnostics; the native core is authoritative in real instances.
         self._motor_last_seen_monotonic: Dict[int, float] = {}
         # DEAD (motor power / CAN loss) detection. During a live async/polling
         # session, every configured joint must have feedback newer than this
@@ -598,6 +572,22 @@ class FafuRobotController:
         # power-return cannot silently resume motion.
         self._dead_rx_timeout_ms: float = 500.0
         self._dead_reason: Optional[str] = None
+
+        # Native P0 core is the single authority for state, writer ownership,
+        # recovery and Servo safety. Refuse an old binary instead of silently
+        # running a second, divergent implementation in Python.
+        if getattr(pm, "CORE_ABI_VERSION", 0) != 2:
+            raise RuntimeError(
+                "fafu_motor native core ABI 2 is required; rebuild/install "
+                "the C++ extension from this SDK version")
+        core_cfg = pm.CoreConfig()
+        core_cfg.all_motor_ids = list(cfg.motor_ids)
+        core_cfg.joint_motor_ids = list(self._joint_motor_ids)
+        core_cfg.max_torque_raw = int(cfg.max_torque_raw)
+        core_cfg.stale_feedback_timeout_ms = self._dead_rx_timeout_ms
+        core_cfg.polling_rate_hz = max(
+            10.0, float(cfg.control_rate_hz or 50.0))
+        self._core = pm.RobotCore(self._ht, core_cfg)
 
         # Push soft limits configured in robot.cfg into the driver.
         try:
@@ -611,44 +601,21 @@ class FafuRobotController:
         # Order is significant: set_motor_mode MUST run before
         # enable_async_rx so that the SDK can verify the mode echo.
         #
-        # enable() failure is NON-FATAL at construction: if a few motors
-        # are stuck (e.g. MIT 0x0B that only a hard power-cycle clears),
-        # crashing here locks the user out of the menu entirely — they
-        # can't even run diagnostics, retry, or operate the other joints.
-        # So warn loudly and continue; the offending joints simply won't
-        # move until recovered ([y] soft-reboot / power-cycle).
+        # enable() failure is non-fatal at construction so diagnostics and
+        # recovery remain available. The native core stops every motor and
+        # keeps motion disabled until a later enable() succeeds.
         if auto_enable:
             try:
                 self.enable()
             except Exception as e:
                 print(f"[FafuRobot] warning: enable() failed at startup: {e}")
-                print("[FafuRobot] continuing anyway so you can run diagnostics "
-                      "/ operate other joints; stuck joints won't move until "
-                      "recovered.")
+                print("[FafuRobot] motion remains disabled; run diagnostics, "
+                      "recover the fault, then call enable() again.")
 
         use_async = async_rx if async_rx is not None else bool(cfg.use_async_rx)
-        if use_async:
-            try:
-                self._ht.enable_async_rx()
-                time.sleep(0.1)
-                # Prime the RX cache so get_cached_state returns immediately.
-                for mid in cfg.motor_ids:
-                    if self._ht.read_motor_state(mid, 0.1) is not None:
-                        self._note_motor_seen(mid)
-            except Exception as e:
-                print(f"[FafuRobot] warning: enable_async_rx failed: {e}")
-
-        if auto_polling:
-            try:
-                hz = float(cfg.control_rate_hz) if cfg.control_rate_hz else 50.0
-                hz = max(10.0, hz)
-                self._ht.start_state_polling(
-                    list(cfg.motor_ids),
-                    hz,
-                    self._on_motor_states_updated,
-                )
-            except Exception as e:
-                print(f"[FafuRobot] warning: start_state_polling failed: {e}")
+        polling_hz = max(10.0, float(cfg.control_rate_hz or 50.0))
+        self._core.start_transport(
+            bool(use_async), bool(auto_polling), polling_hz)
 
         # Last *commanded* joint positions (turns) from a blocking
         # move (S-curve).  Used to start the next move's trajectory from
@@ -661,39 +628,10 @@ class FafuRobotController:
         # commanded value becomes unknown (disable / manual drag).
         self._last_cmd_turns: Optional[Dict[int, float]] = None
 
-        # Servo (online streaming) session state. None when not servoing.
+        # Python only keeps user options for optional dynamics feed-forward.
+        # Servo lifecycle, counters and ownership live in the native core.
         self._servo_active: bool = False
         self._servo_opts: Optional[ServoOpts] = None
-        self._servo_last_target_turns: List[float] = []
-        # filtered_target_turns mirrors last_target when lookahead_time == 0;
-        # when smoothing is enabled it lags the raw target by ~lookahead_time.
-        self._servo_filtered_target_turns: List[float] = []
-        # Pre-allocated numpy buffers for set_many_pos_vel_tqe_partial.
-        # active_ids / hold_ids are set once in servo_start and never
-        # re-allocated; active_pos / active_vel are overwritten in place
-        # every tick to avoid per-call numpy allocation.
-        self._servo_active_ids_np: Optional[np.ndarray] = None
-        self._servo_hold_ids_np: Optional[np.ndarray] = None
-        self._servo_active_pos_np: Optional[np.ndarray] = None
-        self._servo_active_vel_np: Optional[np.ndarray] = None
-        self._servo_max_motor_id: int = 0
-        self._servo_max_torque: int = 0
-        self._servo_started_at: float = 0.0
-        self._servo_tick_count: int = 0
-        # warning counters for batched logging at servo_end
-        self._servo_clamp_count: int = 0
-        self._servo_lag_count: int = 0
-        # Track *consecutive* lag-tripped ticks to support
-        # lag_abort_consecutive. Reset to 0 every time a tick comes
-        # in clean (lag <= max_lag_rad).
-        self._servo_lag_streak: int = 0
-        # One-shot warning so the user sees a live notice on the first
-        # lag-trip without flooding the console at 100Hz.
-        self._servo_lag_warned: bool = False
-        # Sticky flag — once auto-abort fires we refuse further servo_j
-        # frames so callers can detect the condition. Cleared by
-        # servo_start.
-        self._servo_aborted_reason: Optional[str] = None
 
         # ---- Dynamics (gravity / friction compensation) state ----
         # All None until setup_dynamics() succeeds. Kept on the instance
@@ -705,9 +643,8 @@ class FafuRobotController:
         self._eef_frame_id: Optional[int] = None
         self._eef_frame_name: Optional[str] = None
         self._dyn_gravity_vec: np.ndarray = np.array([0.0, 0.0, -9.81])
-        # Per-joint motor model strings used to convert Nm -> raw int16
-        # inside set_pos_vel_tqe_kp_kd. None => "" (coeff 1.0, see
-        # setup_dynamics docstring for why that is unsafe-but-quiet).
+        # Per-joint motor models used for physical torque/MIT conversion.
+        # Unknown models are rejected before any non-zero command is sent.
         self._dyn_motor_models: Optional[List[str]] = None
         # Per-joint torque clip (Nm). Defaults applied in setup_dynamics.
         self._dyn_tau_limit: Optional[np.ndarray] = None
@@ -723,7 +660,9 @@ class FafuRobotController:
         #            MIT is actuated; single-motor 0x15 is not).
         #   False -> legacy per-joint set_torque (0x0A), one frame per joint.
         # Auto-disabled when num_joints > 6 (one MIT frame holds <=6 motors).
-        self._use_group_mit: bool = (self.num_joints <= 6)
+        self._use_group_mit: bool = (
+            self.num_joints <= 6 and max(self._joint_motor_ids) <= 6
+        )
 
         print(
             f"[FafuRobot] connected on {self._port} @ {self._baudrate} "
@@ -731,6 +670,50 @@ class FafuRobotController:
             + (f" + gripper M{self._gripper_motor_id}" if self._has_gripper else "")
             + ")"
         )
+
+    @staticmethod
+    def _python_state_from_core(core_state) -> RobotState:
+        return RobotState[core_state.name]
+
+    def _sync_state_from_core(self) -> RobotState:
+        core = getattr(self, "_core", None)
+        if core is None:
+            return self._state
+        state = self._python_state_from_core(core.state)
+        with self._state_lock:
+            self._state = state
+            self._dead_reason = core.dead_reason or None
+        return state
+
+    @staticmethod
+    def _core_finish_mode(mode: str):
+        return {
+            "stop": pm.FinishMode.STOP,
+            "brake": pm.FinishMode.BRAKE,
+            "hold": pm.FinishMode.HOLD,
+        }[mode]
+
+    def _native_cancel_requested(self) -> bool:
+        core = getattr(self, "_core", None)
+        return bool(core is not None and core.cancel_requested)
+
+    def _command_guard(self):
+        """Serialize one hardware write with ESTOP/DEAD for this instance."""
+        core = getattr(self, "_core", None)
+        return core.command_guard() if core is not None else nullcontext()
+
+    def _combined_abort_check(
+        self, abort_check: Optional[Callable[[], bool]]
+    ) -> Callable[[], bool]:
+        def cancelled() -> bool:
+            core = getattr(self, "_core", None)
+            if self._native_cancel_requested():
+                return True
+            if core is not None and not core.stream_link_ok():
+                self._sync_state_from_core()
+                return True
+            return bool(abort_check is not None and abort_check())
+        return cancelled
 
     # ------------------------------------------------------------------
     #  Public properties
@@ -779,12 +762,10 @@ class FafuRobotController:
     # ------------------------------------------------------------------
     @property
     def state(self) -> RobotState:
-        """Current high-level :class:`RobotState` of the controller.
-
-        This is the software flow-control state that gates the motion
-        API (see :class:`RobotState`).  It is *not* a live hardware read;
-        use :meth:`is_enabled` / :meth:`get_motor_states` for that.
-        """
+        """Current high-level state from the native concurrency core."""
+        core = getattr(self, "_core", None)
+        if core is not None:
+            return self._sync_state_from_core()
         with self._state_lock:
             return self._state
 
@@ -798,6 +779,18 @@ class FafuRobotController:
         self._state_verbose = bool(value)
 
     def _set_state(self, new: RobotState) -> None:
+        core = getattr(self, "_core", None)
+        if core is not None and new not in (
+            RobotState.DEAD, RobotState.ESTOP, RobotState.DISCONNECTED
+        ):
+            target = getattr(pm.RobotState, new.name)
+            try:
+                if core.state != target:
+                    core.transition(target)
+            except Exception as exc:
+                raise RobotStateError(
+                    f"invalid native state transition to {new.name}: {exc}"
+                ) from exc
         with self._state_lock:
             old = self._state
             if old is new:
@@ -807,38 +800,22 @@ class FafuRobotController:
                 print(f"[FafuRobot] state: {old} -> {new}")
 
     def _require_ready(self, action: str, *, allow_disabled: bool = False) -> None:
-        """Raise :class:`RobotStateError` unless the controller can accept
-        the motion command ``action``.
-
-        ``allow_disabled=True`` permits starting from ``DISABLED`` for
-        calls that enable the motors themselves (e.g. ``servo_start``).
-        When state is ``DISABLED`` we first reconcile against the live
-        hardware (motors may actually be in position mode already, e.g.
-        left holding by a previous program) before rejecting.
-        """
+        """Reject a command unless the controller can accept it."""
         st = self._state
         if st is RobotState.IDLE:
-            # Cheap power/link check: if the motors dropped off the bus while
-            # we thought we were idle (brown-out / power cycle), latch DEAD
-            # rather than blindly re-commanding a possibly-sagged arm.
             if not self._stream_link_ok():
                 raise RobotStateError(
-                    f"{action} 被拒绝: 检测到掉电/通信丢失 (DEAD)。"
-                    f" 电源恢复后调用 recover(confirm=True)。"
-                )
+                    f"{action} rejected: feedback was lost (DEAD); "
+                    "call recover(confirm=True) after power is restored")
             return
         if st is RobotState.DEAD:
+            detail = f": {self._dead_reason}" if self._dead_reason else ""
             raise RobotStateError(
-                f"{action} 被拒绝: 掉电/通信丢失锁定 (DEAD)"
-                + (f": {self._dead_reason}" if self._dead_reason else "")
-                + "。电源恢复后调用 recover(confirm=True)，再 enable()。"
-            )
+                f"{action} rejected: feedback loss is latched (DEAD){detail}; "
+                "call recover(confirm=True), then enable()")
         if st in (RobotState.DISABLED, RobotState.BRAKED):
             if allow_disabled:
                 return
-            # Reconcile: the motors may in fact be energised even though
-            # our software state lagged behind (previous ``servo_end("hold")``
-            # / external enable). Promote to IDLE instead of falsely rejecting.
             try:
                 if self.is_enabled:
                     self._set_state(RobotState.IDLE)
@@ -846,70 +823,57 @@ class FafuRobotController:
             except Exception:
                 pass
             raise RobotStateError(
-                f"{action} 需要电机已使能 (position control)，当前 state={st.name}。"
-                f" 请先调用 enable()。"
-            )
+                f"{action} requires enabled motors; state={st.name}. "
+                "Call enable() first")
         if st is RobotState.DISCONNECTED:
             raise RobotStateError(
-                f"{action} 失败: 连接已关闭 (state=DISCONNECTED)。"
-            )
+                f"{action} failed: connection is closed")
         if st is RobotState.ESTOP:
             raise RobotStateError(
-                f"{action} 被拒绝: 处于急停状态 (ESTOP)。请先调用 resume() 解除急停。"
-            )
-        # One of the busy states.
+                f"{action} rejected: emergency stop is latched; call resume()")
         raise RobotStateError(
-            f"{action} 被拒绝: 机械臂正忙 (state={st})，"
-            f"当前操作结束前不能启动新动作。"
-        )
+            f"{action} rejected: controller is busy (state={st})")
 
-    def _require_gripper_ready(self, action: str) -> None:
-        """Guard for gripper commands (``gripper_control`` / ``open`` /
-        ``close``).
+    def _enter_operation(self, action: str, busy_state: RobotState):
+        """Acquire the single per-controller writer lease.
 
-        The gripper (motor M7) is an **independent** actuator from the 6
-        arm joints, so — unlike joint motion — it is allowed to run
-        *during* a joint-streaming session (``SERVOING``) and does not
-        change the joint state.  It is blocked only when the arm is
-        disconnected, estopped, not enabled, already doing a
-        force-``grasp`` (``GRASPING``), or floating in gravity comp.
+        Reads remain concurrent. A second writer fails immediately instead of
+        interleaving frames; same-thread nested joint calls remain supported.
         """
-        st = self._state
-        if st in (RobotState.IDLE, RobotState.MOVING, RobotState.SERVOING):
-            return
-        if st in (RobotState.DISABLED, RobotState.BRAKED):
+        core = getattr(self, "_core", None)
+        if core is not None:
+            if action == "reset_zero":
+                kind = pm.OperationKind.RAW_STREAM
+            elif busy_state is RobotState.MOVING:
+                kind = pm.OperationKind.JOINT_MOTION
+            elif busy_state is RobotState.GRASPING:
+                kind = (pm.OperationKind.GRASP
+                        if action == "grasp"
+                        else pm.OperationKind.GRIPPER_MOTION)
+            elif busy_state is RobotState.GRAVITY_COMP:
+                kind = pm.OperationKind.GRAVITY_COMP
+            else:
+                kind = pm.OperationKind.RAW_STREAM
             try:
-                if self.is_enabled:
-                    return   # leave the joint state as-is; gripper is orthogonal
-            except Exception:
-                pass
-            raise RobotStateError(
-                f"{action} 需要电机已使能, 当前 state={st.name}。请先调用 enable()。"
-            )
-        if st is RobotState.DISCONNECTED:
-            raise RobotStateError(f"{action} 失败: 连接已关闭 (state=DISCONNECTED)。")
-        if st is RobotState.DEAD:
-            raise RobotStateError(
-                f"{action} 被拒绝: 掉电/通信丢失锁定 (DEAD)。"
-                "电源恢复后调用 recover(confirm=True)。"
-            )
-        if st is RobotState.ESTOP:
-            raise RobotStateError(
-                f"{action} 被拒绝: 处于急停状态 (ESTOP)。请先调用 resume()。"
-            )
-        if st is RobotState.GRASPING:
-            raise RobotStateError(f"{action} 被拒绝: 正在力控抓取 (grasp) 中。")
-        if st is RobotState.GRAVITY_COMP:
-            raise RobotStateError(f"{action} 被拒绝: 重力补偿 / 拖动示教中。")
-        raise RobotStateError(f"{action} 被拒绝: state={st}。")
+                token = core.begin_operation(kind)
+                if not core.stream_link_ok():
+                    core.end_operation(token)
+                    self._sync_state_from_core()
+                    raise RobotStateError(
+                        f"{action} rejected: {core.dead_reason}")
+            except RobotStateError:
+                raise
+            except Exception as exc:
+                raise RobotStateError(f"{action} rejected: {exc}") from exc
 
-    def _enter_operation(self, action: str, busy_state: RobotState) -> bool:
-        """Begin a call-scoped guarded operation.
+            owner = threading.get_ident()
+            with self._state_lock:
+                if self._op_depth == 0:
+                    self._op_owner_thread_id = owner
+                self._op_depth += 1
+                self._state = busy_state
+            return int(token)
 
-        Returns ``True`` if this call *owns* the operation (outermost)
-        and is responsible for restoring ``IDLE`` on exit; ``False`` for
-        a nested internal call (which must not touch the state).
-        """
         owner = threading.get_ident()
         with self._state_lock:
             if self._op_depth > 0:
@@ -918,7 +882,6 @@ class FafuRobotController:
                         f"{action} rejected: another thread owns the active "
                         f"control operation (state={self._state})."
                     )
-                # Same-thread internal nesting (go_home -> move_j, etc.).
                 self._op_depth += 1
                 return False
             self._require_ready(action)
@@ -927,7 +890,20 @@ class FafuRobotController:
             self._set_state(busy_state)
             return True
 
-    def _exit_operation(self, owns: bool) -> None:
+    def _exit_operation(self, owns) -> None:
+        core = getattr(self, "_core", None)
+        if core is not None and not isinstance(owns, bool):
+            try:
+                core.end_operation(int(owns))
+            finally:
+                with self._state_lock:
+                    if self._op_depth > 0:
+                        self._op_depth -= 1
+                    if self._op_depth == 0:
+                        self._op_owner_thread_id = None
+                    self._state = self._python_state_from_core(core.state)
+            return
+
         owner = threading.get_ident()
         with self._state_lock:
             if self._op_depth <= 0:
@@ -937,9 +913,6 @@ class FafuRobotController:
             self._op_depth -= 1
             if owns and self._op_depth == 0:
                 self._op_owner_thread_id = None
-                # Only restore IDLE if we are still in a call-scoped busy
-                # state.  An out-of-band transition (emergency_stop from a
-                # signal handler, close_connection) must not be clobbered.
                 if self._state in (RobotState.MOVING, RobotState.GRASPING):
                     self._set_state(RobotState.IDLE)
 
@@ -965,9 +938,13 @@ class FafuRobotController:
             )
             internal_gravity = (
                 allow_gravity_owner
-                and self._gravity_comp_active
-                and self._gravity_comp_owner_thread_id == owner
                 and self._state is RobotState.GRAVITY_COMP
+                and (
+                    (self._gravity_comp_active
+                     and self._gravity_comp_owner_thread_id == owner)
+                    or (self._op_depth > 0
+                        and self._op_owner_thread_id == owner)
+                )
             )
         if not (internal_move or internal_gravity):
             self._require_ready(action)
@@ -997,7 +974,10 @@ class FafuRobotController:
     # ------------------------------------------------------------------
     @property
     def dead_reason(self) -> Optional[str]:
-        """Why the controller latched :attr:`RobotState.DEAD` (or ``None``)."""
+        """Why the controller latched DEAD, or None."""
+        core = getattr(self, "_core", None)
+        if core is not None:
+            return core.dead_reason or None
         return self._dead_reason
 
     def _enter_dead(self, reason: str) -> None:
@@ -1027,6 +1007,14 @@ class FafuRobotController:
         Every commanded joint must have fresh feedback; a healthy motor must
         never hide stale feedback from another commanded joint.
         """
+        core = getattr(self, "_core", None)
+        if core is not None:
+            ok = bool(core.stream_link_ok())
+            if not ok:
+                self._servo_active = False
+                self._sync_state_from_core()
+            return ok
+
         try:
             async_rx = bool(self._ht.is_async_rx())
             polling = bool(self._ht.is_polling())
@@ -1077,6 +1065,12 @@ class FafuRobotController:
         after restoring power.  No-op (returns ``False``) if already
         disconnected.
         """
+        core = getattr(self, "_core", None)
+        if core is not None:
+            alive = bool(core.check_alive(bool(fresh), float(timeout)))
+            self._sync_state_from_core()
+            return alive
+
         if self._state is RobotState.DISCONNECTED:
             return False
         missing: List[int] = []
@@ -1114,6 +1108,17 @@ class FafuRobotController:
         Returns ``True`` if the link is back and we moved to ``DISABLED``;
         ``False`` if the motors are still unresponsive (stays ``DEAD``).
         """
+        core = getattr(self, "_core", None)
+        if core is not None:
+            if self._state is RobotState.DEAD and not confirm:
+                raise RuntimeError(
+                    "recover(confirm=True) required (safety): confirm the arm "
+                    "is powered and the workspace is clear.")
+            recovered = bool(core.recover(bool(confirm), 0.2))
+            self._last_cmd_turns = None
+            self._sync_state_from_core()
+            return recovered
+
         with self._state_lock:
             if self._op_depth > 0:
                 raise RobotStateError(
@@ -1205,273 +1210,60 @@ class FafuRobotController:
     #  Power management
     # ------------------------------------------------------------------
     def enable(self, *, allow_motor_reset: bool = True) -> None:
-        """Switch every motor to position control and mark the controller
-        :attr:`RobotState.IDLE` on success.
-
-        Thin state-machine wrapper around :meth:`_enable_impl` (which
-        holds the full recovery-path documentation).  Legal from
-        ``DISABLED`` / ``IDLE`` / ``ESTOP`` (``resume`` routes here);
-        rejected when disconnected or while a blocking operation is in
-        flight.  If :meth:`_enable_impl` raises, the state is left
-        unchanged (e.g. still ``DISABLED``) so the failure is visible.
-        """
+        """Enable position control, including the native recovery sequence."""
         with self._state_lock:
             if self._op_depth > 0:
                 raise RobotStateError(
                     "enable rejected: wait for the in-flight operation to exit")
 
         if self._state is RobotState.DISCONNECTED:
-            raise RobotStateError("enable 失败: 连接已关闭 (state=DISCONNECTED)。")
+            raise RobotStateError("enable failed: connection is closed")
         if self._state is RobotState.DEAD:
             raise RobotStateError(
-                "enable 被拒绝: 掉电/通信丢失锁定 (DEAD)。请先 recover(confirm=True)。"
-            )
+                "enable rejected: feedback loss is latched (DEAD); "
+                "call recover(confirm=True)")
         if self._state in _BUSY_STATES:
             raise RobotStateError(
-                f"enable 被拒绝: 机械臂正忙 (state={self._state})。"
-            )
+                f"enable rejected: controller is busy (state={self._state})")
+
         self._enable_impl(allow_motor_reset=allow_motor_reset)
         self._set_state(RobotState.IDLE)
 
     def _enable_impl(self, *, allow_motor_reset: bool = True) -> None:
-        """Switch every motor to position control (mode ``0x0A``).
+        """Run the native position-mode recovery sequence."""
+        core = getattr(self, "_core", None)
+        if core is None:
+            raise RuntimeError("native RobotCore is not initialized")
 
-        Resolution path (cheapest to most aggressive):
-
-        0. **Fast path.** Read every motor's live state; if all are
-           already in MODE_POSITION (left over from a previous
-           ``servo_end("hold")`` or ``close_connection(release="hold")``)
-           return without sending any mode-change frame.  This both
-           saves ~30 ms and avoids a known false-failure mode of
-           ``set_motor_mode(0x0A)`` whose internal "switch + read-back"
-           sequence sometimes reports ``None`` on a freshly-reopened
-           port even when the mode change actually succeeded.
-        1. **Normal path.** Call :meth:`_switch_mode_all` with up to
-           3 retries; it now does a fresh ``read_motor_state`` to
-           verify failures, filtering out the false-failure case
-           above.
-        2. **Soft-reboot path.** If the normal path still fails, print
-           a diagnostic for every motor (mode / fault / position read
-           live), then issue a firmware-level ``motor_reset`` to every
-           failed motor (fire-and-forget reset of the on-motor
-           controller — does **not** clear zero / config), wait 1 s
-           for them to come back up, and try the normal path one more
-           time.
-
-        Most cases of "refused mode 0x0A" after a previous
-        ``servo_end`` / ``close_connection`` are resolved at step 2
-        without a hardware power-cycle.
-
-        Parameters
-        ----------
-        allow_motor_reset : bool, optional
-            Default ``True``.  Set to ``False`` to keep the legacy
-            behaviour (raise immediately if step 1 fails).  Useful
-            when something else owns the bus and you do not want a
-            stealth ``motor_reset``.
-
-        Raises
-        ------
-        RuntimeError
-            Either step 1 (when ``allow_motor_reset=False``) or both
-            stages exhausted.  In the latter case the printed
-            diagnostic above tells you whether the motors are
-            unreachable (no state read), faulted (non-zero ``fault``
-            register), or mechanically jammed (mode = 0x0A but the
-            commanded position cannot be tracked).
-        """
-        # Stage-0: fast path. read once, skip the whole switch if every
-        # motor is already in MODE_POSITION. This handles the common
-        # case of "previous program left motors holding" cleanly and
-        # cheaply, and dodges the sync-read false-failure issue.
-        already_active = True
-        seen_mit_mode = False   # 0x0B = MIT (set_many_mit / 0x8093) 残留模式
-        for mid in self._cfg.motor_ids:
-            s = self._ht.read_motor_state(mid, 0.2)
-            if s is None or int(s.mode) != self.MODE_POSITION:
-                already_active = False
-                if s is not None and int(s.mode) == self.MODE_MIT:
-                    seen_mit_mode = True
-                break
-        if already_active:
-            print("[FafuRobot] all motors already in position control hold; "
-                  "enable() is a no-op.")
+        options = pm.EnableOptions()
+        options.allow_motor_reset = bool(allow_motor_reset)
+        result = core.enable(options)
+        self._sync_state_from_core()
+        if result.success:
             return
 
-        # MIT 残留 (mode 0x0B): 实测本固件下 set_motor_mode(0x0A) 切不动 (哪怕用
-        # per-motor 位置帧隐式切也失败, 见 set_motor_mode 注释), 必须 motor_reset
-        # 软重启才能回到位置模式. 常规 _switch_mode_all 的 3 次重试注定失败, 只会
-        # 白白拉长"电机掉电 -> 下垂"的窗口. 检测到 0x0B 就直接跳到 motor_reset.
-        if seen_mit_mode and allow_motor_reset:
-            print("[FafuRobot] enable: MIT residual mode (0x0B) detected; "
-                  "motor_reset directly (skip doomed mode-switch retries) ...")
-            for mid in self._cfg.motor_ids:
-                try:
-                    self._ht.motor_reset(mid)
-                except Exception as e:
-                    print(f"  motor {mid}: motor_reset failed: {e}")
-            # 与 stage-2 一致用 1.0s: 上次日志 J2/J3/J4 在 0.6s 后仍卡在 0x0B.
-            time.sleep(1.0)
-            if self._switch_mode_all(self.MODE_POSITION,
-                                     label="position (post-MIT-reset)", max_retry=3):
-                time.sleep(0.05)
-                print("[FafuRobot] all motors enabled (recovered via motor_reset).")
-                return
-
-            # 部分电机 reset 后仍卡在 0x0B -> 对这些电机做几轮更"用力"的重试:
-            # 每轮对每个卡住电机 stop()(踢一下) + 连发 3 次 motor_reset (文本
-            # 后门命令 fire-and-forget, 可能丢帧, 多发几次更稳), 再等 1.2s.
-            for rnd in range(1, 4):
-                still_mit: List[int] = []
-                for mid in self._cfg.motor_ids:
-                    try:
-                        s = self._ht.read_motor_state(mid, 0.2)
-                        if s is not None and int(s.mode) == self.MODE_MIT:
-                            still_mit.append(mid)
-                    except Exception:
-                        still_mit.append(mid)
-                if not still_mit:
-                    break
-                print(f"[FafuRobot] enable: motors {still_mit} still in MIT 0x0B; "
-                      f"aggressive motor_reset round {rnd} (stop + reset x3) ...")
-                for mid in still_mit:
-                    try:
-                        self._ht.stop(mid)
-                    except Exception:
-                        pass
-                    for _ in range(3):
-                        try:
-                            self._ht.motor_reset(mid)
-                        except Exception as e:
-                            print(f"  motor {mid}: motor_reset failed: {e}")
-                        time.sleep(0.05)
-                time.sleep(1.2)
-                if self._switch_mode_all(self.MODE_POSITION,
-                                         label=f"position (post-MIT-reset-{rnd + 1})",
-                                         max_retry=3):
-                    time.sleep(0.05)
-                    print(f"[FafuRobot] all motors enabled "
-                          f"(recovered via motor_reset round {rnd + 1}).")
-                    return
-
-            # 反复软重启仍有电机卡在 0x0B -> 本固件把 MIT 模式锁死, 纯软件救不回,
-            # 直接给出断电指引 (落到 stage-2 也只是再白等一遍).
-            stuck = []
-            for mid in self._cfg.motor_ids:
-                try:
-                    s = self._ht.read_motor_state(mid, 0.2)
-                    if s is not None and int(s.mode) == self.MODE_MIT:
-                        stuck.append(mid)
-                except Exception:
-                    pass
-            if stuck:
-                self._print_motor_diagnostic(
-                    prefix="enable: MIT 0x0B stuck after repeated motor_reset; ")
-                raise RuntimeError(
-                    f"enable failed: motors {stuck} stuck in MIT mode (0x0B) and "
-                    f"will not respond to motor_reset. This firmware locks the MIT/"
-                    f"运控 mode so tightly that only a HARD POWER-CYCLE of the arm "
-                    f"clears it. Please power the arm off and on, then rerun. "
-                    f"(To avoid this: after using MIT/持续保持, press [y] 软重启 "
-                    f"before quitting so motors are left in position mode 0x0A.)"
-                )
-
-            # (理论上到不了这里) 快速路径没完全恢复 -> 落到 stage-2 全量 reset.
-            print("[FafuRobot] enable: MIT fast-path reset incomplete; "
-                  "falling through to full motor_reset recovery ...")
-
-        if self._switch_mode_all(self.MODE_POSITION, label="position", max_retry=3):
-            time.sleep(0.05)
-            print("[FafuRobot] all motors enabled (position control hold).")
-            return
-
-        # Stage-1 failed. Print a diagnostic so the next message is
-        # actionable instead of a generic "refused".
-        self._print_motor_diagnostic(prefix="enable: stage-1 failed; ")
-
-        if not allow_motor_reset:
-            raise RuntimeError(
-                "enable failed: at least one motor refused mode 0x0A "
-                "(motor_reset recovery disabled by allow_motor_reset=False)"
-            )
-
-        # Stage-2: motor_reset is a firmware-level soft reboot of the
-        # on-motor controller. It is the equivalent of pulling power on
-        # *only that motor* for a few hundred ms, without losing zero
-        # calibration / soft limits / etc. Use as last resort before
-        # asking the user to power-cycle.
-        print("[FafuRobot] enable: attempting motor_reset on every motor (soft reboot) ...")
-        for mid in self._cfg.motor_ids:
-            try:
-                self._ht.motor_reset(mid)
-            except Exception as e:
-                print(f"  motor {mid}: motor_reset failed: {e}")
-        # Firmware needs time to come back. Empirically ~0.6 s is
-        # enough on the boards we have; 1.0 s gives margin.
-        time.sleep(1.0)
-
-        if not self._switch_mode_all(self.MODE_POSITION, label="position (post-reset)", max_retry=3):
-            self._print_motor_diagnostic(prefix="enable: stage-2 (post-reset) failed; ")
-            raise RuntimeError(
-                "enable failed even after motor_reset; check the "
-                "diagnostic above. Likely causes: (a) motor controller "
-                "in latched FAULT state -> hard power-cycle; "
-                "(b) USB-CAN bus disconnected / wrong COM port; "
-                "(c) mechanical jam holding the joint outside soft limits."
-            )
-
-        time.sleep(0.05)
-        print("[FafuRobot] all motors enabled (recovered via motor_reset).")
-
-    def _print_motor_diagnostic(self, *, prefix: str = "") -> None:
-        """Read every motor's live state and print a compact summary.
-
-        Used by :meth:`enable` to turn an opaque "refused mode 0x0A"
-        into something a user can act on.  Reads are synchronous with
-        a generous timeout (300 ms) so the failure mode "motor does
-        not respond" is also obvious.
-        """
-        print(f"[FafuRobot] {prefix}motor states:")
-        for mid in self._cfg.motor_ids:
-            try:
-                s = self._ht.read_motor_state(mid, 0.3)
-            except Exception as e:
-                print(f"  motor {mid}: READ EXCEPTION {e}")
-                continue
-            if s is None:
-                print(f"  motor {mid}: NO RESPONSE (read timeout) — bus or motor power off?")
-                continue
-            fault_val = getattr(s, "fault", 0)
-            fault_tag = "fault=OK" if not fault_val else f"fault=0x{int(fault_val):02X} ★"
-            print(f"  motor {mid}: mode=0x{int(s.mode):02X}  {fault_tag}  "
-                  f"pos={s.position:+.3f}t  vel={s.velocity:+.3f}t/s")
+        failed = list(result.failed_motor_ids)
+        suffix = f"; failed motors={failed}" if failed else ""
+        raise RuntimeError(f"enable failed: {result.message}{suffix}")
 
     def disable(self) -> None:
-        """Switch every motor to free-spin mode (mode ``0x00``)."""
-        if self._state is RobotState.DISCONNECTED:
-            raise RobotStateError("disable 失败: 连接已关闭 (state=DISCONNECTED)。")
-        # Commanded position is now meaningless (the user may hand-drag
-        # the arm); force the next move to start from the measured pose.
+        """Disable motor output and allow the arm to move freely."""
+        core = getattr(self, "_core", None)
+        if core is None:
+            raise RuntimeError("native RobotCore is not initialized")
+        core.disable()
         self._last_cmd_turns = None
-        ok = self._switch_mode_all(self.MODE_STOP, label="stop", max_retry=2)
-        if ok:
-            print("[FafuRobot] all motors disabled (free spin).")
-        self._set_state(RobotState.DISABLED)
+        self._sync_state_from_core()
 
     def brake(self) -> None:
-        """Engage short-circuit braking on every motor (mode ``0x0F``)."""
-        if self._state is RobotState.DISCONNECTED:
-            raise RobotStateError("brake 失败: 连接已关闭 (state=DISCONNECTED)。")
-        ok = self._switch_mode_all(self.MODE_BRAKE, label="brake", max_retry=2)
-        if ok:
-            print("[FafuRobot] all motors braked.")
-        # Short-circuit brake (0x0F): not position control, but distinct from
-        # free-spin DISABLED (0x00) — the arm resists motion. Track as BRAKED.
-        self._set_state(RobotState.BRAKED)
+        """Apply short-circuit braking to every configured motor."""
+        core = getattr(self, "_core", None)
+        if core is None:
+            raise RuntimeError("native RobotCore is not initialized")
+        core.brake()
+        self._last_cmd_turns = None
+        self._sync_state_from_core()
 
-    # ------------------------------------------------------------------
-    #  Joint-space motion
-    # ------------------------------------------------------------------
     @_guard_operation("move_j", RobotState.MOVING)
     def move_j(
         self,
@@ -1517,14 +1309,9 @@ class FafuRobotController:
               profile via :meth:`_move_scurve` (smooth start/stop, uses
               ``set_many_pos_vel_tqe`` == ``pos_vel_MAXtqe``, no
               integral -> gravity steady-state error).
-            * ``"linear"``: synchronized-arrival mode —
-              compute ``v_i = (target_i - current_i)/duration``
-              for synchronized arrival, broadcast **one**
-              ``set_many_pos_vel_tqe`` frame, then poll until settled
-              (:meth:`_move_linear_sync`).  Same ``pos_vel_MAXtqe`` path
-              (no integral) so the gravity steady-state error is
-              **identical** to S-curve; harder start/stop.  A/B only.
-            * ``"acc"``: per-joint ``set_pos_vel_acc`` (firmware
+            * "linear": synchronized-arrival mode. It computes one velocity
+              per joint, sends one group frame, then waits for settling.
+            * "acc": per-joint set_pos_vel_acc (firmware
               trapezoidal *internal* position loop, MODE_POS_VEL_ACC).
               This is
               the channel the firmware drives with its own profile +
@@ -1546,6 +1333,11 @@ class FafuRobotController:
         speed = self._clamp_speed(speed)
 
         style = (style or "scurve").strip().lower()
+        valid_styles = {"scurve", "linear", "acc"}
+        if style not in valid_styles:
+            raise ValueError(
+                f"style must be one of {sorted(valid_styles)}, got {style!r}"
+            )
 
         if style == "linear":
             tol_turns = abs(tolerance) / (_TWO_PI if is_radians else 360.0)
@@ -1577,12 +1369,13 @@ class FafuRobotController:
         # block=False: single shot, no waiting.
         v_avg = (speed / 100.0) * _VEL_AVG_MAX_TPS
         cmds = self._build_many_cmds_holding_others(targets_turns, vel_rps=v_avg)
-        self._ht.set_many_pos_vel_tqe(
-            cmds,
-            pm.PosUnit.Turns,
-            max(self._cfg.motor_ids),
-            0.05,
-        )
+        with self._command_guard():
+            self._ht.set_many_pos_vel_tqe(
+                cmds,
+                pm.PosUnit.Turns,
+                max(self._cfg.motor_ids),
+                0.05,
+            )
 
     def go_home(self, *, speed: int = 20, block: bool = True) -> None:
         """Move every manipulator joint back to 0 rad."""
@@ -1753,11 +1546,11 @@ class FafuRobotController:
                 f"got shape {path_arr.shape}"
             )
 
-        if self.num_joints > 6:
+        if self.num_joints > 6 or max(self._joint_motor_ids) > 6:
             raise RuntimeError(
-                f"move_jntspace_path_mit needs <=6 joints, but "
-                f"num_joints={self.num_joints}. Exclude the gripper "
-                f"(gripper_motor_id) so only manipulator joints stream.")
+                "move_jntspace_path_mit requires at most six joint motors "
+                "with IDs in 1..6; configure joint_motor_ids accordingly"
+            )
 
         tpply = pwp.PiecewisePolyTOPPRA()
         interpolated = tpply.interpolate_by_max_spdacc(
@@ -1780,11 +1573,6 @@ class FafuRobotController:
             print("[FafuRobot] move_jntspace_path_mit: gravity_ff requested but "
                   "no dynamics model; streaming kp/kd only (setup_dynamics to "
                   "add gravity feed-forward).")
-
-        # Active mode so 0x8093 MIT frames are actuated.
-        # The operation guard already owns MOVING, so call the internal
-        # implementation instead of the public enable() state transition.
-        self._enable_impl(allow_motor_reset=True)
 
         dt = max(0.005, control_frequency)
         _to_rad = 1.0 if is_radians else (math.pi / 180.0)
@@ -1818,583 +1606,118 @@ class FafuRobotController:
     # ------------------------------------------------------------------
     #  Servo (online streaming) control
     # ------------------------------------------------------------------
-    #
-    #  Unlike :meth:`move_j` (offline S-curve, blocking), ``servo_j`` is
-    #  designed for upper-layer code that streams a fresh joint target
-    #  every ~10 ms (e.g. teleop, VR, visual servoing, in-the-loop IK).
-    #
-    #  Lifecycle::
-    #
-    #      arm.servo_start(ServoOpts(...))     # once: arm watchdog, async RX
-    #      while not quit:
-    #          arm.servo_j(target_angles)      # ~100 Hz, non-blocking
-    #          time.sleep_until(next_tick)
-    #      arm.servo_end("brake")              # clear watchdog + brake
-    #
-    #  Four safety lines (cannot be skipped — they all live inside
-    #  ``servo_j`` and ``servo_start``):
-    #
-    #    1) Firmware-side watchdog ( :func:`HightorqueSerial.set_timeout` )
-    #       — if the motor sees no new command for ``watchdog_ms`` it
-    #       brakes itself. Survives host crash, Ctrl+C, USB unplug.
-    #    2) Per-step jump clamp (``max_step_rad``) — protects against
-    #       upper-layer planner step bugs.
-    #    3) Tracking-error monitor (``max_lag_rad``) — if measured
-    #       position trails ``last_target`` by more than this, ``servo_j``
-    #       returns ``False`` (stuck joint, motor too weak, planner too
-    #       fast, etc.).
-    #    4) Soft limits — reuses :meth:`enable_position_limit`; the
-    #       underlying ``set_many_pos_vel_tqe`` clamps automatically.
-    # ------------------------------------------------------------------
+    # Timing-sensitive safety and protocol work lives in RobotCore. Python
+    # only maps public options and computes optional dynamics feed-forward.
     def servo_start(self, opts: Optional[ServoOpts] = None) -> None:
-        """Enter an online-streaming joint-servo session.
+        """Start a caller-driven Servo session.
 
-        Idempotent on the second call (warns and returns).  After this
-        every joint motor has a firmware watchdog armed (1) and the
-        wrapper has cached the current joint configuration as the
-        initial ``last_target`` (so the first :meth:`servo_j` cannot
-        trip the step-clamp warning).  The gripper is **not** touched
-        and is not subject to the servo watchdog.
-
-        Parameters
-        ----------
-        opts : ServoOpts, optional
-            Tunables.  Defaults to :class:`ServoOpts` (watchdog 100 ms,
-            max_vel 1.0 rad/s, max_step 0.05 rad, max_lag 0.2 rad).
-
-        Raises
-        ------
-        RuntimeError
-            If the driver fails to enable async RX (servo cannot run on
-            the blocking sync-RX path) or any joint motor fails to
-            report a starting position.
+        The native core owns the watchdog, single-writer lease, step clamp,
+        lag monitor, command channel and session cleanup.
         """
-        if self._servo_active:
-            print("[FafuRobot] servo_start: already servoing; call servo_end first")
-            return
-
-        # State-machine guard. ``allow_disabled`` because servo_start
-        # enables the motors itself below; but reject if disconnected /
-        # estopped / busy with another operation.
-        self._require_ready("servo_start", allow_disabled=True)
-
+        core = getattr(self, "_core", None)
+        if core is None:
+            raise RuntimeError("native RobotCore is not initialized")
         opts = ServoOpts(**vars(opts)) if opts is not None else ServoOpts()
-        if opts.watchdog_ms < 0:
-            opts.watchdog_ms = 0
-        if opts.watchdog_ms == 0:
-            print("[FafuRobot] servo_start: WARNING watchdog disabled; "
-                  "host crash will not stop motors. Use only for offline tests.")
-        elif opts.watchdog_ms < 30:
-            print(f"[FafuRobot] servo_start: WARNING watchdog_ms={opts.watchdog_ms} "
-                  "< 30 may trip spuriously at 100Hz; recommend >= 50 ms.")
-        if opts.max_vel <= 0.0:
-            opts.max_vel = 1.0
-        if opts.max_step_rad <= 0.0:
-            opts.max_step_rad = 0.05
-        if opts.rate_hz <= 0.0:
-            opts.rate_hz = 100.0
-        if opts.lookahead_time < 0.0:
-            opts.lookahead_time = 0.0
+        native = pm.ServoOptions()
+        native.watchdog_ms = int(opts.watchdog_ms)
+        native.max_velocity_rad_s = float(opts.max_vel)
+        native.max_step_rad = float(opts.max_step_rad)
+        native.max_lag_rad = float(opts.max_lag_rad)
+        native.nominal_rate_hz = float(opts.rate_hz)
+        native.input_is_radians = bool(opts.is_radians)
+        native.feedforward_velocity = bool(opts.feedforward_vel)
+        native.lookahead_time_s = float(opts.lookahead_time)
+        native.lag_abort_consecutive = int(opts.lag_abort_consecutive)
+        native.channel = (
+            pm.ServoChannel.MIT if opts.use_mit
+            else pm.ServoChannel.POSITION)
+        if opts.mit_kp is not None:
+            native.mit_kp = (
+                [float(opts.mit_kp)] if np.isscalar(opts.mit_kp)
+                else [float(x) for x in opts.mit_kp])
+        if opts.mit_kd is not None:
+            native.mit_kd = (
+                [float(opts.mit_kd)] if np.isscalar(opts.mit_kd)
+                else [float(x) for x in opts.mit_kd])
 
-        if not self.is_enabled:
-            print("[FafuRobot] servo_start: motors not enabled, calling enable() ...")
-            self.enable()
-
-        # Servo cannot tolerate the 5-15 ms sync RX wait inside
-        # send_can_and_recv_, so force async RX on if it is not already.
-        if not self._ht.is_async_rx():
-            try:
-                self._ht.enable_async_rx()
-                time.sleep(0.05)
-            except Exception as e:
-                raise RuntimeError(f"servo_start: enable_async_rx failed: {e}") from e
-
-        # A servo session moves motors outside the move_j S-curve, so any
-        # previously-cached commanded pose is no longer valid; force the
-        # next move_j to start from the measured pose.
+        models = opts.motor_models or self._dyn_motor_models
+        if opts.use_mit and models is None:
+            raise ValueError(
+                "MIT servo requires exact per-joint motor_models; pass "
+                "ServoOpts(motor_models=[...]) or call set_motor_models()")
+        if models is not None:
+            self.set_motor_models(models)
+        core.servo_start(native)
         self._last_cmd_turns = None
-
-        # Capture current pos as last_target so the first servo_j is a
-        # zero-step move and never trips the step-clamp warning.
-        last_target: List[float] = []
-        for mid in self._joint_motor_ids:
-            s = self._ht.get_cached_state(mid)
-            if s is None:
-                s = self._ht.read_motor_state(mid, 0.1)
-            if s is None:
-                raise RuntimeError(
-                    f"servo_start: cannot read motor {mid} starting position")
-            last_target.append(s.position)
-
-        # Pre-build the numpy arrays consumed by
-        # ``set_many_pos_vel_tqe_partial`` so the per-tick allocation
-        # cost is zero (we only memcpy target_pos / target_vel into
-        # the pre-allocated buffers below; active_ids / hold_ids never
-        # change for a session).
-        active_ids_np = np.asarray(self._joint_motor_ids, dtype=np.int32)
-        # Non-joint motors are normally "held" at cached pos each tick.
-        # The gripper must be excluded: otherwise every servo_j overwrites
-        # M7 back to the position captured at servo_start, canceling
-        # open_gripper/close_gripper (non-blocking) commands.
-        hold_motor_ids = [
-            mid for mid in self._cfg.motor_ids if mid not in self._joint_motor_ids
-        ]
-        if self._has_gripper and self._gripper_motor_id is not None:
-            hold_motor_ids = [
-                mid for mid in hold_motor_ids if mid != self._gripper_motor_id
-            ]
-        hold_ids_np = np.asarray(hold_motor_ids, dtype=np.int32)
-        # Pre-allocated output buffers reused every tick.
-        N = len(self._joint_motor_ids)
-        active_pos_np = np.zeros(N, dtype=np.float64)
-        active_vel_np = np.zeros(N, dtype=np.float64)
-
-        # Arm the firmware watchdog on every JOINT motor (gripper excluded
-        # — gripper is not part of the servo loop, watching it would brake
-        # the jaws while the loop is still in start-up).
-        if opts.watchdog_ms > 0:
-            for mid in self._joint_motor_ids:
-                try:
-                    self._ht.set_timeout(mid, int(opts.watchdog_ms))
-                except Exception as e:
-                    print(f"[FafuRobot] servo_start: set_timeout({mid}) failed: {e}")
-
-        # If MIT channel requested, resolve + convert kp/kd to raw ONCE (per
-        # vendor kp_float2int, radian_2pi) so the per-tick hot path only does a
-        # cheap gravity-ff call + one set_many_mit. Physical gains default to
-        # the vendor replay values (6-DoF) or a scalar.
-        self._servo_mit_kp_raw: List[int] = []
-        self._servo_mit_kd_raw: List[int] = []
-        # MIT frame slot count = max JOINT motor id (gripper excluded), so a
-        # 6-joint arm builds a 6-slot 62B frame, not a 7-slot 72B (>64) one.
-        self._servo_mit_max_motor_id = int(max(self._joint_motor_ids))
-        if opts.use_mit:
-            if self.num_joints > 6:
-                raise RuntimeError(
-                    f"servo use_mit needs <=6 joints, but num_joints="
-                    f"{self.num_joints}; exclude the gripper.")
-            kp = opts.mit_kp
-            kd = opts.mit_kd
-            nj = self.num_joints
-            if kp is None:
-                kp = ([30.0, 40.0, 55.0, 15.0, 7.0, 5.0][:nj] if nj == 6 else 20.0)
-            if kd is None:
-                kd = ([3.0, 4.0, 5.5, 1.5, 0.7, 0.5][:nj] if nj == 6 else 2.0)
-            kp_v = ([float(kp)] * nj if np.isscalar(kp)
-                    else [float(x) for x in kp])
-            kd_v = ([float(kd)] * nj if np.isscalar(kd)
-                    else [float(x) for x in kd])
-            for i in range(nj):
-                model = (self._dyn_motor_models[i]
-                         if self._dyn_motor_models is not None else "")
-                coeff = TORQUE_COEFF.get(model, 1.0) or 1.0
-                self._servo_mit_kp_raw.append(
-                    int(np.clip(round((kp_v[i] / coeff) * 10.0 * _TWO_PI),
-                                -32768, 32767)))
-                self._servo_mit_kd_raw.append(
-                    int(np.clip(round((kd_v[i] / coeff) * 10.0 * _TWO_PI),
-                                -32768, 32767)))
-            if opts.mit_gravity_ff and not self.has_dynamics:
-                print("[FafuRobot] servo_start: use_mit gravity_ff requested but "
-                      "no dynamics model; MIT will run kp/kd-only.")
-
         self._servo_opts = opts
-        self._servo_last_target_turns = list(last_target)
-        self._servo_filtered_target_turns = list(last_target)
-        self._servo_active_ids_np = active_ids_np
-        self._servo_hold_ids_np = hold_ids_np
-        self._servo_active_pos_np = active_pos_np
-        self._servo_active_vel_np = active_vel_np
-        self._servo_max_motor_id = int(max(self._cfg.motor_ids))
-        self._servo_max_torque = int(self._cfg.max_torque_raw)
         self._servo_active = True
-        self._set_state(RobotState.SERVOING)
-        self._servo_tick_count = 0
-        self._servo_clamp_count = 0
-        self._servo_lag_count = 0
-        self._servo_lag_streak = 0
-        self._servo_lag_warned = False
-        self._servo_aborted_reason = None
-        self._servo_started_at = time.monotonic()
-
-        ff_tag = "on" if opts.feedforward_vel else "off"
-        la_tag = (f"{opts.lookahead_time * 1000:.0f}ms"
-                  if opts.lookahead_time > 0 else "off")
-        chan = ("MIT 0x8093 kp={} kd={} (raw)".format(
-                    self._servo_mit_kp_raw, self._servo_mit_kd_raw)
-                if opts.use_mit else "pos+vel+maxtqe 0x8090")
-        print(
-            f"[FafuRobot] servo_start: watchdog={opts.watchdog_ms}ms, "
-            f"max_vel={opts.max_vel}rad/s, max_step={opts.max_step_rad}rad, "
-            f"max_lag={opts.max_lag_rad}rad, "
-            f"feedforward={ff_tag}, lookahead={la_tag}, rate={opts.rate_hz:.0f}Hz, "
-            f"channel={chan}"
-        )
+        self._sync_state_from_core()
 
     def servo_j(self, target_angles: Iterable[float]) -> bool:
-        """Stream one joint-space target (non-blocking).
+        """Send one non-blocking joint target through the native Servo core."""
+        core = getattr(self, "_core", None)
+        if core is None:
+            raise RuntimeError("native RobotCore is not initialized")
 
-        Call repeatedly at a fixed cadence (recommended 100-200 Hz).
-        Caller is responsible for the sleep between calls; we do not
-        block to enforce a rate.
-
-        Parameters
-        ----------
-        target_angles : iterable of float
-            ``num_joints`` joint angles in the unit declared by
-            :attr:`ServoOpts.is_radians` (radians by default).
-
-        Returns
-        -------
-        bool
-            * ``True``  — frame was sent.  ``last_target`` advanced.
-              (Step- or limit-clamping does **not** count as failure;
-              it just bumps :attr:`servo_clamp_count`.  Lag-trip does
-              not count as failure either: the frame is still sent
-              and :attr:`servo_lag_count` is bumped.)
-            * ``False`` — payload was rejected and **no frame was
-              sent**.  Reasons: wrong length, NaN/Inf, send exception,
-              :meth:`servo_start` was never called, or an earlier
-              ``lag_abort_consecutive`` event already terminated the
-              session.  ``last_target`` stays untouched so the next
-              ``servo_j`` will still see the same step delta.
-        """
-        if self._servo_aborted_reason is not None:
-            # Session was auto-terminated earlier; refuse silently.
-            # (The abort site already printed a banner.) Caller can
-            # check :attr:`servo_aborted_reason` to know why.
-            return False
-        if not self._servo_active or self._servo_opts is None:
-            print("[FafuRobot] servo_j: not in a servo session; call servo_start first")
-            return False
-        # Power/CAN-loss guard: if the motors have gone silent mid-stream,
-        # latch DEAD and stop sending so a power-return cannot resume motion.
-        # (_enter_dead clears _servo_active, so subsequent ticks return early.)
-        if not self._stream_link_ok():
-            return False
-
+        values = [float(x) for x in target_angles]
+        torque_ff: List[float] = []
         opts = self._servo_opts
-        arr = np.asarray(list(target_angles), dtype=float)
-        if arr.size != self.num_joints:
-            print(f"[FafuRobot] servo_j: expected {self.num_joints} angles, "
-                  f"got {arr.size}")
-            return False
-        if not np.all(np.isfinite(arr)):
-            print("[FafuRobot] servo_j: target contains NaN/Inf, refused")
-            return False
-
-        N = self.num_joints
-        dt = 1.0 / opts.rate_hz
-        max_vel_tps = opts.max_vel / _TWO_PI    # rad/s -> turns/s
-
-        # (a) Convert user-units -> turns (protocol native)
-        if opts.is_radians:
-            target_turns = [float(v) / _TWO_PI for v in arr]
-        else:
-            target_turns = [float(v) / 360.0 for v in arr]
-
-        # (b) Defense 2 — per-step clamp on the *raw* upper-layer target,
-        # measured against last successfully-sent filtered target. Without
-        # this an upper-layer bug could push the EMA filter far in one
-        # step (lookahead does NOT bound a single step, only smoothes it).
-        max_step_turns = abs(opts.max_step_rad) / _TWO_PI
-        was_clamped = False
-        for i in range(N):
-            delta = target_turns[i] - self._servo_last_target_turns[i]
-            if abs(delta) > max_step_turns:
-                target_turns[i] = (self._servo_last_target_turns[i]
-                                   + math.copysign(max_step_turns, delta))
-                was_clamped = True
-        if was_clamped:
-            self._servo_clamp_count += 1
-            # No per-tick print — would dominate jitter on 100Hz loops.
-            # The aggregated count is reported in servo_end.
-
-        # (c) Lookahead smoothing — exponential moving average with time
-        # constant ``lookahead_time``. Matches UR servoj's lookahead.
-        # alpha = dt / (lookahead + dt); alpha=1 when lookahead=0 (no smoothing).
-        if opts.lookahead_time > 0.0:
-            alpha = dt / (opts.lookahead_time + dt)
-            target_to_send = [
-                self._servo_filtered_target_turns[i]
-                + alpha * (target_turns[i] - self._servo_filtered_target_turns[i])
-                for i in range(N)
+        if (opts is not None and opts.use_mit and opts.mit_gravity_ff
+                and self.has_dynamics and len(values) == self.num_joints):
+            q_rad = np.asarray(values, dtype=float)
+            if not opts.is_radians:
+                q_rad = np.radians(q_rad)
+            tau = self.compute_compensation_torque(
+                q_rad, np.zeros(self.num_joints), friction=False)
+            torque_ff = [
+                float(x) for x in tau * self._dyn_torque_scale
             ]
-        else:
-            target_to_send = target_turns
 
-        # (d) Per-joint velocity, written directly into the pre-allocated
-        # buffer (no per-tick allocation):
-        #   - feedforward_vel=True (default, UR-style):
-        #         vel[i] = (target_to_send[i] - last_sent[i]) / dt, clamped to ±max_vel
-        #     Eliminates the dominant "motor sprints to every micro-step"
-        #     noise source. Tiny target changes get tiny vel commands.
-        #   - feedforward_vel=False (legacy):
-        #         vel[i] = max_vel_tps for every joint
-        active_pos_buf = self._servo_active_pos_np
-        active_vel_buf = self._servo_active_vel_np
-        if opts.feedforward_vel:
-            for i in range(N):
-                active_pos_buf[i] = target_to_send[i]
-                v = (target_to_send[i] - self._servo_filtered_target_turns[i]) / dt
-                if v > max_vel_tps:    v = max_vel_tps
-                elif v < -max_vel_tps: v = -max_vel_tps
-                active_vel_buf[i] = v
-        else:
-            for i in range(N):
-                active_pos_buf[i] = target_to_send[i]
-            active_vel_buf.fill(max_vel_tps)
-
-        # (e) Defense 3 — tracking-error monitor.
-        #
-        # ★ 2026-05 policy change ★
-        # Old behaviour was "lag > max_lag_rad ⇒ return False ⇒ frame NOT
-        # sent". On hardware that turned a single lagging joint into a
-        # cascade: the firmware watchdog on the *other* joints fired
-        # after watchdog_ms of silence and braked them too. Confirmed
-        # with --no-safety-nets (lag check off): J4 still drooped but
-        # J2/J3 actually completed their motion, so the lag check was
-        # making things worse, not better.
-        #
-        # New behaviour: ALWAYS send the frame; just count lag events
-        # for diagnostics. ``lag_abort_consecutive > 0`` opts back into
-        # protective stop with a sensible debounce.
-        lag_tripped_this_tick = False
-        if opts.max_lag_rad > 0.0:
-            max_lag_turns = opts.max_lag_rad / _TWO_PI
-            for i, mid in enumerate(self._joint_motor_ids):
-                s = self._ht.get_cached_state(mid)
-                if s is None:
-                    continue
-                lag = abs(s.position - target_to_send[i])
-                if lag > max_lag_turns:
-                    lag_tripped_this_tick = True
-                    break   # one bad joint is enough for the counter
-        if lag_tripped_this_tick:
-            self._servo_lag_count += 1
-            self._servo_lag_streak += 1
-            if not self._servo_lag_warned:
-                self._servo_lag_warned = True
-                print(f"[FafuRobot] servo_j: first lag-trip "
-                      f"(|lag| > {opts.max_lag_rad:.3f}rad); "
-                      f"frame is still being sent. "
-                      f"Counter at servo_end will show the total.")
-        else:
-            self._servo_lag_streak = 0
-
-        # (f) Defense 4 — soft limits handled inside set_many_pos_vel_tqe_partial.
-
-        # (g) Send one frame on the configured channel.
-        #   - use_mit=True (DEFAULT): 0x8093 group MIT (kp/kd + gravity
-        #     feed-forward). pos/vel here are already in turns / turns-per-sec,
-        #     exactly what set_many_mit wants (PosUnit.Turns); kp/kd raw
-        #     precomputed in servo_start; gravity tau computed from the target
-        #     pose each tick.
-        #   - use_mit=False (fallback): 0x8090 position+vel+maxtqe partial.
-        #     Firmware position loop tracks; hold motors held at cached pos.
-        #     Hot path is entirely C++ (numpy memcpy), ~5us per tick.
-        try:
-            if opts.use_mit:
-                if opts.mit_gravity_ff and self.has_dynamics:
-                    q_rad = np.asarray(target_to_send, dtype=float) * _TWO_PI
-                    v_rad = active_vel_buf * _TWO_PI     # turns/s -> rad/s
-                    tau = self.compute_compensation_torque(
-                        q_rad, v_rad, friction=False) * self._dyn_torque_scale
-                    tau_raw = [int(x) for x in self.tau_to_raw(tau)]
-                else:
-                    tau_raw = [0] * self.num_joints
-                self._ht.set_many_mit(
-                    list(self._joint_motor_ids),
-                    [float(x) for x in active_pos_buf],
-                    [float(x) for x in active_vel_buf],
-                    tau_raw,
-                    self._servo_mit_kp_raw,
-                    self._servo_mit_kd_raw,
-                    pm.PosUnit.Turns,
-                    # MIT frame holds joints only (gripper excluded); slot count
-                    # must be max JOINT id, NOT max of all motor_ids (which
-                    # includes M7 gripper -> 7 slots -> 72B > 64B frame error).
-                    self._servo_mit_max_motor_id,
-                    0.0,                # async_rx is on, don't wait for replies
-                )
-            else:
-                self._ht.set_many_pos_vel_tqe_partial(
-                    self._servo_active_ids_np,
-                    active_pos_buf,
-                    active_vel_buf,
-                    self._servo_max_torque,
-                    self._servo_hold_ids_np,
-                    pm.PosUnit.Turns,
-                    self._servo_max_motor_id,
-                    0.0,                # async_rx is on, don't wait for replies
-                )
-        except Exception as e:
-            print(f"[FafuRobot] servo_j: send failed: {e}")
-            return False
-
-        # Advance state only after a successful send so the next tick's
-        # clamp / feedforward see a consistent "last sent" reference.
-        self._servo_last_target_turns = list(target_turns)
-        self._servo_filtered_target_turns = list(target_to_send)
-        self._servo_tick_count += 1
-
-        # Optional protective-stop: if lag persisted for N ticks in a
-        # row, brake and refuse further frames.  Default opts.value 0
-        # means never auto-abort (preferred for diagnostic scripts).
-        if (opts.lag_abort_consecutive > 0
-                and self._servo_lag_streak >= opts.lag_abort_consecutive):
-            reason = (f"lag_abort_consecutive={opts.lag_abort_consecutive} "
-                      f"exceeded (streak={self._servo_lag_streak})")
-            print(f"[FafuRobot] servo_j: PROTECTIVE STOP — {reason}. "
-                  f"Calling servo_end('brake').")
-            try:
-                self.servo_end(finish_mode="brake")
-            except Exception as e:
-                print(f"[FafuRobot] servo_j: auto servo_end failed: {e}")
-            self._servo_aborted_reason = reason
-            return False
-
-        return True
+        result = core.servo_tick(values, torque_ff)
+        self._servo_active = bool(core.is_servoing)
+        self._sync_state_from_core()
+        if not result.sent and result.message:
+            print(f"[FafuRobot] servo_j: {result.message}")
+        return bool(result.sent and not result.aborted)
 
     def servo_end(self, finish_mode: str = "hold") -> None:
-        """End the servo session and place every joint motor in
-        ``finish_mode``.
-
-        Parameters
-        ----------
-        finish_mode : {"hold", "brake", "stop"}, optional
-            * ``"hold"`` (default): keep the motor in MODE_POSITION
-              (``0x0A``) holding its last commanded frame.  Identical
-              behaviour to the state every motor is in after a
-              successful :meth:`move_j`, so you can immediately chain
-              another ``move_j`` / ``servo_start`` without calling
-              :meth:`enable` again.  Motors stay energised.
-            * ``"brake"``: switch to short-circuit braking
-              (``0x0F``).  No torque output, no current draw, but the
-              joint resists motion (it may still drift slowly under
-              load).  Use when you want to release the loop but keep
-              the arm roughly in place without burning power.
-            * ``"stop"``: PWM off (``0x00``).  Joints free to be moved
-              by hand.  Use only when a human will reposition the arm
-              right after, otherwise the arm will sag.
-
-        Always clears the firmware watchdog first so that the mode
-        change is not interrupted by the watchdog firing in the
-        middle.  The gripper is left alone (we never touched it).
-        """
-        if not self._servo_active:
-            print("[FafuRobot] servo_end: not in a servo session, ignored")
-            return
-
-        valid = {"stop", "brake", "hold"}
-        if finish_mode not in valid:
+        """End the Servo session with hold, brake or stop."""
+        if finish_mode not in {"stop", "brake", "hold"}:
             raise ValueError(
-                f"finish_mode must be one of {sorted(valid)}, got {finish_mode!r}")
+                "finish_mode must be one of ['brake', 'hold', 'stop']")
+        core = getattr(self, "_core", None)
+        if core is None:
+            raise RuntimeError("native RobotCore is not initialized")
 
-        opts = self._servo_opts
-        # 1) clear watchdog FIRST so the mode switch is not pre-empted
-        if opts is not None and opts.watchdog_ms > 0:
-            for mid in self._joint_motor_ids:
-                try:
-                    self._ht.set_timeout(mid, 0)
-                except Exception:
-                    pass
-
-        # 2) place motors in finish_mode
-        used_mit = bool(opts is not None and getattr(opts, "use_mit", False))
-        for mid in self._joint_motor_ids:
-            try:
-                if finish_mode == "stop":
-                    self._ht.stop(mid)
-                elif finish_mode == "brake":
-                    self._ht.set_motor_mode(mid, self.MODE_BRAKE)
-                else:  # "hold"
-                    # A MIT session (0x8093) leaves the motor in a MIT control
-                    # mode. Two problems if we just "leave it": (a) it holds
-                    # only the last PD frame (no integral) and SAGS under
-                    # gravity once we stop refreshing, and (b) the firmware
-                    # then ignores subsequent 0x8090 position frames (move_j /
-                    # go_home / pos-mode servo appear dead) because the
-                    # broadcast 0x8090 frame cannot switch mode. So actively
-                    # switch back to MODE_POSITION (0x0A): the firmware
-                    # position loop (with integral) holds it, and 0x8090 works
-                    # again. Non-MIT (0x8090) sessions already end in 0x0A, so
-                    # only do this for MIT.
-                    if used_mit:
-                        self._ht.set_motor_mode(mid, self.MODE_POSITION)
-                    # else: leave in MODE_POSITION with last frame intact
-            except Exception:
-                pass
-
-        elapsed = max(1e-3, time.monotonic() - self._servo_started_at)
-        rate = self._servo_tick_count / elapsed
-        warn_tag = ""
-        if self._servo_clamp_count or self._servo_lag_count:
-            warn_tag = (f"   [warn: step-clamp={self._servo_clamp_count}, "
-                        f"lag-trip={self._servo_lag_count}]")
-        if self._servo_aborted_reason is not None:
-            warn_tag += f"   [auto-aborted: {self._servo_aborted_reason}]"
-        print(f"[FafuRobot] servo_end ({finish_mode}): "
-              f"{self._servo_tick_count} ticks in {elapsed:.2f}s "
-              f"(~{rate:.1f} Hz){warn_tag}")
-
-        self._servo_active = False
-        # State machine: "hold" -> position control (IDLE, ready to chain
-        # another move); "brake" -> short-circuit brake (BRAKED); "stop" ->
-        # free-spin (DISABLED). Do not clobber a latched ESTOP.
-        if self._state is RobotState.SERVOING:
-            self._set_state(
-                RobotState.IDLE if finish_mode == "hold"
-                else RobotState.BRAKED if finish_mode == "brake"
-                else RobotState.DISABLED
-            )
-        # NOTE: tick_count / clamp_count / lag_count / aborted_reason
-        # are intentionally NOT zeroed here so user code can read them
-        # via :attr:`servo_lag_count` etc. *after* the loop ends.
-        # They are reset at the start of the next servo_start.
-        self._servo_lag_streak = 0
-        self._servo_last_target_turns = []
-        self._servo_filtered_target_turns = []
-        self._servo_active_ids_np = None
-        self._servo_hold_ids_np = None
-        self._servo_active_pos_np = None
-        self._servo_active_vel_np = None
-        self._servo_max_motor_id = 0
-        self._servo_max_torque = 0
+        core.servo_end(self._core_finish_mode(finish_mode))
+        self._servo_active = bool(core.is_servoing)
+        self._sync_state_from_core()
 
     @property
     def is_servoing(self) -> bool:
-        """``True`` while a :meth:`servo_start` / :meth:`servo_end`
-        window is open."""
-        return self._servo_active
+        """Whether a Servo session is currently active."""
+        core = getattr(self, "_core", None)
+        return bool(core.is_servoing) if core is not None else self._servo_active
 
     @property
     def servo_lag_count(self) -> int:
-        """Number of lag-tripped ticks observed in the current (or
-        most recently ended) servo session.
-
-        A "lag-trip" is a tick where some joint's measured position
-        differs from the last sent target by more than
-        :attr:`ServoOpts.max_lag_rad`.  The frame is **still** sent on
-        a lag-trip (see :meth:`servo_j` docstring); this counter is
-        purely informational unless ``lag_abort_consecutive`` is in
-        use.
-        """
-        return int(self._servo_lag_count)
+        """Lag-tripped ticks in the current or most recent Servo session."""
+        core = getattr(self, "_core", None)
+        return int(core.servo_summary().lag_count) if core is not None else 0
 
     @property
     def servo_clamp_count(self) -> int:
-        """Number of step-clamped ticks in the current / last session
-        (caller asked for a jump > ``max_step_rad`` and we limited it)."""
-        return int(self._servo_clamp_count)
+        """Step-clamped ticks in the current or most recent Servo session."""
+        core = getattr(self, "_core", None)
+        return int(core.servo_summary().clamp_count) if core is not None else 0
 
     @property
     def servo_aborted_reason(self) -> Optional[str]:
-        """Non-``None`` iff the current session was auto-terminated by
-        ``lag_abort_consecutive``.  Cleared by the next :meth:`servo_start`.
-        While set, :meth:`servo_j` refuses every frame and returns ``False``.
-        """
-        return self._servo_aborted_reason
+        """Reason for the most recent automatic Servo abort, if any."""
+        core = getattr(self, "_core", None)
+        if core is None:
+            return None
+        return core.servo_summary().aborted_reason or None
 
     # ------------------------------------------------------------------
     #  Dynamics: gravity + friction compensation ("float" / teach mode)
@@ -2415,9 +1738,8 @@ class FafuRobotController:
     #    1) ``pinocchio`` installed (gravity / Coriolis / mass need it).
     #    2) :meth:`setup_dynamics` called once with a URDF that has
     #       <inertial> tags (the vendored follower URDF does).
-    #    3) Per-joint ``motor_models`` configured so Nm -> raw int16 is
-    #       physically correct (otherwise the arm under-drives and sags —
-    #       which is *safe* but not useful).
+    #    3) Per-joint motor models configured so Nm-to-raw conversion is
+    #       physically correct; otherwise compensation will be inaccurate.
     # ------------------------------------------------------------------
     def setup_dynamics(
         self,
@@ -2457,12 +1779,11 @@ class FafuRobotController:
             One motor-model key **per joint** (in :attr:`joint_motor_ids`
             order) used by ``set_pos_vel_tqe_kp_kd`` to convert the
             commanded torque from Nm to the raw int16 the firmware wants.
-            Valid keys are the ones in the driver's ``TORQUE_COEFF`` table
+            Valid keys are defined by the native calibration table
             (e.g. ``"M7256_35"``, ``"M60BM_35"``, ``"M4438_32"``,
-            ``"M3536_32"`` ...).  When ``None`` every joint uses ``""``
-            (coefficient ``1.0``): the loop still runs but the torque is
-            *not* physically scaled, so the arm will merely sag — safe,
-            but you must fill these in for real compensation.
+            ``"M3536_32"`` ...). When ``None``, dynamics calculations
+            remain available but non-zero torque/MIT output is rejected until
+            exact models are configured.
         tau_limit : iterable of float, optional
             Per-joint torque clip (Nm).  Default
             ``[15, 30, 30, 15, 5, 5]`` (the reference script's values,
@@ -2539,13 +1860,14 @@ class FafuRobotController:
                 raise ValueError(
                     f"motor_models must have {self.num_joints} entries "
                     f"(one per joint), got {len(motor_models)}")
-            self._dyn_motor_models = [str(m) for m in motor_models]
+            self.set_motor_models(motor_models)
         else:
             self._dyn_motor_models = None
-            print("[FafuRobot] setup_dynamics: WARNING no motor_models given; "
-                  "torque will NOT be physically scaled (coeff=1.0). The arm "
-                  "will under-drive / sag. Pass motor_models for real "
-                  "compensation.")
+            if self._core is not None:
+                self._core.set_joint_motor_models([""] * self.num_joints)
+            print("[FafuRobot] setup_dynamics: no motor_models given; "
+                  "non-zero torque/MIT output remains disabled until exact "
+                  "models are configured.")
 
         if tau_limit is not None:
             tl = np.asarray(list(tau_limit), dtype=float)
@@ -2572,11 +1894,10 @@ class FafuRobotController:
               f"torque_scale={self._dyn_torque_scale.tolist()}")
 
     def _resolve_eef_frame(self, model, eef_frame: Optional[str]) -> None:
-        """Pick the end-effector frame used by FK/IK.
+        """Pick and cache the end-effector frame used by FK/IK.
 
-        Preference order: explicit ``eef_frame`` arg → ``"tool_link"`` →
-        the child frame of the last actuated joint.  Stored on the
-        instance as ``_eef_frame_id`` / ``_eef_frame_name``.
+        Preference: explicit argument, tool_link, then the child frame of the
+        last actuated joint.
         """
         candidates: List[str] = []
         if eef_frame:
@@ -2604,6 +1925,20 @@ class FafuRobotController:
         print(f"[FafuRobot] setup_dynamics: no tool frame found; using last "
               f"frame {self._eef_frame_name!r} as end effector.")
 
+    def set_motor_models(self, motor_models: Iterable[str]) -> None:
+        """Configure exact per-joint models for torque and MIT conversion."""
+        if self.state in _BUSY_STATES:
+            raise RobotStateError(
+                "motor models cannot change during a control operation")
+        models = [str(model) for model in motor_models]
+        if len(models) != self.num_joints or any(not model for model in models):
+            raise ValueError(
+                f"motor_models must contain {self.num_joints} non-empty names")
+        core = getattr(self, "_core", None)
+        if core is not None:
+            core.set_joint_motor_models(models)
+        self._dyn_motor_models = models
+
     def set_torque_scale(self, scale: "float | Iterable[float]") -> None:
         """Set the empirical per-joint torque gain (see ``torque_scale`` in
         :meth:`setup_dynamics`).  Accepts a scalar or a per-joint list.
@@ -2617,28 +1952,19 @@ class FafuRobotController:
         if arr.shape != (self.num_joints,):
             raise ValueError(
                 f"torque_scale must be a scalar or {self.num_joints} values")
+        if not np.all(np.isfinite(arr)) or np.any(arr < 0.0):
+            raise ValueError(
+                "torque_scale values must be finite and non-negative")
         self._dyn_torque_scale = arr
 
     def tau_to_raw(self, tau: Iterable[float]) -> np.ndarray:
-        """Convert a per-joint torque (Nm) to the firmware raw int16 that
-        :meth:`apply_compensation_torque` would actually send.
-
-        ``raw = round(tau / (coeff * 0.01))`` per joint, where ``coeff``
-        comes from the joint's motor model (1.0 if no model configured).
-        The ``*0.01`` matches the firmware torque LSB (vendor motor.cpp
-        ``tqe_float2int``); it MUST mirror the C++ ``set_torque`` path.
-        Handy for the ``dry_run`` calibration preview.  Does **not** apply
-        the torque-scale gain (pass already-scaled torque if you want that).
-        """
-        tau = np.asarray(list(tau), dtype=float)
-        raw = np.zeros(self.num_joints, dtype=np.int64)
-        for i in range(self.num_joints):
-            model = (self._dyn_motor_models[i]
-                     if self._dyn_motor_models is not None else "")
-            coeff = TORQUE_COEFF.get(model, 1.0)
-            v = tau[i] / (coeff * 0.01) if coeff != 0.0 else 0.0
-            raw[i] = int(np.clip(round(v), -32768, 32767))
-        return raw
+        """Convert per-joint torque in Nm with the native calibration table."""
+        values = [float(x) for x in tau]
+        if len(values) != self.num_joints:
+            raise ValueError(f"tau must have {self.num_joints} elements")
+        models = self._dyn_motor_models or [""] * self.num_joints
+        return np.asarray(
+            pm.torques_to_raw(values, models, 1.0), dtype=np.int64)
 
     @property
     def has_dynamics(self) -> bool:
@@ -3032,6 +2358,8 @@ class FafuRobotController:
             tau = np.clip(tau, -self._dyn_tau_limit, self._dyn_tau_limit)
         return tau
 
+    @_guard_operation(
+        "apply_compensation_torque", RobotState.GRAVITY_COMP)
     def apply_compensation_torque(
         self,
         tau: Iterable[float],
@@ -3066,13 +2394,15 @@ class FafuRobotController:
         # Empirical calibration gain (1.0 by default).
         tau = tau * self._dyn_torque_scale
 
-        if self._use_group_mit and self.num_joints <= 6:
-            # One 0x8093 frame, kp=kd=0 => pure torque feed-forward. pos/vel
-            # are multiplied by 0 in-firmware so their value is irrelevant; send
-            # zeros. Pre-scaled tau -> raw here, so pass raw ints directly.
-            raw = self.tau_to_raw(tau)   # tau already * torque_scale above
-            zeros = [0.0] * self.num_joints
-            try:
+        with self._command_guard():
+            if (
+                self._use_group_mit
+                and self.num_joints <= 6
+                and max(self._joint_motor_ids) <= 6
+            ):
+                # One 0x8093 frame, kp=kd=0 => pure torque feed-forward.
+                raw = self.tau_to_raw(tau)
+                zeros = [0.0] * self.num_joints
                 self._ht.set_many_mit(
                     list(self._joint_motor_ids),
                     zeros, zeros,
@@ -3083,20 +2413,14 @@ class FafuRobotController:
                     max(self._joint_motor_ids),
                     0.0,
                 )
-            except Exception as e:
-                print(f"[FafuRobot] apply_compensation_torque (group MIT) "
-                      f"failed: {e}")
-            return
+                return
 
-        for i, mid in enumerate(self._joint_motor_ids):
-            model = (self._dyn_motor_models[i]
-                     if self._dyn_motor_models is not None else "")
-            try:
+            for i, mid in enumerate(self._joint_motor_ids):
+                model = (self._dyn_motor_models[i]
+                         if self._dyn_motor_models is not None else "")
                 self._ht.set_torque(mid, float(tau[i]), model)
-            except Exception as e:
-                print(f"[FafuRobot] apply_compensation_torque: motor {mid} "
-                      f"failed: {e}")
 
+    @_guard_operation("move_MIT", RobotState.MOVING)
     def move_MIT(
         self,
         pos: Iterable[float],
@@ -3173,11 +2497,11 @@ class FafuRobotController:
         """
         self._require_stream_command("move_MIT")
         n = self.num_joints
-        if n > 6:
+        if n > 6 or max(self._joint_motor_ids) > 6:
             raise RuntimeError(
-                f"move_MIT: group MIT frame holds <=6 motors, but "
-                f"num_joints={n}. Use --gripper-id so the gripper is excluded, "
-                f"or drive extra joints on a separate frame.")
+                "move_MIT requires at most six joint motors with IDs in 1..6; "
+                "configure joint_motor_ids accordingly"
+            )
         pos = np.asarray(list(pos), dtype=float)
         vel = np.asarray(list(vel), dtype=float)
         tau = np.asarray(list(tau), dtype=float)
@@ -3199,22 +2523,19 @@ class FafuRobotController:
         kp_v = _as_vec(kp)
         kd_v = _as_vec(kd)
 
-        if not kp_kd_raw:
-            # Vendor kp_float2int / kd_float2int (radian_2pi convention):
-            #   raw = int16( (gain / coeff) * 10 * 2*pi )
-            # coeff = per-joint torque coefficient (same table as tau_to_raw).
-            kp_raw = np.zeros(n)
-            kd_raw = np.zeros(n)
-            for i in range(n):
-                model = (self._dyn_motor_models[i]
-                         if self._dyn_motor_models is not None else "")
-                coeff = TORQUE_COEFF.get(model, 1.0) or 1.0
-                kp_raw[i] = (kp_v[i] / coeff) * 10.0 * _TWO_PI
-                kd_raw[i] = (kd_v[i] / coeff) * 10.0 * _TWO_PI
-            kp_v, kd_v = kp_raw, kd_raw
-
-        kp_out = [int(np.clip(round(x), -32768, 32767)) for x in kp_v]
-        kd_out = [int(np.clip(round(x), -32768, 32767)) for x in kd_v]
+        models = self._dyn_motor_models or [""] * n
+        if kp_kd_raw:
+            kp_out = [int(np.clip(round(x), -32768, 32767)) for x in kp_v]
+            kd_out = [int(np.clip(round(x), -32768, 32767)) for x in kd_v]
+        else:
+            kp_out = [
+                int(pm.gain_to_raw(float(kp_v[i]), models[i]))
+                for i in range(n)
+            ]
+            kd_out = [
+                int(pm.gain_to_raw(float(kd_v[i]), models[i]))
+                for i in range(n)
+            ]
 
         if apply_torque_scale:
             tau = tau * self._dyn_torque_scale
@@ -3230,17 +2551,18 @@ class FafuRobotController:
             vel_tps = vel / 360.0
 
         motor_ids = list(self._joint_motor_ids)
-        return self._ht.set_many_mit(
-            motor_ids,
-            [float(x) for x in pos],
-            [float(x) for x in vel_tps],
-            [int(x) for x in tau_raw],
-            kp_out,
-            kd_out,
-            unit,
-            max(motor_ids),
-            float(timeout),
-        )
+        with self._command_guard():
+            return self._ht.set_many_mit(
+                motor_ids,
+                [float(x) for x in pos],
+                [float(x) for x in vel_tps],
+                [int(x) for x in tau_raw],
+                kp_out,
+                kd_out,
+                unit,
+                max(motor_ids),
+                float(timeout),
+            )
 
     def gravity_compensation_step(
         self,
@@ -3315,18 +2637,12 @@ class FafuRobotController:
     ) -> None:
         """Run a blocking gravity(+friction) compensation loop ("float mode").
 
-        The arm becomes weightless and can be guided by hand — the classic
-        teaching / lead-through mode.  Mirrors the reference
-        ``while True: ...`` loop but adds rate control, a duration cap, a
-        ``dry_run`` preview and Ctrl+C-safe teardown.
+        The arm becomes weightless and can be guided by hand. The loop adds
+        rate control, a duration cap, dry-run preview and safe cancellation.
 
-        ★ SAFETY ★
-          * Always test with ``dry_run=True`` first and read the printed
-            torques: if any column is wildly larger than the joint's
-            ``tau_limit`` your ``motor_models`` / URDF are wrong.
-          * On exit (normal, Ctrl+C, or exception) every joint is put in
-            ``stop`` (free) mode and the firmware will hold nothing — keep a
-            hand on the arm / E-stop, heavy links will drop.
+        Safety:
+          * Validate torque output with dry_run=True first.
+          * On exit the joint release policy is applied; support heavy links.
           * The gripper is never touched.
 
         Parameters
@@ -3527,12 +2843,19 @@ class FafuRobotController:
         self._gravity_comp_active = True
         self._gravity_comp_owner_thread_id = threading.get_ident()
         if not dry_run:
-            self._set_state(RobotState.GRAVITY_COMP)
+            if self._core is not None:
+                self._gravity_core_token = int(
+                    self._core.begin_operation(
+                        pm.OperationKind.GRAVITY_COMP))
+                with self._state_lock:
+                    self._state = RobotState.GRAVITY_COMP
+            else:
+                self._set_state(RobotState.GRAVITY_COMP)
         try:
             while True:
                 tick_start = time.monotonic()
-                if abort_check is not None and abort_check():
-                    print("[FafuRobot] gravity-comp: abort_check -> stop")
+                if self._combined_abort_check(abort_check)():
+                    print("[FafuRobot] gravity-comp: cancellation -> stop")
                     break
                 # Power/CAN-loss guard: stop feeding torque the instant the
                 # link drops so power-return cannot resume the float loop.
@@ -3630,19 +2953,25 @@ class FafuRobotController:
         finally:
             self._gravity_comp_active = False
             self._gravity_comp_owner_thread_id = None
-            # Leave the GRAVITY_COMP busy-state NOW (before the teardown
-            # below, which calls guarded methods like enable()/go_home()
-            # that would otherwise be rejected as "arm busy"). Preserve a
-            # latched ESTOP if one fired mid-loop.
-            if self._state is RobotState.GRAVITY_COMP:
-                self._set_state(RobotState.DISABLED)
-            # SAFER teardown: instead of dropping to free-spin (limp -> heavy
-            # links fall), re-engage *position hold* at the current pose via
-            # the verified position channel (set_pos_vel_acc, NOT a torque
-            # frame).  This stops any leftover feed-forward torque and keeps
-            # the arm where it is.
+            token = self._gravity_core_token
+            self._gravity_core_token = None
+            if token is not None and self._core is not None:
+                self._core.end_operation(token)
+                current = self._sync_state_from_core()
+            else:
+                current = self._state
+            safety_latched = current in (
+                RobotState.ESTOP,
+                RobotState.DEAD,
+                RobotState.DISCONNECTED,
+            )
+            # Once safety is latched, RobotCore has already serialized STOP.
+            # Do not emit a later brake/hold/home command from this cleanup.
             if dry_run:
                 pass
+            elif safety_latched:
+                print(f"[FafuRobot] gravity-comp stopped ({current.name}); "
+                      "hardware cleanup skipped after safety STOP.")
             elif home_on_exit:
                 # Sequence: brake (arrest motion gently) -> pause -> re-enable
                 # position mode -> slow S-curve home to 0 -> brake at home.
@@ -3660,15 +2989,7 @@ class FafuRobotController:
                       f"returning home (0 rad) @ speed={home_speed} ... "
                       "(do NOT press Ctrl+C again)")
                 try:
-                    # brake (0x0F) -> position (0x0A).  Use _switch_mode_all
-                    # DIRECTLY rather than enable(): enable()'s Stage-0 pre-reads
-                    # every motor (7 x 0.2s ~= 1.4s of "nothing happening")
-                    # which is the dead window that tempts a second Ctrl+C and
-                    # aborts the homing.  Only fall back to the heavier enable()
-                    # (motor_reset recovery) if the quick switch genuinely fails.
-                    if not self._switch_mode_all(self.MODE_POSITION,
-                                                 label="position", max_retry=3):
-                        self.enable()
+                    self.enable()
                     self.go_home(speed=home_speed, block=True)
                     print("[FafuRobot] gravity-comp homed to 0 rad.")
                 except KeyboardInterrupt:
@@ -3687,8 +3008,14 @@ class FafuRobotController:
             # _brake_joints() (mode 0x0F) -> BRAKED. The transient enable()/
             # go_home() inside home_on_exit may have flipped us to IDLE, so
             # correct it here. Do not clobber a latched ESTOP / DEAD.
-            if not dry_run and self._state not in (RobotState.ESTOP, RobotState.DEAD):
-                self._set_state(RobotState.BRAKED)
+            if not dry_run and not safety_latched:
+                self._sync_state_from_core()
+                if self._state not in (
+                    RobotState.ESTOP,
+                    RobotState.DEAD,
+                    RobotState.DISCONNECTED,
+                ):
+                    self._set_state(RobotState.BRAKED)
 
     @property
     def is_gravity_compensating(self) -> bool:
@@ -3703,14 +3030,37 @@ class FafuRobotController:
         under sustained gravity can still creep slowly; it never goes fully
         limp, applies no holding current, and engages without the stiff
         "grab" jolt of a position-hold."""
-        for mid in self._joint_motor_ids:
-            try:
-                self._ht.set_motor_mode(mid, self.MODE_BRAKE)
-            except Exception:
-                try:
-                    self._ht.stop(mid)
-                except Exception:
-                    pass
+        core = getattr(self, "_core", None)
+        token = None
+        try:
+            if core is not None:
+                token = core.begin_operation(pm.OperationKind.LIFECYCLE)
+            with self._command_guard():
+                for mid in self._joint_motor_ids:
+                    try:
+                        self._ht.set_motor_mode(mid, self.MODE_BRAKE)
+                    except Exception:
+                        try:
+                            self._ht.stop(mid)
+                        except Exception:
+                            pass
+            if core is not None:
+                core.transition(pm.RobotState.BRAKED)
+        except Exception:
+            if core is None:
+                raise
+            current = self._sync_state_from_core()
+            if current not in (
+                RobotState.ESTOP,
+                RobotState.DEAD,
+                RobotState.DISCONNECTED,
+            ):
+                raise
+        finally:
+            if token is not None:
+                core.end_operation(token)
+            if core is not None:
+                self._sync_state_from_core()
 
     # ------------------------------------------------------------------
     #  Cartesian motion (placeholders)
@@ -3912,6 +3262,7 @@ class FafuRobotController:
     _GRIPPER_STALL_VEL_TPS = 0.005            # < 1.8 deg/s ⇒ "not moving"
     _GRIPPER_STALL_PATIENCE_S = 0.3           # treat as done if stalled this long
 
+    @_guard_operation("gripper_control", RobotState.GRASPING)
     def gripper_control(
         self,
         angle: float,
@@ -3982,45 +3333,58 @@ class FafuRobotController:
         tolerance_deg : float, optional
             "Reached" tolerance in degrees.  Defaults to 1.5 deg.
         effort_threshold : int, optional
-            Raw int16 ``|torque|`` value that, when exceeded while
-            blocking, causes an early return.  This is the lightweight
-            "did I grab something?" check.  When ``None`` (default)
-            only position / stall / timeout are used.  When given,
-            this method returns a :class:`GraspResult` describing the
-            outcome; otherwise it returns ``None`` for backwards
-            compatibility with the Piper-style void signature.
+            Raw int16 ``|torque|`` value that triggers force detection.
+            When provided, it also limits the firmware command (or lowers
+            ``effort`` when that is smaller) so returning early cannot
+            leave an over-force command active. The method then returns a
+            :class:`GraspResult`; otherwise it returns ``None`` for
+            backwards compatibility.
 
         Returns
         -------
         GraspResult or None
-            A :class:`GraspResult` iff ``block=True`` AND a stop
-            reason was recorded (i.e. ``effort_threshold`` was given,
-            or the stall / target conditions fired). Returns ``None``
-            otherwise.
+            A :class:`GraspResult` only when ``block=True`` and
+            ``effort_threshold`` is provided; otherwise ``None`` for
+            backwards compatibility.
         """
         if not self._has_gripper:
             raise RuntimeError(
                 "FafuRobotController was constructed without a gripper"
             )
-        self._require_gripper_ready("gripper_control")
+        effort_limit = None if effort is None else int(effort)
+        if effort_limit is not None and not 1 <= effort_limit <= 32767:
+            raise ValueError("effort must be in [1, 32767]")
+        threshold = (
+            None if effort_threshold is None else int(effort_threshold)
+        )
+        if threshold is not None and not 1 <= threshold <= 32767:
+            raise ValueError("effort_threshold must be in [1, 32767]")
+        command_effort = effort_limit
+        if threshold is not None:
+            command_effort = (
+                threshold if command_effort is None
+                else min(command_effort, threshold)
+            )
+
         pos_turns = self._rad_to_turns(angle) if is_radians else angle / 360.0
 
-        if effort is None:
-            self._ht.set_pos_vel_acc(
-                self._gripper_motor_id,
-                pos_turns,
-                float(vel),
-                float(acc),
-                pm.PosUnit.Turns,
-            )
-        else:
-            self._ht.set_pos_vel_tqe(
-                self._gripper_motor_id,
-                pos_turns,
-                float(vel),
-                int(effort),
-                pm.PosUnit.Turns,
-            )
+        with self._command_guard():
+            if command_effort is None:
+                self._ht.set_pos_vel_acc(
+                    self._gripper_motor_id,
+                    pos_turns,
+                    float(vel),
+                    float(acc),
+                    pm.PosUnit.Turns,
+                )
+            else:
+                self._ht.set_pos_vel_tqe(
+                    self._gripper_motor_id,
+                    pos_turns,
+                    float(vel),
+                    command_effort,
+                    pm.PosUnit.Turns,
+                )
 
         if not block:
             return None
@@ -4032,9 +3396,9 @@ class FafuRobotController:
             pos_turns,
             timeout=float(timeout),
             tolerance_turns=tolerance_deg / 360.0,
-            effort_threshold=effort_threshold,
+            effort_threshold=threshold,
         )
-        if effort_threshold is None:
+        if threshold is None:
             return None
         return result
 
@@ -4202,16 +3566,15 @@ class FafuRobotController:
 
         This is the Fafu-side equivalent of Piper's
         ``close_gripper(effort=...)``: it commands the gripper toward
-        the closing direction and stops as soon as the **measured**
+        the closing direction and returns as soon as the **measured**
         torque exceeds ``force_threshold`` (or the gripper plateaus
         at finite stiffness against an object).
 
-        Because Fafu's firmware does not implement the position
-        + effort loop itself, the detection logic runs in Python by
-        polling ``MotorState.torque`` from the background poller
-        (``start_state_polling``).  This is good enough for catching
-        objects but is **not** a substitute for a real wrist F/T
-        sensor.
+        Contact detection runs in Python by polling ``MotorState.torque``
+        from the background poller. The firmware command always includes a
+        torque cap, so polling latency cannot exceed that configured limit.
+        This is useful for catching objects but is **not** a substitute for
+        a real wrist F/T sensor.
 
         Parameters
         ----------
@@ -4228,17 +3591,15 @@ class FafuRobotController:
             running an empty close and noting the steady-state torque.
         effort : int, optional
             Torque cap passed to the **firmware** via
-            ``set_pos_vel_tqe`` (raw int16).  When ``None`` the
-            firmware uses its default current limit.  Pass this if
-            you also want a hard hardware-level torque ceiling, not
-            just the soft Python-side trip wire.
+            ``set_pos_vel_tqe`` (raw int16). When ``None``,
+            ``force_threshold`` is also used as the hard cap.
         vel : float, optional
             Closing velocity in turns/s.  Defaults to 0.15 turns/s
             (deliberately slower than ``open_gripper`` so that
             contact is gentle).
         acc : float, optional
-            Acceleration limit in turns/s^2.  Ignored when ``effort``
-            is provided (``set_pos_vel_tqe`` has no acceleration arg).
+            Retained for API compatibility; grasp uses the torque-capped
+            ``set_pos_vel_tqe`` command, which has no acceleration field.
         timeout : float, optional
             Maximum wall-clock seconds to wait.
         min_close_deg : float, optional
@@ -4278,6 +3639,13 @@ class FafuRobotController:
                 "FafuRobotController was constructed without a gripper"
             )
 
+        threshold = int(force_threshold)
+        if not 1 <= threshold <= 32767:
+            raise ValueError("force_threshold must be in [1, 32767]")
+        effort_limit = threshold if effort is None else int(effort)
+        if not 1 <= effort_limit <= 32767:
+            raise ValueError("effort must be in [1, 32767]")
+
         if target_angle is None:
             lo_t, _ = self._gripper_limit_turns()
             target_turns = lo_t if lo_t is not None else -0.25
@@ -4287,27 +3655,19 @@ class FafuRobotController:
                 else target_angle / 360.0
             )
 
-        if effort is None:
-            self._ht.set_pos_vel_acc(
-                self._gripper_motor_id,
-                target_turns,
-                float(vel),
-                float(acc),
-                pm.PosUnit.Turns,
-            )
-        else:
+        with self._command_guard():
             self._ht.set_pos_vel_tqe(
                 self._gripper_motor_id,
                 target_turns,
                 float(vel),
-                int(effort),
+                effort_limit,
                 pm.PosUnit.Turns,
             )
 
         return self._wait_until_gripper_done(
             target_turns,
             timeout=float(timeout),
-            effort_threshold=int(force_threshold),
+            effort_threshold=threshold,
             min_progress_turns=max(0.0, float(min_close_deg)) / 360.0,
         )
 
@@ -4422,6 +3782,15 @@ class FafuRobotController:
         an in-flight guarded operation finishing (its ``finally`` will
         not overwrite ESTOP).
         """
+        core = getattr(self, "_core", None)
+        if core is not None:
+            core.emergency_stop()
+            self._last_cmd_turns = None
+            self._servo_active = False
+            self._sync_state_from_core()
+            print("[FafuRobot] EMERGENCY STOP issued (all motors stopped).")
+            return
+
         for mid in self._cfg.motor_ids:
             try:
                 self._ht.stop(mid)
@@ -4440,6 +3809,17 @@ class FafuRobotController:
         Routes through :meth:`enable`, which transitions the state back
         to ``IDLE`` on success.
         """
+        core = getattr(self, "_core", None)
+        if core is not None:
+            if core.state == pm.RobotState.DEAD:
+                print("[FafuRobot] resume: state is DEAD; use "
+                      "recover(confirm=True), then enable().")
+                return
+            if not core.resume():
+                raise RuntimeError("resume failed to enable all motors")
+            self._sync_state_from_core()
+            return
+
         if self._state is RobotState.DEAD:
             print("[FafuRobot] resume: state is DEAD (power/CAN lost); use "
                   "recover(confirm=True) after restoring power, not resume().")
@@ -4460,6 +3840,7 @@ class FafuRobotController:
         """Return the latest :class:`CanStatus` (live read)."""
         return self._ht.read_can_status()
 
+    @_guard_operation("reset_zero", RobotState.MOVING)
     def reset_zero(self, motor_id: int, *, confirm: bool = False) -> None:
         """Set the current position of ``motor_id`` as the new zero.
 
@@ -4469,7 +3850,8 @@ class FafuRobotController:
             raise RuntimeError("reset_zero is destructive; pass confirm=True")
         if motor_id not in self._cfg.motor_ids:
             raise ValueError(f"motor {motor_id} not in cfg.motor_ids")
-        self._ht.reset_zero(motor_id)
+        with self._command_guard():
+            self._ht.reset_zero(motor_id)
 
     # ------------------------------------------------------------------
     #  Connection lifecycle
@@ -4480,80 +3862,32 @@ class FafuRobotController:
         joint_release: str = "stop",
         gripper_release: str = "brake",
     ) -> None:
-        """Stop background tasks and close the serial port.
-
-        Parameters
-        ----------
-        joint_release : {"stop", "brake", "hold"}, optional
-            What to do with the manipulator joints before closing.
-
-            * ``"stop"`` (default): mode 0x00, PWM off, joints free
-              to be moved by hand. Safest if a human will reposition
-              the arm. Heavy joints may sag slightly under gravity.
-            * ``"brake"``: mode 0x0F, short-circuit damping. No
-              current required, but resists motion. Use this if you
-              want the pose to roughly hold without keeping the
-              motors energised.
-            * ``"hold"``: keep mode 0x0A, motors actively hold their
-              last commanded position. Uses current; do not leave
-              like this for long.
-        gripper_release : {"stop", "brake", "hold"}, optional
-            Same options for the gripper.  Defaults to ``"brake"`` so
-            that the gripper does **not** drift open the moment the
-            program disconnects (the previous default of ``"stop"``
-            caused exactly that issue).
-        """
+        """Cancel active work, release motors and close the serial port."""
         valid = {"stop", "brake", "hold"}
         if joint_release not in valid:
             raise ValueError(f"joint_release must be one of {valid}")
         if gripper_release not in valid:
             raise ValueError(f"gripper_release must be one of {valid}")
 
-        # If a servo session is still open, end it gracefully BEFORE we
-        # stop polling / disable async RX. servo_end clears the firmware
-        # watchdog (which would otherwise fire as soon as we stop
-        # sending frames) and parks the joints in ``joint_release`` mode.
-        if self._servo_active:
-            try:
-                self.servo_end(finish_mode=joint_release)
-            except Exception as e:
-                print(f"[FafuRobot] close_connection: servo_end fallback failed: {e}")
+        core = getattr(self, "_core", None)
+        if core is None:
+            raise RuntimeError("native RobotCore is not initialized")
 
-        try:
-            if self._ht.is_polling():
-                self._ht.stop_state_polling()
-        except Exception:
-            pass
-        try:
-            if self._ht.is_async_rx():
-                self._ht.disable_async_rx()
-        except Exception:
-            pass
-        # Release policies were validated before any shutdown side effect.
+        needs_shutdown = core.state != pm.RobotState.DISCONNECTED
+        port_open = self._ht.is_open()
+        if not needs_shutdown and not port_open:
+            return
 
-        mode_map = {
-            "stop":  self.MODE_STOP,
-            "brake": self.MODE_BRAKE,
-            "hold":  self.MODE_POSITION,
-        }
-        for mid in self._cfg.motor_ids:
-            policy = (gripper_release if (self._has_gripper
-                                          and mid == self._gripper_motor_id)
-                      else joint_release)
-            try:
-                if policy == "stop":
-                    self._ht.stop(mid)
-                else:
-                    # brake (0x0F) or hold (0x0A) — both are mode changes,
-                    # not the dedicated stop()/brake() RPCs.
-                    self._ht.set_motor_mode(mid, mode_map[policy])
-            except Exception:
-                pass
-        try:
+        if needs_shutdown:
+            core.shutdown(
+                self._core_finish_mode(joint_release),
+                self._core_finish_mode(gripper_release),
+                5.0,
+            )
+        if self._ht.is_open():
             self._ht.close()
-        except Exception:
-            pass
-        self._set_state(RobotState.DISCONNECTED)
+        self._servo_active = False
+        self._sync_state_from_core()
         print(f"[FafuRobot] connection closed "
               f"(joints={joint_release}, gripper={gripper_release}).")
 
@@ -4593,26 +3927,26 @@ class FafuRobotController:
         return cfg_path
 
     def _pick_serial_port(self, preferred: Optional[str]) -> str:
+        """Resolve a serial port without silently selecting the wrong arm."""
         pref = (preferred or "").strip()
-        is_auto = (not pref) or pref.lower() == "auto"
+        if pref and pref.lower() != "auto":
+            return pref
+
         try:
-            usb_ports = pm.find_likely_debug_boards()
-        except Exception as e:
-            print(f"[FafuRobot] failed to enumerate ports: {e}")
-            return preferred or ""
-        if not is_auto:
-            for p in usb_ports:
-                if p.port == pref:
-                    return pref
-            print(
-                f"[FafuRobot] preferred port {pref!r} not found; "
-                f"falling back to auto"
-            )
-        if not usb_ports:
+            ports = list(pm.find_likely_debug_boards())
+        except Exception as exc:
             raise RuntimeError(
-                "no USB debug board detected; check the cable and try again"
-            )
-        return usb_ports[0].port
+                f"failed to enumerate USB debug boards: {exc}") from exc
+        if not ports:
+            raise RuntimeError(
+                "no USB debug board detected; specify an explicit port or "
+                "check the cable")
+        if len(ports) != 1:
+            names = ", ".join(str(p.port) for p in ports)
+            raise RuntimeError(
+                "multiple USB debug boards detected "
+                f"({names}); specify one explicit port per SDK instance")
+        return str(ports[0].port)
 
     def _precheck_communication(self) -> None:
         bad: List[int] = []
@@ -4627,57 +3961,6 @@ class FafuRobotController:
                 f"motors {bad} did not respond within 500ms; "
                 f"check power, wiring and motor IDs"
             )
-
-    def _switch_mode_all(
-        self,
-        mode: int,
-        *,
-        label: str,
-        max_retry: int = 3,
-    ) -> bool:
-        """Drive every motor to ``mode``, verifying the actual state.
-
-        Returns True as soon as every motor's *measured* state is at
-        ``mode``.  This intentionally trusts the post-switch read
-        rather than ``set_motor_mode``'s return value, because that
-        return value can legitimately be ``None`` on a busy /
-        freshly-reopened port even when the mode change succeeded
-        (the binding's internal "switch -> sleep -> read confirm"
-        sequence is timing-sensitive).  We back-stop by issuing a
-        fresh read on every motor that the binding flagged as
-        failing, and only treat it as a real failure if the read
-        confirms a wrong mode.
-        """
-        for attempt in range(1, max_retry + 1):
-            failed: List[int] = []
-            for mid in self._cfg.motor_ids:
-                s = self._ht.set_motor_mode(mid, mode)
-                if s is None or int(s.mode) != mode:
-                    failed.append(mid)
-
-            # ★ Post-failure verify: do a fresh read on every "failed"
-            # motor to filter out binding false negatives. If the read
-            # confirms the target mode is already there, the motor is
-            # actually fine — common case after a sync-read timeout
-            # inside set_motor_mode(0x0A).
-            if failed:
-                time.sleep(0.03)
-                really_failed: List[int] = []
-                for mid in failed:
-                    s = self._ht.read_motor_state(mid, 0.3)
-                    if s is None or int(s.mode) != mode:
-                        really_failed.append(mid)
-                failed = really_failed
-
-            if not failed:
-                return True
-            if attempt < max_retry:
-                print(
-                    f"[FafuRobot] switch to {label}: retry {attempt + 1}, "
-                    f"failed motors = {failed}"
-                )
-                time.sleep(0.1)
-        return False
 
     def _validate_joint_angles(
         self,
@@ -4773,6 +4056,12 @@ class FafuRobotController:
 
         while True:
             now = time.monotonic()
+            if self._native_cancel_requested() or not self._stream_link_ok():
+                return self._make_grasp_result(
+                    reason="cancelled", grasped=False,
+                    last_pos=last_pos, start_pos=start_pos,
+                    peak_torque=peak_torque, duration=now - t0,
+                )
             if now >= deadline:
                 return self._make_grasp_result(
                     reason="timeout", grasped=False,
@@ -4970,9 +4259,10 @@ class FafuRobotController:
                         pm.ManyMotorCmd(mid, start_pos[mid], 0.0, max_torque)
                     )
 
-            self._ht.set_many_pos_vel_tqe(
-                cmds, pm.PosUnit.Turns, max_mid, 0.002,
-            )
+            with self._command_guard():
+                self._ht.set_many_pos_vel_tqe(
+                    cmds, pm.PosUnit.Turns, max_mid, 0.002,
+                )
             return True
 
         # The control loop runs on the C++ side with GIL released.
@@ -4980,7 +4270,7 @@ class FafuRobotController:
             rate_hz,
             list(self._cfg.motor_ids),
             on_tick,
-            abort_check=abort_check,
+            abort_check=self._combined_abort_check(abort_check),
             on_exception=lambda msg: print(f"[FafuRobot] ctrl-loop exception: {msg}"),
             stop_on_finish=False,
             stop_on_abort=True,
@@ -4991,7 +4281,8 @@ class FafuRobotController:
             self._last_cmd_turns = None
             raise RuntimeError("move_j aborted (abort_check returned True)")
         if rc == 2:
-            print("[FafuRobot] warning: control loop exited abnormally")
+            self._last_cmd_turns = None
+            raise RuntimeError("move_j control loop exited after a send error")
 
         # Remember what we last *commanded* every motor to, so the next
         # blocking move can start continuously from here (see start_pos
@@ -5080,7 +4371,9 @@ class FafuRobotController:
 
         max_mid = max(self._cfg.motor_ids)
         # first broadcast == posVelMaxTorque() + motor_send_cmd()
-        self._ht.set_many_pos_vel_tqe(cmds, pm.PosUnit.Turns, max_mid, 0.05)
+        with self._command_guard():
+            self._ht.set_many_pos_vel_tqe(
+                cmds, pm.PosUnit.Turns, max_mid, 0.05)
 
         last_cmd: Dict[int, float] = {}
         for mid in self._cfg.motor_ids:
@@ -5099,14 +4392,16 @@ class FafuRobotController:
         deadline = time.monotonic() + max(0.1, float(timeout_s))
         reached = False
         while time.monotonic() < deadline:
-            if abort_check is not None and abort_check():
+            if self._combined_abort_check(abort_check)():
                 self._last_cmd_turns = None
                 raise RuntimeError(
                     "move_j(style=linear) aborted (abort_check returned True)"
                 )
             # keep-alive resend (fire-and-forget, no reply wait) — refreshes
             # the position loop / watchdog exactly like the S-curve loop.
-            self._ht.set_many_pos_vel_tqe(cmds, pm.PosUnit.Turns, max_mid, 0.0)
+            with self._command_guard():
+                self._ht.set_many_pos_vel_tqe(
+                    cmds, pm.PosUnit.Turns, max_mid, 0.0)
             ok = True
             for mid, tgt in targets_turns.items():
                 s = self._ht.read_motor_state(mid, 0.1)
@@ -5162,14 +4457,12 @@ class FafuRobotController:
         # so the start is not a hard step like style="linear".
         acc = float(acc_rpss) if acc_rpss is not None else max(0.05, v_max / 0.3)
 
-        for mid, tgt in targets_turns.items():
-            try:
+        with self._command_guard():
+            for mid, tgt in targets_turns.items():
                 self._ht.set_pos_vel_acc(
                     int(mid), float(tgt), float(v_max), float(acc),
                     pm.PosUnit.Turns,
                 )
-            except Exception as e:
-                print(f"[FafuRobot] move_j(style=acc): motor {mid} failed: {e}")
 
         last_cmd: Dict[int, float] = {}
         cur = self._last_cmd_turns or {}
@@ -5186,10 +4479,10 @@ class FafuRobotController:
         deadline = time.monotonic() + max(0.1, float(timeout_s))
         reached = False
         while time.monotonic() < deadline:
-            if abort_check is not None and abort_check():
+            if self._combined_abort_check(abort_check)():
                 self._last_cmd_turns = None
                 raise RuntimeError(
-                    "move_j(style=acc) aborted (abort_check returned True)"
+                    "move_j(style=acc) aborted (cancellation requested)"
                 )
             ok = True
             for mid, tgt in targets_turns.items():

@@ -18,6 +18,7 @@
 #include <pybind11/numpy.h>        // py::array_t (servoJ partial broadcast, zero-copy)
 
 #include "hightorque_serial.hpp"
+#include "fafu/core/bindings.hpp"
 #include "robot_config.hpp"
 
 #ifdef _WIN32
@@ -540,4 +541,6 @@ PYBIND11_MODULE(fafu_motor, m) {
         .def("get_cached_state",    &HightorqueSerial::get_cached_state, py::arg("motor_id"))
         .def("get_state_age_ms",    &HightorqueSerial::get_state_age_ms,
              py::arg("motor_id"));
+
+    fafu::core::bind_core(m);
 }

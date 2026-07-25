@@ -31,7 +31,10 @@
 //  线程模型:
 //    - 构造完成后内部有 1 个 RX 线程 (异步串口接收) + 1 个 polling 线程 (50Hz 缓存
 //      状态), 由底层 hightorque::HightorqueSerial 管理.
-//    - 对外 API 不保证线程安全; 同一实例不要在多个线程并发调用 move_j / grasp 等.
+//    - 状态读取可并发; 每个实例只允许一个写控制操作. 冲突立即抛
+//      fafu::core::BusyError, 不会交错发送控制帧.
+//    - emergency_stop / close_connection 可从另一线程请求取消.
+//    - 不同实例完全独立; 每个实例必须绑定不同串口.
 //
 //  错误处理:
 //    - 大部分方法在参数错 / 通信失败时 *返回 bool false* 或抛 std::runtime_error
@@ -41,9 +44,9 @@
 #pragma once
 
 #include "hightorque_serial.hpp"        // hightorque::HightorqueSerial, MotorState, ...
+#include "fafu/core/robot_core.hpp"      // shared thread-safe P0 control core
 #include "robot_config.hpp"             // hightorque::RobotConfig
 
-#include <chrono>
 #include <functional>
 #include <map>
 #include <optional>
@@ -85,15 +88,16 @@ enum class ReleaseMode {
 struct GraspResult {
     // 是否认为"抓到物体".
     //   true:  detected_object_force / detected_object_stall
-    //   false: reached_target / no_movement / timeout
+    //   false: reached_target / no_movement / timeout / cancelled
     bool        grasped = false;
 
-    // 触发停止的原因, 见下面 5 种字符串:
+    // 终止原因:
     //   "detected_object_force"  |torque| >= effort_threshold
     //   "detected_object_stall"  夹爪闭合 >= min_close_deg 后又停滞
     //   "reached_target"         到达 target_angle (无障碍)
     //   "no_movement"            停滞但闭合 < min_close_deg
     //   "timeout"                超时
+    //   "cancelled"              安全停止、关闭或通信丢失
     std::string reason;
 
     // 终止时的夹爪角度 (弧度)
@@ -182,6 +186,12 @@ public:
     // 当前是否所有电机都处于 MODE_POSITION
     bool is_enabled();
 
+    // 共享核心的线程安全生命周期状态与健康快照.
+    fafu::core::RobotState state() const;
+    fafu::core::HealthSnapshot health() const;
+    bool check_alive(bool fresh = true, double timeout_s = 0.1);
+    bool recover(bool confirm = false, double timeout_s = 0.2);
+
     // ----------------------------------------------------------------------
     //  电源管理
     // ----------------------------------------------------------------------
@@ -266,6 +276,18 @@ public:
         // 设为 0 / 负值 = 关闭检测.
         double max_lag_rad      = 0.2;
 
+        // 进阶选项由共享 C++ core 实现; 默认保持旧 C++ SDK 的 position 通道.
+        double rate_hz           = 100.0;
+        bool   feedforward_vel   = true;
+        double lookahead_time    = 0.0;
+        int    lag_abort_consecutive = 0;
+        bool   use_mit           = false;
+        std::vector<double> mit_kp;
+        std::vector<double> mit_kd;
+        // Required for non-zero MIT gains/torque. Unknown models are rejected
+        // instead of silently using an unsafe coefficient.
+        std::vector<std::string> motor_models;
+
         // joint_angles 单位 (true=弧度, false=度). 跟 move_j 一致.
         bool   is_radians       = true;
     };
@@ -288,7 +310,7 @@ public:
     void servo_end(ReleaseMode finish_mode = ReleaseMode::Brake);
 
     // 当前是否在 servo 会话中
-    bool is_servoing() const { return servo_active_; }
+    bool is_servoing() const;
 
     // ----------------------------------------------------------------------
     //  状态读取 (从 polling 缓存; prefer_cache=false 则现读)
@@ -306,7 +328,7 @@ public:
     //  夹爪控制 (仅 has_gripper=true 时可用)
     // ----------------------------------------------------------------------
     struct GripperOpts {
-        // 硬件层力矩上限 (raw int16). std::nullopt = 走 set_pos_vel_acc (无 effort 参数).
+        // 硬件层力矩上限 (raw int16, 1..32767). nullopt = 走 set_pos_vel_acc.
         std::optional<int> effort = std::nullopt;
 
         bool   is_radians      = true;
@@ -316,8 +338,9 @@ public:
         double timeout_s       = 8.0;
         double tolerance_deg   = 1.5;
 
-        // 软力控提前停的阈值 (raw int16 |torque|). std::nullopt = 不做.
-        // 用 grasp() 通常用 grasp 自带的 force_threshold, 不需要在这里设.
+        // 力检测阈值 (raw int16 |torque|, 1..32767). 提供时也会作为
+        // 固件力矩上限 (若 effort 更低则保留更低值), 避免提前返回后继续过力.
+        // 用 grasp() 时通常不需要在这里设置.
         std::optional<int> effort_threshold = std::nullopt;
     };
 
@@ -341,10 +364,10 @@ public:
         std::optional<double> target_angle = std::nullopt;
         bool                  is_radians   = true;
 
-        // *Python 侧* 力检测阈值 (raw int16). 见 GraspResult::reason 触发条件.
+        // 力检测阈值 (raw int16), 也作为默认的固件层力矩上限.
         int                   force_threshold = 500;
 
-        // 硬件层力矩上限 (raw int16). std::nullopt 表示不限.
+        // 可选的独立固件层力矩上限 (1..32767); nullopt 时使用 force_threshold.
         std::optional<int>    effort       = std::nullopt;
 
         double                vel          = 0.15;   // 闭合速度 (turns/s, 默认比 open 慢)
@@ -414,9 +437,6 @@ private:
     // 给每个电机 read_motor_state 一次, 失败抛异常.
     void precheck_communication_();
 
-    // 一次性把所有电机切到 mode, 带重试. label 用于打印.
-    bool switch_mode_all_(uint8_t mode, const char* label, int max_retry);
-
     // 入参做长度 / NaN 校验, 返回归一到 turns 的 joint_angles (用于内部 set_many_*).
     std::vector<double> validate_joint_angles_(const std::vector<double>& angles,
                                                bool is_radians);
@@ -451,6 +471,7 @@ private:
     hightorque::RobotConfig                       cfg_;
     std::string                                   cfg_path_;
     std::unique_ptr<hightorque::HightorqueSerial> ht_;
+    std::unique_ptr<fafu::core::RobotCore>         core_;
 
     std::string                                   port_;
     uint32_t                                      baudrate_ = 0;
@@ -458,16 +479,6 @@ private:
     bool                                          has_gripper_      = false;
     int                                           gripper_motor_id_ = 0;
     std::vector<int>                              joint_motor_ids_; // = motor_ids - {gripper}
-
-    bool                                          owns_polling_ = false;
-    bool                                          owns_rx_      = false;
-
-    // ---- servo session ----
-    bool                                          servo_active_     = false;
-    ServoOpts                                     servo_opts_{};
-    std::vector<double>                           servo_last_target_turns_;   // size = num_joints
-    std::chrono::steady_clock::time_point         servo_started_at_{};
-    uint64_t                                      servo_tick_count_ = 0;
 
     // S-curve 调参 (与 Python 同步)
     static constexpr double VEL_AVG_MAX_TPS_ = 0.5;
