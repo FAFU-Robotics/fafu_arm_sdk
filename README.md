@@ -120,8 +120,9 @@ fafu_robot_sdk/                     ← 拷到任何地方都能独立构建 / �
 - **C++ 侧 (`fafu_robot_cpp/`)** 构建依赖: CMake 3.18+ / VS2022 (或 GCC/Clang) / pybind11.
   所有 C++ 源码都已 vendor 进本目录, **不需要任何外部仓库** 就能 build.
 
-- **Python 侧 (`fafu_robot_python/`)** 运行只依赖 `numpy` + `pybind11` (见
-  `fafu_robot_python/requirements.txt`), 再加上当前已经 build 好的 `.pyd` + `.dll`.
+- **Python 侧 (`fafu_robot_python/`)** runtime only requires `numpy` (see
+  `fafu_robot_python/requirements.txt`) plus an ABI-matched `.pyd` and `.dll`.
+  Native rebuilds use `fafu_robot_python/requirements-build.txt`.
 
 > vendored C++ 源码的上游对照表见 [`fafu_robot_cpp/README.md`](fafu_robot_cpp/README.md)
 > 的 "vendored 源码来自哪里" 一节. 如果厂家升级了底层协议库, 直接覆盖回来重新构建即可.

@@ -9,4 +9,3 @@
 #   wrs                 : 启用 move_jntspace_path 的 TOPPRA 时间最优插值
 #   pinocchio / kdl      : 自行接入 IK/FK 后让 move_p / move_l 可用
 numpy>=1.19
-pybind11>=2.10

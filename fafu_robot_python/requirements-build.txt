@@ -1,0 +1,3 @@
+# Dependencies needed to build the native extension and run unit tests.
+-r requirements.txt
+pybind11>=2.10  # Build-time only.
