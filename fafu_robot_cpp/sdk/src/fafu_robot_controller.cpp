@@ -36,12 +36,6 @@ void log_warn(const std::string& msg) {
     std::cerr << kPrefix << "WARN: " << msg << std::endl;
 }
 
-double monotonic_seconds() {
-    using clk = std::chrono::steady_clock;
-    static const auto t0 = clk::now();
-    return std::chrono::duration<double>(clk::now() - t0).count();
-}
-
 fafu::core::FinishMode to_finish_mode(ReleaseMode mode) {
     switch (mode) {
         case ReleaseMode::Stop:  return fafu::core::FinishMode::Stop;
@@ -109,6 +103,9 @@ std::string FafuRobotController::release_mode_name_(ReleaseMode m) {
 // ============================================================================
 //  构造 / 析构
 // ============================================================================
+FafuRobotController::FafuRobotController(const std::string& cfg_path)
+    : FafuRobotController(cfg_path, Options{}) {}
+
 FafuRobotController::FafuRobotController(const std::string& cfg_path,
                                          const Options& opts)
 {
@@ -275,6 +272,10 @@ void FafuRobotController::brake() {
 // ============================================================================
 //  关节空间
 // ============================================================================
+bool FafuRobotController::move_j(const std::vector<double>& joint_angles) {
+    return move_j(joint_angles, MoveOpts{});
+}
+
 bool FafuRobotController::move_j(const std::vector<double>& joint_angles,
                                  const MoveOpts& opts) {
     if (!core_) throw std::runtime_error("controller core is unavailable");
@@ -331,6 +332,10 @@ bool FafuRobotController::go_home(int speed, bool block) {
 // ============================================================================
 //  Servo (online streaming)
 // ============================================================================
+void FafuRobotController::servo_start() {
+    servo_start(ServoOpts{});
+}
+
 void FafuRobotController::servo_start(const ServoOpts& opts) {
     if (!core_) throw std::runtime_error("controller core is unavailable");
 
@@ -428,6 +433,11 @@ FafuRobotController::get_motor_states(bool prefer_cache) {
 //  夹爪
 // ============================================================================
 std::optional<GraspResult>
+FafuRobotController::gripper_control(double angle) {
+    return gripper_control(angle, GripperOpts{});
+}
+
+std::optional<GraspResult>
 FafuRobotController::gripper_control(double angle, const GripperOpts& opts) {
     if (!core_) throw std::runtime_error("controller core is unavailable");
     CoreLease operation(*core_, fafu::core::OperationKind::GripperMotion);
@@ -480,6 +490,10 @@ FafuRobotController::gripper_control(double angle, const GripperOpts& opts) {
     return result;
 }
 
+bool FafuRobotController::open_gripper(std::optional<double> angle) {
+    return open_gripper(angle, GripperOpts{});
+}
+
 bool FafuRobotController::open_gripper(std::optional<double> angle,
                                        const GripperOpts& opts) {
     if (!has_gripper_)
@@ -503,6 +517,10 @@ bool FafuRobotController::open_gripper(std::optional<double> angle,
     return true;
 }
 
+bool FafuRobotController::close_gripper(std::optional<double> angle) {
+    return close_gripper(angle, GripperOpts{});
+}
+
 bool FafuRobotController::close_gripper(std::optional<double> angle,
                                         const GripperOpts& opts) {
     if (!has_gripper_)
@@ -521,6 +539,10 @@ bool FafuRobotController::close_gripper(std::optional<double> angle,
     auto r = gripper_control(target_turns * 360.0, forwarded);
     (void)r;
     return true;
+}
+
+GraspResult FafuRobotController::grasp() {
+    return grasp(GraspOpts{});
 }
 
 GraspResult FafuRobotController::grasp(const GraspOpts& opts) {
@@ -559,6 +581,10 @@ GraspResult FafuRobotController::grasp(const GraspOpts& opts) {
         /*tolerance_turns=*/std::nullopt,
         std::make_optional<int>(opts.force_threshold),
         min_progress_turns);
+}
+
+void FafuRobotController::release() {
+    release(GripperOpts{});
 }
 
 void FafuRobotController::release(const GripperOpts& opts) {
