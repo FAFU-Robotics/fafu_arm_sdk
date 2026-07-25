@@ -74,6 +74,7 @@ import functools
 import math
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -581,13 +582,20 @@ class FafuRobotController:
         # ``_op_depth`` tracks nested guarded operations for re-entrancy
         # (e.g. go_home -> move_j); ``_state_verbose`` toggles transition
         # logging (off by default to avoid spamming per-move_j).
+        self._state_lock = threading.RLock()
         self._state: RobotState = RobotState.DISABLED
         self._op_depth: int = 0
+        self._op_owner_thread_id: Optional[int] = None
         self._state_verbose: bool = False
-        # DEAD (motor power / CAN loss) detection. During a live session
-        # (async RX / polling on) a growing ``Stats.last_rx_age_ms`` beyond
-        # this threshold is treated as motors losing power mid-stream ->
-        # latch DEAD and stop sending, so power-return cannot resume motion.
+        self._gravity_comp_owner_thread_id: Optional[int] = None
+        # Per-motor feedback freshness.  The C++ driver also tracks this in
+        # recent builds; keeping a Python-side mirror preserves safety when an
+        # older prebuilt binding is used.
+        self._motor_last_seen_monotonic: Dict[int, float] = {}
+        # DEAD (motor power / CAN loss) detection. During a live async/polling
+        # session, every configured joint must have feedback newer than this
+        # threshold. A stale joint latches DEAD and stops all streaming, so
+        # power-return cannot silently resume motion.
         self._dead_rx_timeout_ms: float = 500.0
         self._dead_reason: Optional[str] = None
 
@@ -625,7 +633,8 @@ class FafuRobotController:
                 time.sleep(0.1)
                 # Prime the RX cache so get_cached_state returns immediately.
                 for mid in cfg.motor_ids:
-                    self._ht.read_motor_state(mid, 0.1)
+                    if self._ht.read_motor_state(mid, 0.1) is not None:
+                        self._note_motor_seen(mid)
             except Exception as e:
                 print(f"[FafuRobot] warning: enable_async_rx failed: {e}")
 
@@ -633,7 +642,11 @@ class FafuRobotController:
             try:
                 hz = float(cfg.control_rate_hz) if cfg.control_rate_hz else 50.0
                 hz = max(10.0, hz)
-                self._ht.start_state_polling(list(cfg.motor_ids), hz)
+                self._ht.start_state_polling(
+                    list(cfg.motor_ids),
+                    hz,
+                    self._on_motor_states_updated,
+                )
             except Exception as e:
                 print(f"[FafuRobot] warning: start_state_polling failed: {e}")
 
@@ -772,7 +785,8 @@ class FafuRobotController:
         API (see :class:`RobotState`).  It is *not* a live hardware read;
         use :meth:`is_enabled` / :meth:`get_motor_states` for that.
         """
-        return self._state
+        with self._state_lock:
+            return self._state
 
     @property
     def state_verbose(self) -> bool:
@@ -784,12 +798,13 @@ class FafuRobotController:
         self._state_verbose = bool(value)
 
     def _set_state(self, new: RobotState) -> None:
-        old = self._state
-        if old is new:
-            return
-        self._state = new
-        if self._state_verbose:
-            print(f"[FafuRobot] state: {old} -> {new}")
+        with self._state_lock:
+            old = self._state
+            if old is new:
+                return
+            self._state = new
+            if self._state_verbose:
+                print(f"[FafuRobot] state: {old} -> {new}")
 
     def _require_ready(self, action: str, *, allow_disabled: bool = False) -> None:
         """Raise :class:`RobotStateError` unless the controller can accept
@@ -895,24 +910,87 @@ class FafuRobotController:
         and is responsible for restoring ``IDLE`` on exit; ``False`` for
         a nested internal call (which must not touch the state).
         """
-        if self._op_depth > 0:
-            # Already inside an operation we started -> nested call, allow.
-            self._op_depth += 1
-            return False
-        self._require_ready(action)
-        self._op_depth = 1
-        self._set_state(busy_state)
-        return True
+        owner = threading.get_ident()
+        with self._state_lock:
+            if self._op_depth > 0:
+                if self._op_owner_thread_id != owner:
+                    raise RobotStateError(
+                        f"{action} rejected: another thread owns the active "
+                        f"control operation (state={self._state})."
+                    )
+                # Same-thread internal nesting (go_home -> move_j, etc.).
+                self._op_depth += 1
+                return False
+            self._require_ready(action)
+            self._op_depth = 1
+            self._op_owner_thread_id = owner
+            self._set_state(busy_state)
+            return True
 
     def _exit_operation(self, owns: bool) -> None:
-        if self._op_depth > 0:
+        owner = threading.get_ident()
+        with self._state_lock:
+            if self._op_depth <= 0:
+                return
+            if self._op_owner_thread_id != owner:
+                raise RuntimeError("operation guard exited by a non-owner thread")
             self._op_depth -= 1
-        if owns and self._op_depth == 0:
-            # Only restore IDLE if we are still in a call-scoped busy
-            # state.  An out-of-band transition (emergency_stop from a
-            # signal handler, close_connection) must not be clobbered.
-            if self._state in (RobotState.MOVING, RobotState.GRASPING):
-                self._set_state(RobotState.IDLE)
+            if owns and self._op_depth == 0:
+                self._op_owner_thread_id = None
+                # Only restore IDLE if we are still in a call-scoped busy
+                # state.  An out-of-band transition (emergency_stop from a
+                # signal handler, close_connection) must not be clobbered.
+                if self._state in (RobotState.MOVING, RobotState.GRASPING):
+                    self._set_state(RobotState.IDLE)
+
+    def _require_stream_command(
+        self,
+        action: str,
+        *,
+        allow_gravity_owner: bool = False,
+    ) -> None:
+        """Gate low-level streaming APIs without breaking internal loops.
+
+        Direct callers must be in ``IDLE``.  A guarded composite move may call
+        a low-level sender only from the same thread that owns the operation;
+        the gravity-compensation loop gets the same narrowly-scoped exception.
+        ESTOP/DEAD/DISCONNECTED are never bypassed.
+        """
+        owner = threading.get_ident()
+        with self._state_lock:
+            internal_move = (
+                self._op_depth > 0
+                and self._op_owner_thread_id == owner
+                and self._state in (RobotState.MOVING, RobotState.GRASPING)
+            )
+            internal_gravity = (
+                allow_gravity_owner
+                and self._gravity_comp_active
+                and self._gravity_comp_owner_thread_id == owner
+                and self._state is RobotState.GRAVITY_COMP
+            )
+        if not (internal_move or internal_gravity):
+            self._require_ready(action)
+            return
+        if not self._stream_link_ok():
+            raise RobotStateError(
+                f"{action} rejected: motor feedback is stale (DEAD).")
+        with self._state_lock:
+            if self._state in (
+                RobotState.ESTOP,
+                RobotState.DEAD,
+                RobotState.DISCONNECTED,
+            ):
+                raise RobotStateError(
+                    f"{action} rejected: state={self._state}.")
+
+    def _note_motor_seen(self, motor_id: int) -> None:
+        self._motor_last_seen_monotonic[int(motor_id)] = time.monotonic()
+
+    def _on_motor_states_updated(self, motor_ids: Iterable[int]) -> None:
+        now = time.monotonic()
+        for motor_id in motor_ids:
+            self._motor_last_seen_monotonic[int(motor_id)] = now
 
     # ------------------------------------------------------------------
     #  Power / link loss -> DEAD (latched, survives power-return)
@@ -946,50 +1024,79 @@ class FafuRobotController:
         """Cheap per-tick liveness check for high-rate loops (servo_j /
         move_MIT / gravity comp).
 
-        Uses the driver's ``Stats.last_rx_age_ms``: while async RX is running,
-        motors losing power stop replying and the age climbs.  If it exceeds
-        :attr:`_dead_rx_timeout_ms` we latch ``DEAD`` and return ``False`` so
-        the caller stops streaming.  If async RX is off we cannot cheaply tell,
-        so we return ``True`` (use :meth:`check_alive` at boundaries instead).
+        Every commanded joint must have fresh feedback; a healthy motor must
+        never hide stale feedback from another commanded joint.
         """
         try:
-            if not self._ht.is_async_rx():
+            async_rx = bool(self._ht.is_async_rx())
+            polling = bool(self._ht.is_polling())
+            if not async_rx and not polling:
                 return True
-            age = float(getattr(self._ht.get_stats(), "last_rx_age_ms", 0.0))
         except Exception:
             return True
-        if age > self._dead_rx_timeout_ms:
+
+        now = time.monotonic()
+        age_fn = getattr(self._ht, "get_state_age_ms", None)
+        stale: List[Tuple[int, float]] = []
+        for mid in self._joint_motor_ids:
+            age_ms: Optional[float] = None
+            if age_fn is not None:
+                try:
+                    driver_age = float(age_fn(mid))
+                    if math.isfinite(driver_age):
+                        age_ms = driver_age
+                except Exception:
+                    pass
+            if age_ms is None:
+                seen_at = self._motor_last_seen_monotonic.get(mid)
+                if seen_at is not None:
+                    age_ms = max(0.0, (now - seen_at) * 1000.0)
+            if age_ms is None or age_ms > self._dead_rx_timeout_ms:
+                stale.append((mid, float("inf") if age_ms is None else age_ms))
+
+        if stale:
+            detail = ", ".join(
+                f"M{mid}=never" if not math.isfinite(age)
+                else f"M{mid}={age:.0f}ms"
+                for mid, age in stale
+            )
             self._enter_dead(
-                f"no CAN RX for {age:.0f} ms (motor power / USB / bus lost mid-stream?)")
+                f"stale motor feedback: {detail} "
+                f"(limit={self._dead_rx_timeout_ms:.0f}ms)"
+            )
             return False
         return True
 
     def check_alive(self, *, fresh: bool = True, timeout: float = 0.1) -> bool:
         """Probe the joint motors for a live power / CAN link.
 
-        Returns ``True`` if at least one joint motor answers a state read.  If
-        **none** answer — the signature of a full power loss / USB unplug / bus
-        down — the controller latches :attr:`RobotState.DEAD` (sticky) so no
+        Returns ``True`` only if every joint motor answers a state read.  If
+        **any** fail to answer — indicating partial/full power, wiring, or CAN
+        failure — the controller latches :attr:`RobotState.DEAD` (sticky) so no
         motion can be issued, and returns ``False``.  Call :meth:`recover`
         after restoring power.  No-op (returns ``False``) if already
         disconnected.
         """
         if self._state is RobotState.DISCONNECTED:
             return False
-        alive = False
+        missing: List[int] = []
         for mid in self._joint_motor_ids:
             try:
                 s = (self._ht.read_motor_state(mid, timeout) if fresh
                      else self._ht.get_cached_state(mid))
             except Exception:
                 s = None
-            if s is not None:
-                alive = True
-                break
-        if not alive:
-            self._enter_dead("no motor responded to a state read "
-                             "(power off / USB unplugged / CAN down?)")
-        return alive
+            if s is None:
+                missing.append(mid)
+            else:
+                self._note_motor_seen(mid)
+        if missing:
+            self._enter_dead(
+                f"motors {missing} did not respond to a state read "
+                "(partial power/wiring/CAN failure?)"
+            )
+            return False
+        return True
 
     def recover(self, *, confirm: bool = False) -> bool:
         """Leave ``DEAD`` after motor power / CAN has been restored.
@@ -1007,6 +1114,11 @@ class FafuRobotController:
         Returns ``True`` if the link is back and we moved to ``DISABLED``;
         ``False`` if the motors are still unresponsive (stays ``DEAD``).
         """
+        with self._state_lock:
+            if self._op_depth > 0:
+                raise RobotStateError(
+                    "recover rejected: wait for the in-flight operation to exit")
+
         if self._state is not RobotState.DEAD:
             print(f"[FafuRobot] recover: not in DEAD (state={self._state}); ignored.")
             return self._state is not RobotState.DEAD
@@ -1024,21 +1136,26 @@ class FafuRobotController:
         try:
             if not self._ht.is_polling():
                 hz = float(self._cfg.control_rate_hz) if self._cfg.control_rate_hz else 50.0
-                self._ht.start_state_polling(list(self._cfg.motor_ids), max(10.0, hz))
+                self._ht.start_state_polling(
+                    list(self._cfg.motor_ids),
+                    max(10.0, hz),
+                    self._on_motor_states_updated,
+                )
         except Exception as e:
             print(f"[FafuRobot] recover: start_state_polling failed: {e}")
-        # Probe: read fresh; if still nothing, stay DEAD.
-        alive = False
-        for mid in self._joint_motor_ids:
+        # Probe every configured motor; partial recovery is not safe.
+        missing: List[int] = []
+        for mid in self._cfg.motor_ids:
             try:
                 if self._ht.read_motor_state(mid, 0.2) is not None:
-                    alive = True
-                    break
+                    self._note_motor_seen(mid)
+                else:
+                    missing.append(mid)
             except Exception:
-                pass
-        if not alive:
-            print("[FafuRobot] recover: motors still unresponsive; "
-                  "check power / USB / CAN and retry. (state stays DEAD)")
+                missing.append(mid)
+        if missing:
+            print(f"[FafuRobot] recover: motors {missing} still unresponsive; "
+                  "check power/wiring/USB/CAN and retry. (state stays DEAD)")
             return False
         # Link is back. Force a known-safe non-energised state; never move.
         for mid in self._cfg.motor_ids:
@@ -1098,6 +1215,11 @@ class FafuRobotController:
         flight.  If :meth:`_enable_impl` raises, the state is left
         unchanged (e.g. still ``DISABLED``) so the failure is visible.
         """
+        with self._state_lock:
+            if self._op_depth > 0:
+                raise RobotStateError(
+                    "enable rejected: wait for the in-flight operation to exit")
+
         if self._state is RobotState.DISCONNECTED:
             raise RobotStateError("enable 失败: 连接已关闭 (state=DISCONNECTED)。")
         if self._state is RobotState.DEAD:
@@ -1523,9 +1645,15 @@ class FafuRobotController:
             raise ValueError("path must not be None")
 
         path_arr = np.asarray(path, dtype=float)
-        if path_arr.ndim != 2 or path_arr.shape[1] != self.num_joints:
+        if (
+            path_arr.ndim != 2
+            or path_arr.shape[0] == 0
+            or path_arr.shape[1] != self.num_joints
+            or not np.all(np.isfinite(path_arr))
+        ):
             raise ValueError(
-                f"path must have shape (N, {self.num_joints}); got {path_arr.shape}"
+                f"path must be a non-empty finite (N, {self.num_joints}) array; "
+                f"got shape {path_arr.shape}"
             )
 
         tpply = pwp.PiecewisePolyTOPPRA()
@@ -1614,9 +1742,15 @@ class FafuRobotController:
             raise ValueError("path must not be None")
 
         path_arr = np.asarray(path, dtype=float)
-        if path_arr.ndim != 2 or path_arr.shape[1] != self.num_joints:
+        if (
+            path_arr.ndim != 2
+            or path_arr.shape[0] == 0
+            or path_arr.shape[1] != self.num_joints
+            or not np.all(np.isfinite(path_arr))
+        ):
             raise ValueError(
-                f"path must have shape (N, {self.num_joints}); got {path_arr.shape}"
+                f"path must be a non-empty finite (N, {self.num_joints}) array; "
+                f"got shape {path_arr.shape}"
             )
 
         if self.num_joints > 6:
@@ -1648,7 +1782,9 @@ class FafuRobotController:
                   "add gravity feed-forward).")
 
         # Active mode so 0x8093 MIT frames are actuated.
-        self.enable()
+        # The operation guard already owns MOVING, so call the internal
+        # implementation instead of the public enable() state transition.
+        self._enable_impl(allow_motor_reset=True)
 
         dt = max(0.005, control_frequency)
         _to_rad = 1.0 if is_radians else (math.pi / 180.0)
@@ -2921,10 +3057,12 @@ class FafuRobotController:
         software impedance net (``b_soft`` in
         :meth:`start_gravity_compensation`) instead.
         """
+        self._require_stream_command(
+            "apply_compensation_torque", allow_gravity_owner=True)
         tau = np.asarray(list(tau), dtype=float)
-        if tau.shape != (self.num_joints,):
+        if tau.shape != (self.num_joints,) or not np.all(np.isfinite(tau)):
             raise ValueError(
-                f"tau must have {self.num_joints} elements, got {tau.shape}")
+                f"tau must have {self.num_joints} finite elements, got {tau}")
         # Empirical calibration gain (1.0 by default).
         tau = tau * self._dyn_torque_scale
 
@@ -3033,31 +3171,29 @@ class FafuRobotController:
         cap). This method sends the manipulator joints only; drive the gripper
         separately (``gripper_control`` / group with <=6 total).
         """
+        self._require_stream_command("move_MIT")
         n = self.num_joints
         if n > 6:
             raise RuntimeError(
                 f"move_MIT: group MIT frame holds <=6 motors, but "
                 f"num_joints={n}. Use --gripper-id so the gripper is excluded, "
                 f"or drive extra joints on a separate frame.")
-        # Power/CAN-loss guard for the MIT replay / teleop hot loop: if the
-        # motors went silent mid-stream, latch DEAD and send nothing so power
-        # returning cannot resume the trajectory.
-        if not self._stream_link_ok():
-            return {}
         pos = np.asarray(list(pos), dtype=float)
         vel = np.asarray(list(vel), dtype=float)
         tau = np.asarray(list(tau), dtype=float)
         for name, arr in (("pos", pos), ("vel", vel), ("tau", tau)):
-            if arr.shape != (n,):
+            if arr.shape != (n,) or not np.all(np.isfinite(arr)):
                 raise ValueError(
-                    f"{name} must have {n} elements, got {arr.shape}")
+                    f"{name} must have {n} finite elements, got {arr}")
 
         def _as_vec(g) -> np.ndarray:
             if np.isscalar(g):
-                return np.full(n, float(g))
-            g = np.asarray(list(g), dtype=float)
-            if g.shape != (n,):
-                raise ValueError(f"kp/kd must be scalar or {n} elements")
+                g = np.full(n, float(g))
+            else:
+                g = np.asarray(list(g), dtype=float)
+            if g.shape != (n,) or not np.all(np.isfinite(g)):
+                raise ValueError(
+                    f"kp/kd must be scalar or {n} finite elements")
             return g
 
         kp_v = _as_vec(kp)
@@ -3389,6 +3525,7 @@ class FafuRobotController:
         last_t = t0
         last_log = t0
         self._gravity_comp_active = True
+        self._gravity_comp_owner_thread_id = threading.get_ident()
         if not dry_run:
             self._set_state(RobotState.GRAVITY_COMP)
         try:
@@ -3492,6 +3629,7 @@ class FafuRobotController:
             print("\n[FafuRobot] gravity-comp interrupted by user")
         finally:
             self._gravity_comp_active = False
+            self._gravity_comp_owner_thread_id = None
             # Leave the GRAVITY_COMP busy-state NOW (before the teardown
             # below, which calls guarded methods like enable()/go_home()
             # that would otherwise be rejected as "arm busy"). Preserve a
@@ -4365,6 +4503,12 @@ class FafuRobotController:
             program disconnects (the previous default of ``"stop"``
             caused exactly that issue).
         """
+        valid = {"stop", "brake", "hold"}
+        if joint_release not in valid:
+            raise ValueError(f"joint_release must be one of {valid}")
+        if gripper_release not in valid:
+            raise ValueError(f"gripper_release must be one of {valid}")
+
         # If a servo session is still open, end it gracefully BEFORE we
         # stop polling / disable async RX. servo_end clears the firmware
         # watchdog (which would otherwise fire as soon as we stop
@@ -4385,12 +4529,7 @@ class FafuRobotController:
                 self._ht.disable_async_rx()
         except Exception:
             pass
-
-        valid = {"stop", "brake", "hold"}
-        if joint_release not in valid:
-            raise ValueError(f"joint_release must be one of {valid}")
-        if gripper_release not in valid:
-            raise ValueError(f"gripper_release must be one of {valid}")
+        # Release policies were validated before any shutdown side effect.
 
         mode_map = {
             "stop":  self.MODE_STOP,
@@ -4481,6 +4620,8 @@ class FafuRobotController:
             s = self._ht.read_motor_state(mid, 0.5)
             if s is None:
                 bad.append(mid)
+            else:
+                self._note_motor_seen(mid)
         if bad:
             raise RuntimeError(
                 f"motors {bad} did not respond within 500ms; "
@@ -4545,10 +4686,13 @@ class FafuRobotController:
     ) -> List[float]:
         """Validate length and convert input angles to **turns**."""
         arr = np.asarray(list(joint_angles), dtype=float)
-        if arr.size != self.num_joints:
+        if arr.shape != (self.num_joints,):
             raise ValueError(
-                f"expected {self.num_joints} joint values, got {arr.size}"
+                f"expected a 1-D vector of {self.num_joints} joint values; "
+                f"got shape {arr.shape}"
             )
+        if not np.all(np.isfinite(arr)):
+            raise ValueError("joint values must all be finite (no NaN/Inf)")
         if not is_radians:
             return [v / 360.0 for v in arr]  # degrees -> turns
         return [self._rad_to_turns(v) for v in arr]
@@ -4576,6 +4720,7 @@ class FafuRobotController:
             s = self._ht.read_motor_state(mid, 0.1)
             if s is not None:
                 out[mid] = s
+                self._note_motor_seen(mid)
         return out
 
     # Minimum closure (in turns) before a stall counts as "grasped object"

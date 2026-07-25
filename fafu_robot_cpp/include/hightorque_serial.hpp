@@ -245,6 +245,10 @@ public:
     void enable_async_rx();
     void disable_async_rx();
     bool is_async_rx() const { return async_rx_enabled_.load(); }
+    // Milliseconds since this motor's last real feedback. Returns +infinity
+    // when no feedback has ever been received. Unlike the global RX age,
+    // healthy motors cannot hide a stale motor here.
+    double get_state_age_ms(int motor_id) const;
 
     // ---- 状态缓存读取 (任何模式下都能用; async 模式更有意义) ----
     std::optional<MotorState> get_state(int motor_id) const;     // = get_cached_state 别名
@@ -498,6 +502,7 @@ private:
     std::mutex                      tx_mtx_;
     mutable std::mutex              cache_mtx_;
     std::condition_variable         cache_cv_;
+    std::map<int, double>           state_update_time_;
     std::map<int, MotorState>       state_cache_;
     std::map<int, uint64_t>         update_seq_;        // motor_id -> 单调递增序号
 

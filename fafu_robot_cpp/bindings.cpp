@@ -512,11 +512,14 @@ PYBIND11_MODULE(fafu_motor, m) {
                 };
             }
             py::object ot = std::move(on_tick);
-            return self.run_control_loop(opt, [ot](int tick, double period_ms) -> bool {
+            auto tick_fn = [ot](int tick, double period_ms) -> bool {
                 py::gil_scoped_acquire gil;
                 py::object r = ot(tick, period_ms);
                 return py::cast<bool>(r);
-            });
+            };
+            // Keep all py::object construction/destruction under the GIL.
+            py::gil_scoped_release release;
+            return self.run_control_loop(opt, std::move(tick_fn));
         },
         py::arg("rate_hz"),
         py::arg("stop_motor_ids"),
@@ -524,8 +527,7 @@ PYBIND11_MODULE(fafu_motor, m) {
         py::arg("abort_check") = py::none(),
         py::arg("on_exception") = py::none(),
         py::arg("stop_on_finish") = false,
-        py::arg("stop_on_abort") = true,
-        py::call_guard<py::gil_scoped_release>())
+        py::arg("stop_on_abort") = true)
 
         // -- 后台轮询 --
         .def("start_state_polling", &HightorqueSerial::start_state_polling,
@@ -535,5 +537,7 @@ PYBIND11_MODULE(fafu_motor, m) {
         .def("stop_state_polling",  &HightorqueSerial::stop_state_polling,
              py::call_guard<py::gil_scoped_release>())
         .def("is_polling",          &HightorqueSerial::is_polling)
-        .def("get_cached_state",    &HightorqueSerial::get_cached_state, py::arg("motor_id"));
+        .def("get_cached_state",    &HightorqueSerial::get_cached_state, py::arg("motor_id"))
+        .def("get_state_age_ms",    &HightorqueSerial::get_state_age_ms,
+             py::arg("motor_id"));
 }

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>   // std::cout (调试打印, 见 read_motor_state_with_debug)
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -161,6 +162,15 @@ inline int16_t saturate_to_i16(T value) {
     return static_cast<int16_t>(value);
 }
 
+inline int16_t finite_to_i16(double value, const char* field) {
+    if (!std::isfinite(value)) {
+        throw std::invalid_argument(std::string(field) + " must be finite");
+    }
+    if (value > 32767.0) return 32767;
+    if (value < -32768.0) return -32768;
+    return static_cast<int16_t>(value);
+}
+
 inline int hex_digit(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -255,9 +265,9 @@ std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
 //  int16 单位转换
 // ---------------------------------------------------------------------------
 
-int16_t turns_to_int16(double turns)  { return saturate_to_i16(static_cast<long long>(turns / 0.0001)); }
+int16_t turns_to_int16(double turns)  { return finite_to_i16(turns / 0.0001, "position"); }
 double  int16_to_turns(int16_t val)   { return val * 0.0001; }
-int16_t rps_to_int16(double rps)      { return saturate_to_i16(static_cast<long long>(rps  / 0.00025)); }
+int16_t rps_to_int16(double rps)      { return finite_to_i16(rps / 0.00025, "velocity"); }
 double  int16_to_rps(int16_t val)     { return val * 0.00025; }
 int16_t rad_to_int16(double rad)      { return turns_to_int16(rad / (2.0 * kPi)); }
 double  int16_to_rad(int16_t val)     { return int16_to_turns(val) * 2.0 * kPi; }
@@ -712,6 +722,8 @@ void HightorqueSerial::serial_write_(const std::vector<uint8_t>& data, int retri
 
 std::string HightorqueSerial::send_cmd_(const std::string& cmd, double timeout_s) {
     std::lock_guard<std::mutex> lock(tx_mtx_);
+    const bool async_mode = async_rx_enabled_.load();
+    if (!async_mode) ser_->flushInput();
 
     const std::string line = cmd + "\r\n";
     std::vector<uint8_t> bytes(line.begin(), line.end());
@@ -720,12 +732,11 @@ std::string HightorqueSerial::send_cmd_(const std::string& cmd, double timeout_s
 
     // 异步模式: ASCII 响应行也会被 RX 线程吃掉. 此函数只用于诊断命令(can status/config),
     // 启用 async 后建议尽量不用. 这里只做"短等" (50ms) 兜底.
-    if (async_rx_enabled_.load()) {
+    if (async_mode) {
         sleep_seconds(0.05);
         return std::string{};
     }
 
-    ser_->flushInput();
     std::string response;
     const double deadline = now_seconds() + timeout_s;
     while (now_seconds() < deadline) {
@@ -746,6 +757,8 @@ HightorqueSerial::RcvList HightorqueSerial::send_can_and_recv_(
         int can_id, const std::vector<uint8_t>& data, double timeout_s, int expected_replies) {
 
     std::unique_lock<std::mutex> lock(tx_mtx_);
+    const bool async_mode = async_rx_enabled_.load();
+    if (!async_mode) ser_->flushInput();
     std::ostringstream cmd;
     cmd << "can send " << std::hex << std::uppercase << can_id
         << " " << bytes_to_hex(data) << "\r\n";
@@ -755,11 +768,9 @@ HightorqueSerial::RcvList HightorqueSerial::send_can_and_recv_(
     note_tx_();
 
     // 异步模式: 提前 return, 释放锁; 回复由 RX 线程异步入 cache
-    if (async_rx_enabled_.load()) return {};
+    if (async_mode) return {};
 
     // 同步模式: 持锁继续读串口直到收齐回复或超时
-    ser_->flushInput();
-
     if (expected_replies < 1) expected_replies = 1;
 
     // 退出条件: 实测调试板 'can send' 不送命令回显行, 只回 N 个 'rcv'.
@@ -986,7 +997,7 @@ std::optional<MotorState> HightorqueSerial::set_pos_vel_acc(int motor_id, double
                                                             double vel_max_rps, double acc_rpss,
                                                             PosUnit unit) {
     const auto [pos_t, flag] = apply_position_limit_(motor_id, to_turns(pos, unit));
-    const int16_t acc_int = saturate_to_i16(static_cast<long long>(acc_rpss / 0.001));
+    const int16_t acc_int = finite_to_i16(acc_rpss / 0.001, "acceleration");
     auto st = control_call(
         [&](int can_id, double t) {
             return send_can_and_recv_(can_id,
@@ -1004,7 +1015,7 @@ std::optional<MotorState> HightorqueSerial::set_vel_acc(int motor_id, double vel
     // 速度+加速度 (3.1.9): 不带位置限制, 不经过 apply_position_limit_ (没有 pos 参数).
     // acc LSB = 0.001 转/秒² (协议 2.8), 与 set_pos_vel_acc 一致.
     const int16_t v       = rps_to_int16(vel_rps);
-    const int16_t acc_int = saturate_to_i16(static_cast<long long>(acc_rpss / 0.001));
+    const int16_t acc_int = finite_to_i16(acc_rpss / 0.001, "acceleration");
     return control_call(
         [&](int can_id, double t) {
             return send_can_and_recv_(can_id, build_vel_acc_int16(v, acc_int), t);
@@ -1325,21 +1336,21 @@ std::optional<MotorState> HightorqueSerial::set_torque(int motor_id, double tqe_
     // motor.cpp tqe_float2int: raw = Nm / (motor_tqe_adj * 0.01)). Without
     // the *0.01 the raw is 100x too small -> arm under-drives / sags.
     const int16_t tqe_int = (coeff != 0.0)
-        ? saturate_to_i16(static_cast<long long>(tqe_nm / (coeff * 0.01))) : 0;
+        ? finite_to_i16(tqe_nm / (coeff * 0.01), "torque") : 0;
     return control_call(
         [&](int can_id, double t) { return send_can_and_recv_(can_id, build_torque_int16(tqe_int), t); },
         motor_id);
 }
 
 std::optional<MotorState> HightorqueSerial::set_voltage(int motor_id, double voltage_v) {
-    const int16_t v = saturate_to_i16(static_cast<long long>(voltage_v / 0.1));
+    const int16_t v = finite_to_i16(voltage_v / 0.1, "voltage");
     return control_call(
         [&](int can_id, double t) { return send_can_and_recv_(can_id, build_voltage_int16(v), t); },
         motor_id);
 }
 
 std::optional<MotorState> HightorqueSerial::set_current(int motor_id, double current_a) {
-    const int16_t c = saturate_to_i16(static_cast<long long>(current_a / 0.1));
+    const int16_t c = finite_to_i16(current_a / 0.1, "current");
     return control_call(
         [&](int can_id, double t) { return send_can_and_recv_(can_id, build_current_int16(c), t); },
         motor_id);
@@ -1351,11 +1362,14 @@ std::optional<MotorState> HightorqueSerial::set_pos_vel_tqe_kp_kd(
     const auto [pos_t, flag] = apply_position_limit_(motor_id, to_turns(pos, unit));
     double coeff = 1.0;
     if (auto it = TORQUE_COEFF.find(motor_model); it != TORQUE_COEFF.end()) coeff = it->second;
+    if (!std::isfinite(kp) || !std::isfinite(kd)) {
+        throw std::invalid_argument("kp and kd must be finite");
+    }
     // Firmware torque LSB is (coeff * 0.01) Nm/count (see set_torque note).
     const int16_t tqe_int = (coeff != 0.0)
-        ? saturate_to_i16(static_cast<long long>(tqe_nm / (coeff * 0.01))) : 0;
-    const int16_t kp_int  = static_cast<int16_t>(std::clamp<long long>(static_cast<long long>(kp),       0LL, 32767LL));
-    const int16_t kd_int  = static_cast<int16_t>(std::clamp<long long>(static_cast<long long>(kd * 100), 0LL, 32767LL));
+        ? finite_to_i16(tqe_nm / (coeff * 0.01), "torque") : 0;
+    const int16_t kp_int = finite_to_i16(std::max(0.0, kp), "kp");
+    const int16_t kd_int = finite_to_i16(std::max(0.0, kd * 100.0), "kd");
     auto st = control_call(
         [&](int can_id, double t) {
             return send_can_and_recv_(can_id,
@@ -1428,6 +1442,9 @@ std::string HightorqueSerial::set_timeout(int motor_id, int16_t timeout_ms) {
 void HightorqueSerial::enable_position_limit(int motor_id, double lo, double hi, PosUnit unit) {
     double lo_t = to_turns(lo, unit);
     double hi_t = to_turns(hi, unit);
+    if (!std::isfinite(lo_t) || !std::isfinite(hi_t)) {
+        throw std::invalid_argument("position limits must be finite");
+    }
     if (lo_t > hi_t) std::swap(lo_t, hi_t);
     std::lock_guard<std::mutex> lk(limits_mtx_);
     limits_[motor_id] = Range{lo_t, hi_t};
@@ -1453,6 +1470,9 @@ bool HightorqueSerial::get_position_limit_turns(int motor_id, double& lo_turns, 
 }
 
 std::pair<double, int> HightorqueSerial::apply_position_limit_(int motor_id, double pos_turns) const {
+    if (!std::isfinite(pos_turns)) {
+        throw std::invalid_argument("position must be finite");
+    }
     std::lock_guard<std::mutex> lk(limits_mtx_);
     auto it = limits_.find(motor_id);
     if (it == limits_.end()) return {pos_turns, 0};
@@ -1635,6 +1655,7 @@ void HightorqueSerial::start_state_polling(
                 if (st) {
                     std::lock_guard<std::mutex> lk(cache_mtx_);
                     state_cache_[mid] = *st;
+                    state_update_time_[mid] = now_seconds();
                     updated.push_back(mid);
                 }
             }
@@ -1794,6 +1815,7 @@ void HightorqueSerial::dispatch_rcv_line_(const std::string& line) {
     {
         std::lock_guard<std::mutex> lk(cache_mtx_);
         state_cache_[motor_id] = *st_opt;
+        state_update_time_[motor_id] = now_seconds();
         update_seq_[motor_id]++;
     }
     {
@@ -1838,6 +1860,15 @@ std::map<int, MotorState> HightorqueSerial::get_states(const std::vector<int>& m
         if (it != state_cache_.end()) out[mid] = it->second;
     }
     return out;
+}
+
+double HightorqueSerial::get_state_age_ms(int motor_id) const {
+    std::lock_guard<std::mutex> lk(cache_mtx_);
+    auto it = state_update_time_.find(motor_id);
+    if (it == state_update_time_.end()) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return std::max(0.0, (now_seconds() - it->second) * 1000.0);
 }
 
 std::optional<MotorState> HightorqueSerial::wait_state(int motor_id, double timeout_s) {
