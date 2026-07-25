@@ -436,14 +436,30 @@ FafuRobotController::gripper_control(double angle, const GripperOpts& opts) {
     if (!core_->stream_link_ok()) {
         throw fafu::core::StateError(core_->dead_reason());
     }
+    if (opts.effort.has_value() &&
+        (*opts.effort < 1 || *opts.effort > 32767)) {
+        throw std::invalid_argument("effort must be in [1, 32767]");
+    }
+    if (opts.effort_threshold.has_value() &&
+        (*opts.effort_threshold < 1 || *opts.effort_threshold > 32767)) {
+        throw std::invalid_argument(
+            "effort_threshold must be in [1, 32767]");
+    }
+
+    std::optional<int> command_effort = opts.effort;
+    if (opts.effort_threshold.has_value()) {
+        command_effort = command_effort.has_value()
+            ? std::min(*command_effort, *opts.effort_threshold)
+            : opts.effort_threshold;
+    }
 
     double pos_turns = opts.is_radians ? rad_to_turns_(angle) : (angle / 360.0);
 
     {
         auto command = core_->command_guard();
-        if (opts.effort.has_value()) {
+        if (command_effort.has_value()) {
             ht_->set_pos_vel_tqe(gripper_motor_id_, pos_turns, opts.vel,
-                                 *opts.effort, hightorque::PosUnit::Turns);
+                                 *command_effort, hightorque::PosUnit::Turns);
         } else {
             ht_->set_pos_vel_acc(gripper_motor_id_, pos_turns, opts.vel,
                                  opts.acc, hightorque::PosUnit::Turns);
@@ -513,6 +529,14 @@ GraspResult FafuRobotController::grasp(const GraspOpts& opts) {
     if (!has_gripper_)
         throw std::runtime_error("FafuRobotController was constructed without a gripper");
 
+    if (opts.force_threshold < 1 || opts.force_threshold > 32767) {
+        throw std::invalid_argument("force_threshold must be in [1, 32767]");
+    }
+    const int effort_limit = opts.effort.value_or(opts.force_threshold);
+    if (effort_limit < 1 || effort_limit > 32767) {
+        throw std::invalid_argument("effort must be in [1, 32767]");
+    }
+
     double target_turns;
     if (opts.target_angle.has_value()) {
         target_turns = opts.is_radians ? rad_to_turns_(*opts.target_angle)
@@ -524,13 +548,8 @@ GraspResult FafuRobotController::grasp(const GraspOpts& opts) {
 
     {
         auto command = core_->command_guard();
-        if (opts.effort.has_value()) {
-            ht_->set_pos_vel_tqe(gripper_motor_id_, target_turns, opts.vel,
-                                 *opts.effort, hightorque::PosUnit::Turns);
-        } else {
-            ht_->set_pos_vel_acc(gripper_motor_id_, target_turns, opts.vel,
-                                 opts.acc, hightorque::PosUnit::Turns);
-        }
+        ht_->set_pos_vel_tqe(gripper_motor_id_, target_turns, opts.vel,
+                             effort_limit, hightorque::PosUnit::Turns);
     }
 
     double min_progress_turns = std::max(0.0, opts.min_close_deg) / 360.0;
@@ -621,16 +640,19 @@ void FafuRobotController::reset_zero(int motor_id, bool confirm) {
 // ============================================================================
 void FafuRobotController::close_connection(
         ReleaseMode joint_release, ReleaseMode gripper_release) {
-    if (!ht_ || !core_ ||
-        core_->state() == fafu::core::RobotState::Disconnected) {
-        return;
-    }
+    if (!ht_) return;
 
-    core_->shutdown(
-        to_finish_mode(joint_release),
-        to_finish_mode(gripper_release),
-        5.0);
-    ht_->close();
+    const bool needs_shutdown =
+        core_ && core_->state() != fafu::core::RobotState::Disconnected;
+    if (!needs_shutdown && !ht_->is_open()) return;
+
+    if (needs_shutdown) {
+        core_->shutdown(
+            to_finish_mode(joint_release),
+            to_finish_mode(gripper_release),
+            5.0);
+    }
+    if (ht_->is_open()) ht_->close();
 
     std::ostringstream message;
     message << "connection closed (joints="

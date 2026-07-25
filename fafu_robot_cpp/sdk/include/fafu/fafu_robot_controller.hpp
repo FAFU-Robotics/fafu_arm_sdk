@@ -88,15 +88,16 @@ enum class ReleaseMode {
 struct GraspResult {
     // 是否认为"抓到物体".
     //   true:  detected_object_force / detected_object_stall
-    //   false: reached_target / no_movement / timeout
+    //   false: reached_target / no_movement / timeout / cancelled
     bool        grasped = false;
 
-    // 触发停止的原因, 见下面 5 种字符串:
+    // 终止原因:
     //   "detected_object_force"  |torque| >= effort_threshold
     //   "detected_object_stall"  夹爪闭合 >= min_close_deg 后又停滞
     //   "reached_target"         到达 target_angle (无障碍)
     //   "no_movement"            停滞但闭合 < min_close_deg
     //   "timeout"                超时
+    //   "cancelled"              安全停止、关闭或通信丢失
     std::string reason;
 
     // 终止时的夹爪角度 (弧度)
@@ -327,7 +328,7 @@ public:
     //  夹爪控制 (仅 has_gripper=true 时可用)
     // ----------------------------------------------------------------------
     struct GripperOpts {
-        // 硬件层力矩上限 (raw int16). std::nullopt = 走 set_pos_vel_acc (无 effort 参数).
+        // 硬件层力矩上限 (raw int16, 1..32767). nullopt = 走 set_pos_vel_acc.
         std::optional<int> effort = std::nullopt;
 
         bool   is_radians      = true;
@@ -337,8 +338,9 @@ public:
         double timeout_s       = 8.0;
         double tolerance_deg   = 1.5;
 
-        // 软力控提前停的阈值 (raw int16 |torque|). std::nullopt = 不做.
-        // 用 grasp() 通常用 grasp 自带的 force_threshold, 不需要在这里设.
+        // 力检测阈值 (raw int16 |torque|, 1..32767). 提供时也会作为
+        // 固件力矩上限 (若 effort 更低则保留更低值), 避免提前返回后继续过力.
+        // 用 grasp() 时通常不需要在这里设置.
         std::optional<int> effort_threshold = std::nullopt;
     };
 
@@ -362,10 +364,10 @@ public:
         std::optional<double> target_angle = std::nullopt;
         bool                  is_radians   = true;
 
-        // *Python 侧* 力检测阈值 (raw int16). 见 GraspResult::reason 触发条件.
+        // 力检测阈值 (raw int16), 也作为默认的固件层力矩上限.
         int                   force_threshold = 500;
 
-        // 硬件层力矩上限 (raw int16). std::nullopt 表示不限.
+        // 可选的独立固件层力矩上限 (1..32767); nullopt 时使用 force_threshold.
         std::optional<int>    effort       = std::nullopt;
 
         double                vel          = 0.15;   // 闭合速度 (turns/s, 默认比 open 慢)

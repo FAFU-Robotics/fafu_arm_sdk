@@ -28,9 +28,9 @@ Conventions
   (``0 - 100``); this is mapped to a peak average velocity in
   turns/second.
 * The Fafu arm is a chain of independent motors driven over a
-  USB-CAN debug board; there is no built-in inverse kinematics.
-  ``move_p`` / ``move_l`` therefore raise :class:`NotImplementedError`
-  unless an external IK solver is plugged in.
+  USB-CAN debug board. Cartesian motion uses the optional Pinocchio
+  model configured through :meth:`setup_dynamics`; joint-space motion
+  remains available without it.
 
 Example
 -------
@@ -74,7 +74,6 @@ import functools
 import math
 from contextlib import nullcontext
 import os
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -84,13 +83,14 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 
 # ----------------------------------------------------------------------------
-#  Make sure fafu_motor.pyd next to this file is importable.
+#  Import the native extension as a package, with a direct-module fallback for
+#  legacy scripts that put this directory on sys.path.
 # ----------------------------------------------------------------------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-import fafu_motor as pm  # noqa: E402
+if __package__:
+    from . import fafu_motor as pm
+else:  # pragma: no cover - direct module import compatibility
+    import fafu_motor as pm
 
 # Optional: TOPPRA-based time-optimal interpolation (matches piper.py).
 try:
@@ -262,6 +262,7 @@ class GraspResult:
         * ``'no_movement'``         — stalled but barely moved (command
           may not have taken effect, or jaws were already shut)
         * ``'timeout'``             — neither condition met within ``timeout``
+        * ``'cancelled'``           — safety stop, close, or link loss
     angle_rad : float
         Final gripper angle (radians).
     closed_deg : float
@@ -600,20 +601,16 @@ class FafuRobotController:
         # Order is significant: set_motor_mode MUST run before
         # enable_async_rx so that the SDK can verify the mode echo.
         #
-        # enable() failure is NON-FATAL at construction: if a few motors
-        # are stuck (e.g. MIT 0x0B that only a hard power-cycle clears),
-        # crashing here locks the user out of the menu entirely — they
-        # can't even run diagnostics, retry, or operate the other joints.
-        # So warn loudly and continue; the offending joints simply won't
-        # move until recovered ([y] soft-reboot / power-cycle).
+        # enable() failure is non-fatal at construction so diagnostics and
+        # recovery remain available. The native core stops every motor and
+        # keeps motion disabled until a later enable() succeeds.
         if auto_enable:
             try:
                 self.enable()
             except Exception as e:
                 print(f"[FafuRobot] warning: enable() failed at startup: {e}")
-                print("[FafuRobot] continuing anyway so you can run diagnostics "
-                      "/ operate other joints; stuck joints won't move until "
-                      "recovered.")
+                print("[FafuRobot] motion remains disabled; run diagnostics, "
+                      "recover the fault, then call enable() again.")
 
         use_async = async_rx if async_rx is not None else bool(cfg.use_async_rx)
         polling_hz = max(10.0, float(cfg.control_rate_hz or 50.0))
@@ -663,7 +660,9 @@ class FafuRobotController:
         #            MIT is actuated; single-motor 0x15 is not).
         #   False -> legacy per-joint set_torque (0x0A), one frame per joint.
         # Auto-disabled when num_joints > 6 (one MIT frame holds <=6 motors).
-        self._use_group_mit: bool = (self.num_joints <= 6)
+        self._use_group_mit: bool = (
+            self.num_joints <= 6 and max(self._joint_motor_ids) <= 6
+        )
 
         print(
             f"[FafuRobot] connected on {self._port} @ {self._baudrate} "
@@ -1334,6 +1333,11 @@ class FafuRobotController:
         speed = self._clamp_speed(speed)
 
         style = (style or "scurve").strip().lower()
+        valid_styles = {"scurve", "linear", "acc"}
+        if style not in valid_styles:
+            raise ValueError(
+                f"style must be one of {sorted(valid_styles)}, got {style!r}"
+            )
 
         if style == "linear":
             tol_turns = abs(tolerance) / (_TWO_PI if is_radians else 360.0)
@@ -1542,11 +1546,11 @@ class FafuRobotController:
                 f"got shape {path_arr.shape}"
             )
 
-        if self.num_joints > 6:
+        if self.num_joints > 6 or max(self._joint_motor_ids) > 6:
             raise RuntimeError(
-                f"move_jntspace_path_mit needs <=6 joints, but "
-                f"num_joints={self.num_joints}. Exclude the gripper "
-                f"(gripper_motor_id) so only manipulator joints stream.")
+                "move_jntspace_path_mit requires at most six joint motors "
+                "with IDs in 1..6; configure joint_motor_ids accordingly"
+            )
 
         tpply = pwp.PiecewisePolyTOPPRA()
         interpolated = tpply.interpolate_by_max_spdacc(
@@ -1569,11 +1573,6 @@ class FafuRobotController:
             print("[FafuRobot] move_jntspace_path_mit: gravity_ff requested but "
                   "no dynamics model; streaming kp/kd only (setup_dynamics to "
                   "add gravity feed-forward).")
-
-        # Active mode so 0x8093 MIT frames are actuated.
-        # The operation guard already owns MOVING, so call the internal
-        # implementation instead of the public enable() state transition.
-        self._enable_impl(allow_motor_reset=True)
 
         dt = max(0.005, control_frequency)
         _to_rad = 1.0 if is_radians else (math.pi / 180.0)
@@ -1618,9 +1617,6 @@ class FafuRobotController:
         core = getattr(self, "_core", None)
         if core is None:
             raise RuntimeError("native RobotCore is not initialized")
-        if core.is_servoing:
-            return
-
         opts = ServoOpts(**vars(opts)) if opts is not None else ServoOpts()
         native = pm.ServoOptions()
         native.watchdog_ms = int(opts.watchdog_ms)
@@ -2399,7 +2395,11 @@ class FafuRobotController:
         tau = tau * self._dyn_torque_scale
 
         with self._command_guard():
-            if self._use_group_mit and self.num_joints <= 6:
+            if (
+                self._use_group_mit
+                and self.num_joints <= 6
+                and max(self._joint_motor_ids) <= 6
+            ):
                 # One 0x8093 frame, kp=kd=0 => pure torque feed-forward.
                 raw = self.tau_to_raw(tau)
                 zeros = [0.0] * self.num_joints
@@ -2497,11 +2497,11 @@ class FafuRobotController:
         """
         self._require_stream_command("move_MIT")
         n = self.num_joints
-        if n > 6:
+        if n > 6 or max(self._joint_motor_ids) > 6:
             raise RuntimeError(
-                f"move_MIT: group MIT frame holds <=6 motors, but "
-                f"num_joints={n}. Use --gripper-id so the gripper is excluded, "
-                f"or drive extra joints on a separate frame.")
+                "move_MIT requires at most six joint motors with IDs in 1..6; "
+                "configure joint_motor_ids accordingly"
+            )
         pos = np.asarray(list(pos), dtype=float)
         vel = np.asarray(list(vel), dtype=float)
         tau = np.asarray(list(tau), dtype=float)
@@ -3333,30 +3333,43 @@ class FafuRobotController:
         tolerance_deg : float, optional
             "Reached" tolerance in degrees.  Defaults to 1.5 deg.
         effort_threshold : int, optional
-            Raw int16 ``|torque|`` value that, when exceeded while
-            blocking, causes an early return.  This is the lightweight
-            "did I grab something?" check.  When ``None`` (default)
-            only position / stall / timeout are used.  When given,
-            this method returns a :class:`GraspResult` describing the
-            outcome; otherwise it returns ``None`` for backwards
-            compatibility with the Piper-style void signature.
+            Raw int16 ``|torque|`` value that triggers force detection.
+            When provided, it also limits the firmware command (or lowers
+            ``effort`` when that is smaller) so returning early cannot
+            leave an over-force command active. The method then returns a
+            :class:`GraspResult`; otherwise it returns ``None`` for
+            backwards compatibility.
 
         Returns
         -------
         GraspResult or None
-            A :class:`GraspResult` iff ``block=True`` AND a stop
-            reason was recorded (i.e. ``effort_threshold`` was given,
-            or the stall / target conditions fired). Returns ``None``
-            otherwise.
+            A :class:`GraspResult` only when ``block=True`` and
+            ``effort_threshold`` is provided; otherwise ``None`` for
+            backwards compatibility.
         """
         if not self._has_gripper:
             raise RuntimeError(
                 "FafuRobotController was constructed without a gripper"
             )
+        effort_limit = None if effort is None else int(effort)
+        if effort_limit is not None and not 1 <= effort_limit <= 32767:
+            raise ValueError("effort must be in [1, 32767]")
+        threshold = (
+            None if effort_threshold is None else int(effort_threshold)
+        )
+        if threshold is not None and not 1 <= threshold <= 32767:
+            raise ValueError("effort_threshold must be in [1, 32767]")
+        command_effort = effort_limit
+        if threshold is not None:
+            command_effort = (
+                threshold if command_effort is None
+                else min(command_effort, threshold)
+            )
+
         pos_turns = self._rad_to_turns(angle) if is_radians else angle / 360.0
 
         with self._command_guard():
-            if effort is None:
+            if command_effort is None:
                 self._ht.set_pos_vel_acc(
                     self._gripper_motor_id,
                     pos_turns,
@@ -3369,7 +3382,7 @@ class FafuRobotController:
                     self._gripper_motor_id,
                     pos_turns,
                     float(vel),
-                    int(effort),
+                    command_effort,
                     pm.PosUnit.Turns,
                 )
 
@@ -3383,9 +3396,9 @@ class FafuRobotController:
             pos_turns,
             timeout=float(timeout),
             tolerance_turns=tolerance_deg / 360.0,
-            effort_threshold=effort_threshold,
+            effort_threshold=threshold,
         )
-        if effort_threshold is None:
+        if threshold is None:
             return None
         return result
 
@@ -3553,16 +3566,15 @@ class FafuRobotController:
 
         This is the Fafu-side equivalent of Piper's
         ``close_gripper(effort=...)``: it commands the gripper toward
-        the closing direction and stops as soon as the **measured**
+        the closing direction and returns as soon as the **measured**
         torque exceeds ``force_threshold`` (or the gripper plateaus
         at finite stiffness against an object).
 
-        Because Fafu's firmware does not implement the position
-        + effort loop itself, the detection logic runs in Python by
-        polling ``MotorState.torque`` from the background poller
-        (``start_state_polling``).  This is good enough for catching
-        objects but is **not** a substitute for a real wrist F/T
-        sensor.
+        Contact detection runs in Python by polling ``MotorState.torque``
+        from the background poller. The firmware command always includes a
+        torque cap, so polling latency cannot exceed that configured limit.
+        This is useful for catching objects but is **not** a substitute for
+        a real wrist F/T sensor.
 
         Parameters
         ----------
@@ -3579,17 +3591,15 @@ class FafuRobotController:
             running an empty close and noting the steady-state torque.
         effort : int, optional
             Torque cap passed to the **firmware** via
-            ``set_pos_vel_tqe`` (raw int16).  When ``None`` the
-            firmware uses its default current limit.  Pass this if
-            you also want a hard hardware-level torque ceiling, not
-            just the soft Python-side trip wire.
+            ``set_pos_vel_tqe`` (raw int16). When ``None``,
+            ``force_threshold`` is also used as the hard cap.
         vel : float, optional
             Closing velocity in turns/s.  Defaults to 0.15 turns/s
             (deliberately slower than ``open_gripper`` so that
             contact is gentle).
         acc : float, optional
-            Acceleration limit in turns/s^2.  Ignored when ``effort``
-            is provided (``set_pos_vel_tqe`` has no acceleration arg).
+            Retained for API compatibility; grasp uses the torque-capped
+            ``set_pos_vel_tqe`` command, which has no acceleration field.
         timeout : float, optional
             Maximum wall-clock seconds to wait.
         min_close_deg : float, optional
@@ -3629,6 +3639,13 @@ class FafuRobotController:
                 "FafuRobotController was constructed without a gripper"
             )
 
+        threshold = int(force_threshold)
+        if not 1 <= threshold <= 32767:
+            raise ValueError("force_threshold must be in [1, 32767]")
+        effort_limit = threshold if effort is None else int(effort)
+        if not 1 <= effort_limit <= 32767:
+            raise ValueError("effort must be in [1, 32767]")
+
         if target_angle is None:
             lo_t, _ = self._gripper_limit_turns()
             target_turns = lo_t if lo_t is not None else -0.25
@@ -3639,27 +3656,18 @@ class FafuRobotController:
             )
 
         with self._command_guard():
-            if effort is None:
-                self._ht.set_pos_vel_acc(
-                    self._gripper_motor_id,
-                    target_turns,
-                    float(vel),
-                    float(acc),
-                    pm.PosUnit.Turns,
-                )
-            else:
-                self._ht.set_pos_vel_tqe(
-                    self._gripper_motor_id,
-                    target_turns,
-                    float(vel),
-                    int(effort),
-                    pm.PosUnit.Turns,
-                )
+            self._ht.set_pos_vel_tqe(
+                self._gripper_motor_id,
+                target_turns,
+                float(vel),
+                effort_limit,
+                pm.PosUnit.Turns,
+            )
 
         return self._wait_until_gripper_done(
             target_turns,
             timeout=float(timeout),
-            effort_threshold=int(force_threshold),
+            effort_threshold=threshold,
             min_progress_turns=max(0.0, float(min_close_deg)) / 360.0,
         )
 
@@ -3864,15 +3872,20 @@ class FafuRobotController:
         core = getattr(self, "_core", None)
         if core is None:
             raise RuntimeError("native RobotCore is not initialized")
-        if core.state == pm.RobotState.DISCONNECTED:
+
+        needs_shutdown = core.state != pm.RobotState.DISCONNECTED
+        port_open = self._ht.is_open()
+        if not needs_shutdown and not port_open:
             return
 
-        core.shutdown(
-            self._core_finish_mode(joint_release),
-            self._core_finish_mode(gripper_release),
-            5.0,
-        )
-        self._ht.close()
+        if needs_shutdown:
+            core.shutdown(
+                self._core_finish_mode(joint_release),
+                self._core_finish_mode(gripper_release),
+                5.0,
+            )
+        if self._ht.is_open():
+            self._ht.close()
         self._servo_active = False
         self._sync_state_from_core()
         print(f"[FafuRobot] connection closed "
@@ -4043,7 +4056,7 @@ class FafuRobotController:
 
         while True:
             now = time.monotonic()
-            if self._native_cancel_requested():
+            if self._native_cancel_requested() or not self._stream_link_ok():
                 return self._make_grasp_result(
                     reason="cancelled", grasped=False,
                     last_pos=last_pos, start_pos=start_pos,

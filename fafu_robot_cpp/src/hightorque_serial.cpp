@@ -2076,6 +2076,15 @@ int HightorqueSerial::run_control_loop(const ControlLoopOptions& opt, ControlTic
             } catch (...) {
             }
         }
+    } catch (...) {
+        return_code = 2;
+        if (opt.on_exception) {
+            try {
+                const std::runtime_error error("unknown control-loop exception");
+                opt.on_exception(error);
+            } catch (...) {
+            }
+        }
     }
 
     const bool should_stop =

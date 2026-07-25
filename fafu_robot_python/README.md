@@ -191,12 +191,15 @@ arm.grasp(force_threshold=500,                    # 力控抓取
           effort=None, vel=0.15, timeout=5.0)     # → GraspResult
 ```
 
+`grasp` 默认同时把 `force_threshold` 作为固件力矩上限；显式 `effort`
+可设置更低的硬上限，避免 Python 检测延迟造成过力。
+
 `GraspResult` 字段：
 
 | 字段 | 含义 |
 |---|---|
 | `grasped` | `True` = 抓到物体 |
-| `reason` | `'detected_object_force'` / `'detected_object_stall'` / `'reached_target'` / `'no_movement'` / `'timeout'` |
+| `reason` | `'detected_object_force'` / `'detected_object_stall'` / `'reached_target'` / `'no_movement'` / `'timeout'` / `'cancelled'` |
 | `angle_rad` | 停止时夹爪角度 |
 | `closed_deg` | 从起始位置闭合了多少度 |
 | `peak_torque_raw` | 整个过程力矩峰值（raw int16） |

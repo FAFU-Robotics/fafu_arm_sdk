@@ -21,10 +21,34 @@ class _PosUnit(Enum):
     Degrees = 2
 
 
+class _ServoChannel(Enum):
+    POSITION = 0
+    MIT = 1
+
+
+class _ServoOptions:
+    pass
+
+
+class _NativeRobotState(Enum):
+    DISCONNECTED = 0
+    IDLE = 1
+
+
+class _FinishMode(Enum):
+    STOP = 0
+    BRAKE = 1
+    HOLD = 2
+
+
 # The controller imports the native extension at module import time. These unit
 # tests exercise Python policy only, so provide the smallest compatible module.
 _fake_motor = types.ModuleType("fafu_motor")
 _fake_motor.PosUnit = _PosUnit
+_fake_motor.ServoChannel = _ServoChannel
+_fake_motor.ServoOptions = _ServoOptions
+_fake_motor.RobotState = _NativeRobotState
+_fake_motor.FinishMode = _FinishMode
 _fake_motor.gain_to_raw = lambda gain, _model: int(round(gain * 10.0 * 2.0 * np.pi))
 _fake_motor.torques_to_raw = lambda values, _models, scale=1.0: [
     int(round(value * scale / 0.01)) for value in values
@@ -46,6 +70,8 @@ class _FakeDriver:
         self.ages = dict(ages or {1: 0.0, 2: 0.0})
         self.responses = dict(responses or {1: object(), 2: object()})
         self.mit_calls = []
+        self.pos_vel_tqe_calls = []
+        self.open = True
 
     def is_async_rx(self):
         return True
@@ -66,6 +92,15 @@ class _FakeDriver:
     def set_many_mit(self, *args):
         self.mit_calls.append(args)
         return {}
+
+    def set_pos_vel_tqe(self, *args):
+        self.pos_vel_tqe_calls.append(args)
+
+    def is_open(self):
+        return self.open
+
+    def close(self):
+        self.open = False
 
 
 def _make_arm(*, state=None, ages=None, responses=None):
@@ -91,6 +126,8 @@ def _make_arm(*, state=None, ages=None, responses=None):
     arm._dyn_motor_models = None
     arm._use_group_mit = True
     arm._pin_model = None
+    arm._has_gripper = True
+    arm._gripper_motor_id = 7
     return arm
 
 
@@ -210,6 +247,63 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertEqual(result, {})
         self.assertEqual(len(arm._ht.mit_calls), 1)
 
+    def test_move_j_rejects_unknown_style_without_sending(self):
+        arm = _make_arm()
+
+        with self.assertRaisesRegex(ValueError, "style must be one of"):
+            arm.move_j([0.0, 0.0], style="typo")
+
+        self.assertEqual(arm._ht.mit_calls, [])
+
+    def test_servo_start_always_delegates_ownership_to_native_core(self):
+        arm = _make_arm()
+        core = mock.Mock()
+        core.is_servoing = True
+        arm._core = core
+        arm._sync_state_from_core = mock.Mock()
+
+        arm.servo_start()
+
+        core.servo_start.assert_called_once()
+        self.assertIsInstance(
+            core.servo_start.call_args.args[0], _ServoOptions
+        )
+
+    def test_grasp_defaults_to_force_threshold_as_firmware_cap(self):
+        arm = _make_arm()
+        expected = controller.GraspResult(
+            grasped=True,
+            reason="detected_object_force",
+            angle_rad=0.0,
+            closed_deg=5.0,
+            peak_torque_raw=321,
+            duration_s=0.1,
+        )
+        arm._wait_until_gripper_done = mock.Mock(return_value=expected)
+
+        result = arm.grasp(force_threshold=321)
+        generic_result = arm.gripper_control(
+            0.0, effort=500, effort_threshold=222
+        )
+
+        self.assertIs(result, expected)
+        self.assertIs(generic_result, expected)
+        self.assertEqual(len(arm._ht.pos_vel_tqe_calls), 2)
+        self.assertEqual(arm._ht.pos_vel_tqe_calls[0][3], 321)
+        self.assertEqual(arm._ht.pos_vel_tqe_calls[1][3], 222)
+
+    def test_gripper_limits_are_validated_without_sending(self):
+        arm = _make_arm()
+
+        with self.assertRaisesRegex(ValueError, "force_threshold"):
+            arm.grasp(force_threshold=0)
+        with self.assertRaisesRegex(ValueError, "effort"):
+            arm.grasp(force_threshold=100, effort=0)
+        with self.assertRaisesRegex(ValueError, "effort_threshold"):
+            arm.gripper_control(0.0, effort_threshold=-1)
+
+        self.assertEqual(arm._ht.pos_vel_tqe_calls, [])
+
     def test_fault_recovery_waits_for_inflight_operation_exit(self):
         arm = _make_arm()
         owns = arm._enter_operation("move", controller.RobotState.MOVING)
@@ -245,17 +339,46 @@ class ControllerSafetyTests(unittest.TestCase):
         arm.servo_end.assert_not_called()
         self.assertIs(arm.state, controller.RobotState.IDLE)
 
-    def test_mit_path_uses_internal_enable_while_guard_owns_moving(self):
+    def test_close_retries_driver_after_core_is_disconnected(self):
         arm = _make_arm()
-        enable_states = []
+
+        class FailOnceDriver(_FakeDriver):
+            def __init__(self):
+                super().__init__()
+                self.close_attempts = 0
+
+            def close(self):
+                self.close_attempts += 1
+                if self.close_attempts == 1:
+                    raise OSError("close failed")
+                self.open = False
+
+        driver = FailOnceDriver()
+        core = types.SimpleNamespace(
+            state=_NativeRobotState.IDLE,
+            dead_reason="",
+            shutdown=mock.Mock(),
+        )
+
+        def shutdown(*args):
+            del args
+            core.state = _NativeRobotState.DISCONNECTED
+
+        core.shutdown.side_effect = shutdown
+        arm._ht = driver
+        arm._core = core
+
+        with self.assertRaisesRegex(OSError, "close failed"):
+            arm.close_connection()
+        arm.close_connection()
+
+        core.shutdown.assert_called_once()
+        self.assertEqual(driver.close_attempts, 2)
+        self.assertFalse(driver.is_open())
+
+    def test_mit_path_does_not_nest_enable_inside_moving(self):
+        arm = _make_arm()
         mit_states = []
-
-        def internal_enable(*, allow_motor_reset):
-            self.assertTrue(allow_motor_reset)
-            enable_states.append(arm.state)
-
-        def public_enable_should_not_run(*args, **kwargs):
-            raise AssertionError("public enable() must not run inside MOVING")
 
         def record_mit(*args, **kwargs):
             del args, kwargs
@@ -266,8 +389,8 @@ class ControllerSafetyTests(unittest.TestCase):
             def interpolate_by_max_spdacc(self, **kwargs):
                 return np.asarray(kwargs["path"], dtype=float)
 
-        arm._enable_impl = internal_enable
-        arm.enable = public_enable_should_not_run
+        arm._enable_impl = mock.Mock()
+        arm.enable = mock.Mock()
         arm.move_MIT = record_mit
         fake_pwp = types.SimpleNamespace(PiecewisePolyTOPPRA=FakeInterpolator)
 
@@ -281,7 +404,8 @@ class ControllerSafetyTests(unittest.TestCase):
                 gravity_ff=False,
             )
 
-        self.assertEqual(enable_states, [controller.RobotState.MOVING])
+        arm._enable_impl.assert_not_called()
+        arm.enable.assert_not_called()
         self.assertEqual(len(mit_states), 4)
         self.assertTrue(all(state is controller.RobotState.MOVING for state in mit_states))
         self.assertIs(arm.state, controller.RobotState.IDLE)
