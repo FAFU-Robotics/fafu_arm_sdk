@@ -50,11 +50,13 @@ public:
                          double polling_rate_hz = 0.0);
     void stop_transport();
 
-    EnableResult enable(const EnableOptions& options = {});
+    EnableResult enable();
+    EnableResult enable(const EnableOptions& options);
     void disable();
     void brake();
     void emergency_stop();
-    bool resume(const EnableOptions& options = {});
+    bool resume();
+    bool resume(const EnableOptions& options);
     bool check_alive(bool fresh = true, double timeout_s = 0.1);
     bool recover(bool confirm, double timeout_s = 0.2);
 
@@ -62,10 +64,12 @@ public:
     void set_stale_feedback_timeout_ms(double timeout_ms);
     bool stream_link_ok();
 
-    void servo_start(const ServoOptions& options = {});
+    void servo_start();
+    void servo_start(const ServoOptions& options);
+    ServoTickResult servo_tick(const std::vector<double>& target_angles);
     ServoTickResult servo_tick(
         const std::vector<double>& target_angles,
-        const std::vector<double>& torque_ff_nm = {});
+        const std::vector<double>& torque_ff_nm);
     ServoSummary servo_end(FinishMode finish_mode = FinishMode::Hold);
     bool is_servoing() const;
     ServoSummary servo_summary() const;

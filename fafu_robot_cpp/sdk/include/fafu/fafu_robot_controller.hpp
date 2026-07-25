@@ -160,7 +160,8 @@ public:
     //   7. opts.auto_polling: start_state_polling
     //
     // 抛: std::runtime_error (配置错误 / 串口打不开 / 电机不响应)
-    explicit FafuRobotController(const std::string& cfg_path, const Options& opts = {});
+    explicit FafuRobotController(const std::string& cfg_path);
+    explicit FafuRobotController(const std::string& cfg_path, const Options& opts);
 
     // 析构会自动调 close_connection({Stop, Brake}) (跟 Python __exit__ 一致).
     ~FafuRobotController();
@@ -212,7 +213,8 @@ public:
     // 把所有 *关节* 电机驱动到 joint_angles. 夹爪 (若 has_gripper) 保持当前位置.
     //   joint_angles.size() 必须 == num_joints()
     // 阻塞模式下走 S-curve + run_control_loop, 至少 0.3s; 非阻塞模式下一帧 set_many_pos_vel_tqe.
-    bool move_j(const std::vector<double>& joint_angles, const MoveOpts& opts = {});
+    bool move_j(const std::vector<double>& joint_angles);
+    bool move_j(const std::vector<double>& joint_angles, const MoveOpts& opts);
 
     // 所有关节归零 (joint_angles = {0, 0, ...}).
     bool go_home(int speed = 20, bool block = true);
@@ -296,7 +298,8 @@ public:
     // - 把 watchdog 写到每个关节电机 (夹爪不参与 servo, 不写)
     // - 强制 async_rx (没启过就启) + 确保 polling 在跑
     // - 抓取当前位置作为 last_target_, 这样首次 servo_j 不会 step clamp
-    void servo_start(const ServoOpts& opts = {});
+    void servo_start();
+    void servo_start(const ServoOpts& opts);
 
     // 单次 servo (非阻塞, 立即返回).
     // 返回:
@@ -347,17 +350,18 @@ public:
     // 驱动夹爪到指定 angle (弧度 / 度), Piper 风格 (angle + effort).
     // 如果 block=true 且 effort_threshold 非空, 返回的 GraspResult 描述结果.
     // 否则返回 std::nullopt (兼容 Piper 的 void 返回).
+    std::optional<GraspResult> gripper_control(double angle);
     std::optional<GraspResult> gripper_control(double angle,
-                                               const GripperOpts& opts = {});
+                                               const GripperOpts& opts);
 
     // 把夹爪 *打开* (= 朝软限位上限走). angle=nullopt 时直接走上限.
     // 注意: Fafu 夹爪是 "更开 = 角度更大 (less negative)".
-    bool open_gripper(std::optional<double> angle = std::nullopt,
-                      const GripperOpts& opts = {});
+    bool open_gripper(std::optional<double> angle = std::nullopt);
+    bool open_gripper(std::optional<double> angle, const GripperOpts& opts);
 
     // 把夹爪 *关闭* (= 朝软限位下限走).
-    bool close_gripper(std::optional<double> angle = std::nullopt,
-                       const GripperOpts& opts = {});
+    bool close_gripper(std::optional<double> angle = std::nullopt);
+    bool close_gripper(std::optional<double> angle, const GripperOpts& opts);
 
     struct GraspOpts {
         // 关闭目标角度. std::nullopt 时用软限位下限.
@@ -378,10 +382,12 @@ public:
 
     // 力控抓取: 朝关闭方向走, 一旦 |torque| >= force_threshold 立即返回 grasped=true.
     // 抛 std::runtime_error: 控制器无夹爪.
-    GraspResult grasp(const GraspOpts& opts = {});
+    GraspResult grasp();
+    GraspResult grasp(const GraspOpts& opts);
 
     // grasp 的对称操作 — 把夹爪打开释放物体. 内部就是 open_gripper().
-    void release(const GripperOpts& opts = {});
+    void release();
+    void release(const GripperOpts& opts);
 
     // 夹爪当前状态. 抛: 没夹爪 / 没收到回执.
     hightorque::MotorState get_gripper_state();

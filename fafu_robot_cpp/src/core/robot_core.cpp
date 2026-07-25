@@ -461,6 +461,10 @@ EnableResult RobotCore::switch_to_active(const EnableOptions& options) {
     return result;
 }
 
+EnableResult RobotCore::enable() {
+    return enable(EnableOptions{});
+}
+
 EnableResult RobotCore::enable(const EnableOptions& options) {
     OperationLease operation(controller_state_, OperationKind::Lifecycle);
     EnableResult result = switch_to_active(options);
@@ -525,6 +529,10 @@ void RobotCore::emergency_stop() {
     controller_state_.latch_estop();
     std::lock_guard<std::mutex> command(command_mutex_);
     release_motors_unlocked(config_.all_motor_ids, FinishMode::Stop);
+}
+
+bool RobotCore::resume() {
+    return resume(EnableOptions{});
 }
 
 bool RobotCore::resume(const EnableOptions& options) {
@@ -738,6 +746,10 @@ std::vector<double> RobotCore::expand_gains(
     return values;
 }
 
+void RobotCore::servo_start() {
+    servo_start(ServoOptions{});
+}
+
 void RobotCore::servo_start(const ServoOptions& options) {
     if (state() == RobotState::Disabled || state() == RobotState::Braked) {
         const EnableResult enabled = enable();
@@ -833,6 +845,11 @@ void RobotCore::servo_start(const ServoOptions& options) {
         controller_state_.end(token);
         throw;
     }
+}
+
+ServoTickResult RobotCore::servo_tick(
+        const std::vector<double>& target_angles) {
+    return servo_tick(target_angles, std::vector<double>{});
 }
 
 ServoTickResult RobotCore::servo_tick(

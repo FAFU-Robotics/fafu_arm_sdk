@@ -203,7 +203,8 @@ void bind_core(py::module_& module) {
              py::call_guard<py::gil_scoped_release>())
         .def("stop_transport", &RobotCore::stop_transport,
              py::call_guard<py::gil_scoped_release>())
-        .def("enable", &RobotCore::enable,
+        .def("enable",
+             py::overload_cast<const EnableOptions&>(&RobotCore::enable),
              py::arg("options") = EnableOptions{},
              py::call_guard<py::gil_scoped_release>())
         .def("disable", &RobotCore::disable,
@@ -212,7 +213,8 @@ void bind_core(py::module_& module) {
              py::call_guard<py::gil_scoped_release>())
         .def("emergency_stop", &RobotCore::emergency_stop,
              py::call_guard<py::gil_scoped_release>())
-        .def("resume", &RobotCore::resume,
+        .def("resume",
+             py::overload_cast<const EnableOptions&>(&RobotCore::resume),
              py::arg("options") = EnableOptions{},
              py::call_guard<py::gil_scoped_release>())
         .def("check_alive", &RobotCore::check_alive,
@@ -229,10 +231,13 @@ void bind_core(py::module_& module) {
              py::arg("timeout_ms"))
         .def("stream_link_ok", &RobotCore::stream_link_ok,
              py::call_guard<py::gil_scoped_release>())
-        .def("servo_start", &RobotCore::servo_start,
+        .def("servo_start",
+             py::overload_cast<const ServoOptions&>(&RobotCore::servo_start),
              py::arg("options") = ServoOptions{},
              py::call_guard<py::gil_scoped_release>())
-        .def("servo_tick", &RobotCore::servo_tick,
+        .def("servo_tick",
+             py::overload_cast<const std::vector<double>&,
+                               const std::vector<double>&>(&RobotCore::servo_tick),
              py::arg("target_angles"),
              py::arg("torque_ff_nm") = std::vector<double>{},
              py::call_guard<py::gil_scoped_release>())
