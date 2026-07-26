@@ -62,7 +62,7 @@ RobotCore::RobotCore(hightorque::HightorqueSerial& serial, CoreConfig config)
 RobotCore::~RobotCore() {
     try {
         if (state() != RobotState::Disconnected) {
-            shutdown(FinishMode::Stop, FinishMode::Brake, 1.0);
+            shutdown(FinishMode::Brake, FinishMode::Brake, 1.0);
         }
     } catch (...) {
         try {
@@ -520,6 +520,37 @@ void RobotCore::brake() {
     controller_state_.transition(RobotState::Braked);
 }
 
+void RobotCore::brake_active_operation() {
+    if (!controller_state_.operation_owned_by_current_thread()) {
+        throw BusyError(
+            "active-operation brake must be requested by its owner thread");
+    }
+    const OperationKind operation = active_operation();
+    if (operation != OperationKind::JointMotion &&
+        operation != OperationKind::RawStream) {
+        throw StateError(
+            "active-operation brake is only valid for motion operations");
+    }
+
+    std::lock_guard<std::mutex> command(command_mutex_);
+    if (is_latched_or_disconnected(state())) {
+        return;
+    }
+
+    release_motors_unlocked(config_.all_motor_ids, FinishMode::Brake);
+    try {
+        controller_state_.transition(RobotState::Braked);
+    } catch (...) {
+        // A safety latch may win after the state check while waiting for this
+        // command lease. Its serialized ESTOP=STOP / DEAD=BRAKE action runs
+        // after this lock is released and must remain authoritative.
+        if (is_latched_or_disconnected(state())) {
+            return;
+        }
+        throw;
+    }
+}
+
 void RobotCore::emergency_stop() {
     std::lock_guard<std::mutex> safety(safety_mutex_);
     if (state() == RobotState::Disconnected) {
@@ -582,7 +613,8 @@ std::vector<int> RobotCore::stale_joint_ids() const {
 
 void RobotCore::latch_dead(const std::vector<int>& stale) {
     std::lock_guard<std::mutex> safety(safety_mutex_);
-    if (state() == RobotState::Disconnected) {
+    if (state() == RobotState::Disconnected ||
+        state() == RobotState::Estop) {
         return;
     }
     safety_generation_.fetch_add(1, std::memory_order_acq_rel);
@@ -590,11 +622,12 @@ void RobotCore::latch_dead(const std::vector<int>& stale) {
         stale_message(stale, stale_feedback_timeout_ms_.load(
             std::memory_order_acquire)));
     std::lock_guard<std::mutex> command(command_mutex_);
-    release_motors_unlocked(config_.all_motor_ids, FinishMode::Stop);
+    release_motors_unlocked(config_.all_motor_ids, FinishMode::Brake);
 }
 
 bool RobotCore::stream_link_ok() {
-    if (state() == RobotState::Dead ||
+    if (state() == RobotState::Estop ||
+        state() == RobotState::Dead ||
         state() == RobotState::Disconnected) {
         return false;
     }
@@ -665,8 +698,8 @@ bool RobotCore::recover(bool confirm, double timeout_s) {
     }
     {
         std::lock_guard<std::mutex> command(command_mutex_);
-        release_motors_unlocked(config_.all_motor_ids, FinishMode::Stop);
-        controller_state_.clear_latched(RobotState::Disabled);
+        release_motors_unlocked(config_.all_motor_ids, FinishMode::Brake);
+        controller_state_.clear_latched(RobotState::Braked);
     }
     return true;
 }
@@ -712,6 +745,11 @@ ServoOptions RobotCore::normalize_servo_options(ServoOptions options) {
     }
     if (!std::isfinite(options.max_lag_rad)) {
         throw std::invalid_argument("max_lag_rad must be finite");
+    }
+    if (!std::isfinite(options.position_error_deadband_rad) ||
+        options.position_error_deadband_rad < 0.0) {
+        throw std::invalid_argument(
+            "position_error_deadband_rad must be finite and non-negative");
     }
     if (!std::isfinite(options.nominal_rate_hz) ||
         options.nominal_rate_hz <= 0.0) {
@@ -932,13 +970,39 @@ ServoTickResult RobotCore::servo_tick(
         positions = target_turns;
     }
 
-    // Position frames use this as a positive velocity limit. MIT frames use
-    // it as a signed desired velocity and therefore must default to zero.
-    std::vector<double> velocities(
-        count,
-        options.channel == ServoChannel::Position
-            ? max_velocity_turns_s : 0.0);
-    if (options.feedforward_velocity) {
+    std::vector<double> velocities(count, 0.0);
+    if (options.channel == ServoChannel::Position) {
+        // The 0x8090 Position channel interprets velocity as a non-negative
+        // limit, not a signed setpoint. With adaptive feed-forward enabled,
+        // retain enough authority to follow the path and to catch residual
+        // measured error; settle to zero only inside the configured deadband.
+        if (!options.feedforward_velocity) {
+            std::fill(
+                velocities.begin(), velocities.end(),
+                max_velocity_turns_s);
+        } else {
+            const double deadband_turns =
+                options.position_error_deadband_rad / kTwoPi;
+            for (std::size_t i = 0; i < count; ++i) {
+                const double path_speed = std::abs(
+                    (positions[i] - servo_.filtered_target_turns[i]) / dt_s);
+                double catchup_speed = 0.0;
+                const auto motor =
+                    io_.cached_state(config_.joint_motor_ids[i]);
+                if (motor) {
+                    const double error =
+                        std::abs(positions[i] - motor->position);
+                    if (error > deadband_turns) {
+                        catchup_speed = error / dt_s;
+                    }
+                }
+                velocities[i] = std::clamp(
+                    std::max(path_speed, catchup_speed),
+                    0.0, max_velocity_turns_s);
+            }
+        }
+    } else if (options.feedforward_velocity) {
+        // MIT velocity is a signed desired velocity.
         for (std::size_t i = 0; i < count; ++i) {
             const double velocity =
                 (positions[i] - servo_.filtered_target_turns[i]) / dt_s;
@@ -1034,10 +1098,10 @@ ServoSummary RobotCore::end_servo_locked(
         }
 
         const RobotState current = state();
-        if (current == RobotState::Estop ||
-            current == RobotState::Dead ||
-            current == RobotState::Disconnected) {
+        if (current == RobotState::Estop) {
             finish_mode = FinishMode::Stop;
+        } else if (current == RobotState::Dead) {
+            finish_mode = FinishMode::Brake;
         }
         if (finish_mode == FinishMode::Hold) {
             if (servo_.options.channel == ServoChannel::Mit) {
@@ -1124,9 +1188,16 @@ void RobotCore::shutdown(
 
     stop_transport();
     std::lock_guard<std::mutex> command(command_mutex_);
-    if (state() == RobotState::Estop || state() == RobotState::Dead) {
+    const RobotState current = state();
+    if (current == RobotState::Disconnected) {
+        return;
+    }
+    if (current == RobotState::Estop) {
         joint_release = FinishMode::Stop;
         auxiliary_release = FinishMode::Stop;
+    } else if (current == RobotState::Dead) {
+        joint_release = FinishMode::Brake;
+        auxiliary_release = FinishMode::Brake;
     }
     release_motors_unlocked(config_.joint_motor_ids, joint_release);
 

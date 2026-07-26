@@ -14,8 +14,20 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(fafu_linux_serial_exclusive_tests
         PRIVATE serial_cmake
     )
+
+    add_executable(fafu_linux_serial_polling_tests
+        test_linux_serial_polling.cpp
+    )
+    target_link_libraries(fafu_linux_serial_polling_tests
+        PRIVATE hightorque_serial_debug
+    )
+
     add_test(
         NAME fafu_linux_serial_exclusive_tests
         COMMAND fafu_linux_serial_exclusive_tests
+    )
+    add_test(
+        NAME fafu_linux_serial_polling_tests
+        COMMAND fafu_linux_serial_polling_tests
     )
 endif()

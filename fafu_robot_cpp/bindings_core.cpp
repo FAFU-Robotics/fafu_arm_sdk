@@ -110,6 +110,8 @@ void bind_core(py::module_& module) {
                        &ServoOptions::input_is_radians)
         .def_readwrite("feedforward_velocity",
                        &ServoOptions::feedforward_velocity)
+        .def_readwrite("position_error_deadband_rad",
+                       &ServoOptions::position_error_deadband_rad)
         .def_readwrite("lookahead_time_s",
                        &ServoOptions::lookahead_time_s)
         .def_readwrite("lag_abort_consecutive",
@@ -211,6 +213,8 @@ void bind_core(py::module_& module) {
              py::call_guard<py::gil_scoped_release>())
         .def("brake", &RobotCore::brake,
              py::call_guard<py::gil_scoped_release>())
+        .def("brake_active_operation", &RobotCore::brake_active_operation,
+             py::call_guard<py::gil_scoped_release>())
         .def("emergency_stop", &RobotCore::emergency_stop,
              py::call_guard<py::gil_scoped_release>())
         .def("resume",
@@ -246,7 +250,7 @@ void bind_core(py::module_& module) {
              py::call_guard<py::gil_scoped_release>())
         .def("servo_summary", &RobotCore::servo_summary)
         .def("shutdown", &RobotCore::shutdown,
-             py::arg("joint_release") = FinishMode::Stop,
+             py::arg("joint_release") = FinishMode::Brake,
              py::arg("auxiliary_release") = FinishMode::Brake,
              py::arg("wait_timeout_s") = 5.0,
              py::call_guard<py::gil_scoped_release>());

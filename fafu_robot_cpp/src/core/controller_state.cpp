@@ -174,7 +174,8 @@ void ControllerState::transition(RobotState next) {
 
 void ControllerState::latch_dead(std::string reason) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ == RobotState::Disconnected) {
+    if (state_ == RobotState::Disconnected ||
+        state_ == RobotState::Estop) {
         return;
     }
     dead_reason_ = std::move(reason);
@@ -184,9 +185,12 @@ void ControllerState::latch_dead(std::string reason) {
 
 void ControllerState::latch_estop() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ == RobotState::Disconnected || state_ == RobotState::Dead) {
+    if (state_ == RobotState::Disconnected) {
         return;
     }
+    // An explicit ESTOP dominates an earlier feedback-loss latch so later
+    // cleanup/shutdown cannot replace its STOP with DEAD's BRAKE.
+    dead_reason_.clear();
     state_ = RobotState::Estop;
     cancel_requested_.store(true, std::memory_order_release);
 }

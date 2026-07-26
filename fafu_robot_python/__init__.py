@@ -11,14 +11,14 @@ scripts that put this directory on ``sys.path``.
 """
 from __future__ import annotations
 
-from .fafu_robot_controller import (
-    FafuRobotController,
+from ._api_types import (
     FrictionParams,
     GraspResult,
     RobotState,
     RobotStateError,
     ServoOpts,
 )
+from .fafu_robot_controller import FafuRobotController
 
 __all__ = [
     "FafuRobotController",

@@ -458,9 +458,10 @@ public:
 
     // -- 后台状态轮询 (可选) --
     //
-    // start_state_polling: 启动后台线程, 以 rate_hz 频率轮询所有 motor_ids 的状态,
-    //   缓存最新一次成功的 MotorState, 上层用 get_cached_state(id) 读取.
-    //   on_update 是可选回调, 每轮全部电机刷新完成后调用 (传入读到的 ID 列表).
+    // start_state_polling: 以 rate_hz 频率快速发出整轮 motor_ids 状态请求.
+    //   请求是 fire-and-forget, 不按 ID 等回复; 独立 RX 线程按收到的 ID 更新缓存,
+    //   因而单电机丢包不会冻结后续电机. on_update 在每个绝对周期截止点调用,
+    //   参数只包含该周期内实际收到新反馈的 ID.
     // 同一时间只能有一个轮询线程在跑; 重复调用会先停掉旧线程.
     void start_state_polling(const std::vector<int>& motor_ids,
                              double rate_hz = 50.0,
@@ -475,6 +476,7 @@ private:
     using RcvList = std::vector<std::pair<int, std::vector<uint8_t>>>;
 
     void        serial_write_(const std::vector<uint8_t>& data, int retries = 3);
+    void        request_motor_state_(int motor_id);
     std::string send_cmd_(const std::string& cmd, double timeout_s = 0.5);
     // expected_replies: 期望收到几条 'rcv' 行后才退出 (除非超时);
     //   单发场景下默认 1, 一拖多 N 个电机时传 N.
@@ -493,6 +495,7 @@ private:
     // TX 计数 + 周期/抖动统计 (由 send_can_and_recv_ 调用)
     void note_tx_();
     void stop_state_polling_unlocked_();
+    void enable_async_rx_unlocked_();
     void disable_async_rx_unlocked_();
 
     std::unique_ptr<serial::Serial> ser_;
@@ -516,9 +519,10 @@ private:
     std::map<int, Range>            limits_;
     mutable std::mutex              limits_mtx_;
 
-    // 后台 *轮询* 线程 (老接口, 单线程从串口轮询)
+    // 后台请求调度线程; 回复始终由独立 RX 线程解析并按 ID 回填.
     std::thread                     poll_thread_;
     std::atomic<bool>               poll_running_{false};
+    bool                            poll_owns_async_rx_ = false;
 
     // 后台 *接收* 线程 (新接口, 异步 RX)
     std::thread                     rx_thread_;

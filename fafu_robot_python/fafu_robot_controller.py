@@ -72,12 +72,10 @@ from __future__ import annotations
 
 import functools
 import math
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import os
 import threading
 import time
-from dataclasses import dataclass
-from enum import Enum
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -89,8 +87,56 @@ import numpy as np
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if __package__:
     from . import fafu_motor as pm
+    from ._api_types import (
+        FrictionParams,
+        GraspResult,
+        MODE_BRAKE,
+        MODE_MIT,
+        MODE_POSITION,
+        MODE_STOP,
+        RobotState,
+        RobotStateError,
+        ServoOpts,
+        _BUSY_STATES,
+    )
+    from ._dynamics import (
+        DynamicsModel,
+        friction_compensation,
+        resolve_urdf_path,
+    )
 else:  # pragma: no cover - direct module import compatibility
     import fafu_motor as pm
+    from _api_types import (
+        FrictionParams,
+        GraspResult,
+        MODE_BRAKE,
+        MODE_MIT,
+        MODE_POSITION,
+        MODE_STOP,
+        RobotState,
+        RobotStateError,
+        ServoOpts,
+        _BUSY_STATES,
+    )
+    from _dynamics import (
+        DynamicsModel,
+        friction_compensation,
+        resolve_urdf_path,
+    )
+
+__all__ = [
+    "FafuRobotController",
+    "FrictionParams",
+    "GraspResult",
+    "MODE_BRAKE",
+    "MODE_MIT",
+    "MODE_POSITION",
+    "MODE_STOP",
+    "RobotState",
+    "RobotStateError",
+    "ServoOpts",
+]
+
 
 # Optional: TOPPRA-based time-optimal interpolation (matches piper.py).
 try:
@@ -100,105 +146,18 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     _TOPPRA_EXIST = False
 
-# Optional: wrs robot_math, only needed if move_p / move_l are wired to IK.
-try:
-    import wrs.basis.robot_math as rm  # type: ignore  # noqa: F401
-except Exception:  # pragma: no cover - optional dependency
-    rm = None  # type: ignore
-
-# Optional: pinocchio rigid-body dynamics, only needed for the
-# gravity / Coriolis / mass-matrix terms behind :meth:`setup_dynamics`
-# and :meth:`start_gravity_compensation`.  It is notoriously hard to
-# install on Windows (conda-forge / Linux are the smooth paths), so the
-# whole dynamics feature degrades gracefully: when ``pinocchio`` is
-# missing every dynamics method raises a clear, actionable error and the
-# rest of the controller (move_j / servo_j / gripper) keeps working.
-try:
-    import pinocchio as pin  # type: ignore
-
-    _PIN_EXIST = True
-except Exception:  # pragma: no cover - optional dependency
-    pin = None  # type: ignore
-    _PIN_EXIST = False
-
-
 # ============================================================================
-#  Constants
+#  Operation guard
 # ============================================================================
-
-# Operating modes (matches motor_example_debug / arm_multi_joint_example).
-MODE_POSITION = 0x0A   # release / position-control hold
-MODE_BRAKE    = 0x0F   # short-circuit braking (no torque to spin)
-MODE_STOP     = 0x00   # PWM off, free to move by hand
-MODE_MIT      = 0x0B   # MIT residual mode left by set_many_mit (0x8093);
-                       # on this firmware only motor_reset can leave it
+_BORROWED_SERVO_WRITER = object()
 
 
-# ============================================================================
-#  High-level controller state machine
-# ============================================================================
-class RobotState(Enum):
-    """High-level lifecycle state of :class:`FafuRobotController`.
-
-    This is a *software* flow-control state (distinct from the per-motor
-    hardware ``mode`` byte, see ``MODE_*``).  It gates which high-level
-    API calls are legal at any moment so that mistakes like "``move_j``
-    while not enabled" or "issue motion after an emergency stop" fail
-    loudly with a clear message instead of silently doing the wrong
-    thing on the hardware.
-
-    Transition map (arrows are the *only* legal transitions)::
-
-        DISCONNECTED --open--> DISABLED
-        DISABLED  --enable()-->  IDLE
-        IDLE      --disable()-->  DISABLED
-        IDLE      --brake()---->  BRAKED
-        BRAKED/DISABLED --enable()--> IDLE
-        IDLE      --move_j/move_p/...-->  MOVING     --(done)--> IDLE
-        IDLE      --servo_start()------>  SERVOING   --servo_end("hold")--> IDLE
-                                                     --servo_end("brake")--> BRAKED
-                                                     --servo_end("stop")--> DISABLED
-        IDLE      --grasp()/gripper---->  GRASPING   --(done)--> IDLE
-        IDLE      --start_gravity_comp->  GRAVITY_COMP --(exit)--> BRAKED
-        <any connected> --emergency_stop()--> ESTOP  --resume()--> IDLE
-        <any connected> --power/CAN lost---> DEAD     --recover()--> DISABLED
-        <any>     --close_connection()-->  DISCONNECTED
-    """
-
-    DISCONNECTED  = "disconnected"   # serial port closed (initial / after close_connection)
-    DISABLED      = "disabled"       # connected, motors free-spin (MODE_STOP 0x00), hand-movable
-    BRAKED        = "braked"         # connected, short-circuit brake (MODE_BRAKE 0x0F), resists motion
-    IDLE          = "idle"           # connected + enabled (MODE_POSITION), ready & not busy
-    MOVING        = "moving"         # blocking joint / cartesian / gripper motion in progress
-    SERVOING      = "servoing"       # servo_start .. servo_end streaming session open
-    GRASPING      = "grasping"       # force-aware grasp() in progress
-    GRAVITY_COMP  = "gravity_comp"   # start_gravity_compensation() float/drag-teach loop running
-    ESTOP         = "estop"          # emergency_stop() latched — sticky until resume()
-    DEAD          = "dead"           # motor power / CAN link lost — latched; recover() after restore
-
-    def __str__(self) -> str:  # nicer prints
-        return self.value
-
-
-class RobotStateError(RuntimeError):
-    """Raised when a high-level API call is illegal in the current
-    :class:`RobotState` (e.g. ``move_j`` before ``enable``, or any
-    motion while the controller is latched in ``ESTOP``)."""
-
-
-# States in which the arm is actively executing an operation and must
-# not accept a *new* one.  emergency_stop() is the only exception.
-_BUSY_STATES = frozenset(
-    {
-        RobotState.MOVING,
-        RobotState.SERVOING,
-        RobotState.GRASPING,
-        RobotState.GRAVITY_COMP,
-    }
-)
-
-
-def _guard_operation(action: str, busy_state: "RobotState"):
+def _guard_operation(
+    action: str,
+    busy_state: "RobotState",
+    *,
+    allow_servo_nonblocking: bool = False,
+):
     """Decorator: gate a call-scoped, blocking operation behind the
     controller state machine.
 
@@ -213,7 +172,15 @@ def _guard_operation(action: str, busy_state: "RobotState"):
     def deco(fn: Callable) -> Callable:
         @functools.wraps(fn)
         def wrapper(self, *args, **kwargs):
-            owns = self._enter_operation(action, busy_state)
+            borrow_servo_writer = (
+                allow_servo_nonblocking
+                and kwargs.get("block", True) is False
+            )
+            owns = self._enter_operation(
+                action,
+                busy_state,
+                borrow_servo_writer=borrow_servo_writer,
+            )
             try:
                 return fn(self, *args, **kwargs)
             finally:
@@ -237,198 +204,6 @@ _CMD_CONTINUITY_TOL_T = 0.05
 
 # 1 turn = 2*pi rad
 _TWO_PI = 2.0 * math.pi
-
-# ============================================================================
-#  Public dataclasses
-# ============================================================================
-@dataclass
-class GraspResult:
-    """Outcome of a :meth:`FafuRobotController.grasp` call.
-
-    Attributes
-    ----------
-    grasped : bool
-        ``True`` iff the wrapper concluded that an object was caught
-        (torque threshold reached, or the gripper stalled after having
-        clearly moved towards the target).  ``False`` for "reached the
-        target with no resistance" / "did not move at all" / "timeout".
-    reason : str
-        One of:
-
-        * ``'detected_object_force'`` — ``|torque| >= effort_threshold``
-        * ``'detected_object_stall'`` — speed plateaued after closing
-          at least ``min_close_deg``
-        * ``'reached_target'``      — got to the commanded angle, nothing in the way
-        * ``'no_movement'``         — stalled but barely moved (command
-          may not have taken effect, or jaws were already shut)
-        * ``'timeout'``             — neither condition met within ``timeout``
-        * ``'cancelled'``           — safety stop, close, or link loss
-    angle_rad : float
-        Final gripper angle (radians).
-    closed_deg : float
-        Absolute change in the gripper angle since the call started
-        (degrees).  Always non-negative.
-    peak_torque_raw : int
-        Maximum ``|MotorState.torque|`` observed during the move
-        (raw int16 from the motor).
-    duration_s : float
-        Wall-clock time the call took (seconds).
-    """
-    grasped: bool
-    reason: str
-    angle_rad: float
-    closed_deg: float
-    peak_torque_raw: int
-    duration_s: float
-
-
-@dataclass
-class ServoOpts:
-    """Tunables for an online ``servo_j`` streaming session.
-
-    See the four safety lines documented on
-    :meth:`FafuRobotController.servo_start`.
-
-    Attributes
-    ----------
-    watchdog_ms : int, optional
-        Firmware-side watchdog in milliseconds.  If the motor receives
-        no new command for this long it automatically brakes.  Default
-        100. Set to 0 to disable (not recommended).
-    max_vel : float, optional
-        Per-joint velocity cap in **rad/s** written into every frame
-        (``set_many_pos_vel_tqe`` ``vel`` field).  Default ``1.0``
-        (~57 deg/s).  When ``feedforward_vel=True`` this acts as an
-        upper safety bound on the computed feedforward velocity.
-    max_step_rad : float, optional
-        Per-step jump limit in **rad**.  ``|target - last_target|``
-        larger than this is clamped to ``±max_step_rad`` and a warning
-        is logged.  Default ``0.05`` (~2.9 deg).
-    max_lag_rad : float, optional
-        Tracking-error guard in **rad**.  If any motor's measured
-        position deviates from its last target by more than this,
-        the tick is flagged as a "lag-trip" and the running counter
-        :attr:`FafuRobotController.servo_lag_count` is incremented
-        (and ``servo_end`` prints the total).  The frame is **still
-        sent** so the firmware watchdog cannot brake the rest of the
-        arm; pass ``lag_abort_consecutive`` if you need automatic
-        protective stop on persistent lag.  Default ``0.2``
-        (~11.5 deg).  Set to ``0`` / negative to disable the
-        counter entirely.
-    is_radians : bool, optional
-        Interpret arguments to :meth:`servo_j` in radians (default) or
-        degrees.  Matches :meth:`move_j`.
-    rate_hz : float, optional
-        Nominal upper-layer call rate **only used to compute dt for
-        feedforward and lookahead**.  Default ``100.0``.  The actual
-        call rate is still set by however fast the caller invokes
-        :meth:`servo_j`; this number does not throttle anything.
-    feedforward_vel : bool, optional
-        Default ``True``.  When enabled, the per-frame ``vel`` field
-        written to each motor is the **true required velocity**
-        ``(target[k] - target[k-1]) * rate_hz`` (clamped to
-        ``±max_vel``), exactly like UR servoj's internal velocity
-        feedforward. When ``False``, position-channel frames use
-        ``max_vel`` as a positive velocity limit, while MIT frames use zero
-        desired velocity (MIT velocity is signed, not a limit).
-    lookahead_time : float, optional
-        Default ``0.0`` (no smoothing).  When ``> 0``, an exponential
-        moving average (first-order low-pass) with time constant
-        ``lookahead_time`` is applied to every target before it is
-        sent.  Recommended ``0.03 - 0.10`` s for noisy upper layers
-        (joystick teleop, VR, vision servoing); leave at ``0`` when the
-        upper layer already produces a smooth trajectory (planned
-        path).  This is the same knob UR servoj exposes as
-        ``lookahead_time``.
-    lag_abort_consecutive : int, optional
-        Default ``0`` (off).  When ``> 0``, the servo session is
-        automatically terminated with :meth:`servo_end` (``"brake"``)
-        after this many *consecutive* lag-tripped ticks.  This is the
-        old "fail-stop" behaviour, just bounded so a single bad tick
-        does not kill the loop.  Recommended in production: ``5`` -
-        ``10`` (50 - 100 ms of persistent lag).  Leave at ``0`` for
-        diagnostic scripts.
-    """
-
-    watchdog_ms: int = 100
-    max_vel: float = 1.0
-    max_step_rad: float = 0.05
-    max_lag_rad: float = 0.2
-    is_radians: bool = True
-    # ---- noise / lag tuning (UR-servoj style) ----
-    rate_hz: float = 100.0
-    feedforward_vel: bool = True
-    lookahead_time: float = 0.0
-    # ---- lag-trip policy ----
-    # Old behaviour was "lag > max_lag_rad ⇒ servo_j returns False ⇒ frame
-    # NOT sent". That turned a single lagging joint into a cascade: the
-    # firmware watchdog on the *good* joints tripped after watchdog_ms of
-    # no frames and braked them too. The new default is "keep sending +
-    # accumulate lag_count"; the lag count is reported by servo_end and
-    # can be polled live via :attr:`FafuRobotController.servo_lag_count`.
-    # Set ``lag_abort_consecutive > 0`` to opt back into auto-abort (handy
-    # for production safety, but not for diagnostic scripts).
-    lag_abort_consecutive: int = 0
-    # ---- control channel ----
-    # False (default): position channel; no motor calibration is needed.
-    # True: group-MIT impedance channel. Non-zero MIT gains/torque require
-    # exact per-joint motor_models; unknown coefficients are rejected.
-    use_mit: bool = False
-    # Per-joint MIT PD gains (physical vendor units, same as move_MIT). None =>
-    # vendor replay defaults for 6-DoF (kp=[30,40,55,15,7,5], kd=[3,4,5.5,1.5,
-    # 0.7,0.5]); scalar otherwise. Only used when use_mit=True.
-    mit_kp: "float | Iterable[float] | None" = None
-    mit_kd: "float | Iterable[float] | None" = None
-    motor_models: "Optional[List[str]]" = None
-    # Add gravity feed-forward each MIT tick (needs setup_dynamics; silently
-    # falls back to kp/kd-only when no model). Only used when use_mit=True.
-    mit_gravity_ff: bool = True
-
-
-@dataclass
-class FrictionParams:
-    """Coulomb + viscous joint-friction model for gravity-comp / float mode.
-
-    Mirrors ``2_gravity_friction_compensation_control.py``::
-
-        tau_friction = fc * sign(v) + fv * v
-
-    with a low-speed dead-band: when ``|v| < vel_threshold`` only the
-    viscous term ``fv * v`` is used, so the Coulomb ``sign(v)`` term does
-    not chatter around zero velocity.
-
-    Attributes
-    ----------
-    fc : np.ndarray
-        Per-joint Coulomb friction (Nm) — constant magnitude, opposes the
-        direction of motion.  Identify by driving each joint at a very low
-        constant speed and reading the minimum steady torque needed.
-    fv : np.ndarray
-        Per-joint viscous friction (Nm*s/rad) — proportional to speed.
-        Identify from the slope of the torque-vs-speed curve.  Usually an
-        order of magnitude smaller than ``fc``.
-    vel_threshold : float
-        Speed (rad/s) below which the Coulomb term is suppressed.
-        ``0.01 - 0.05`` is reasonable; default ``0.02``.
-    """
-
-    fc: np.ndarray
-    fv: np.ndarray
-    vel_threshold: float = 0.02
-
-    @staticmethod
-    def reference_6dof() -> "FrictionParams":
-        """Starting values from the reference friction model.
-
-        These are starting values only. Friction is arm- and wear-specific
-        and must be re-identified on the actual hardware.
-        """
-        return FrictionParams(
-            fc=np.array([0.20, 0.15, 0.15, 0.15, 0.04, 0.04]),
-            fv=np.array([0.06, 0.06, 0.06, 0.03, 0.02, 0.02]),
-            vel_threshold=0.02,
-        )
-
 
 # ============================================================================
 #  Controller
@@ -557,6 +332,8 @@ class FafuRobotController:
         # (e.g. go_home -> move_j); ``_state_verbose`` toggles transition
         # logging (off by default to avoid spamming per-move_j).
         self._state_lock = threading.RLock()
+        # Serializes configuration commits with native writer-lease start.
+        self._config_lock = threading.RLock()
         self._state: RobotState = RobotState.DISABLED
         self._op_depth: int = 0
         self._op_owner_thread_id: Optional[int] = None
@@ -576,9 +353,9 @@ class FafuRobotController:
         # Native P0 core is the single authority for state, writer ownership,
         # recovery and Servo safety. Refuse an old binary instead of silently
         # running a second, divergent implementation in Python.
-        if getattr(pm, "CORE_ABI_VERSION", 0) != 2:
+        if getattr(pm, "CORE_ABI_VERSION", 0) != 3:
             raise RuntimeError(
-                "fafu_motor native core ABI 2 is required; rebuild/install "
+                "fafu_motor native core ABI 3 is required; rebuild/install "
                 "the C++ extension from this SDK version")
         core_cfg = pm.CoreConfig()
         core_cfg.all_motor_ids = list(cfg.motor_ids)
@@ -633,24 +410,12 @@ class FafuRobotController:
         self._servo_active: bool = False
         self._servo_opts: Optional[ServoOpts] = None
 
-        # ---- Dynamics (gravity / friction compensation) state ----
-        # All None until setup_dynamics() succeeds. Kept on the instance
-        # so the per-tick compensation loop does not re-load the URDF.
-        self._pin_model = None
-        self._pin_data = None
-        # End-effector frame used by FK/IK (move_p / move_l). Resolved in
-        # setup_dynamics from the URDF ("tool_link" for the follower arm).
-        self._eef_frame_id: Optional[int] = None
-        self._eef_frame_name: Optional[str] = None
-        self._dyn_gravity_vec: np.ndarray = np.array([0.0, 0.0, -9.81])
-        # Per-joint motor models used for physical torque/MIT conversion.
-        # Unknown models are rejected before any non-zero command is sent.
+        # ---- Optional numerical dynamics state ----
+        # Hardware ownership and safety remain here. The helper owns only the
+        # Pinocchio model and deterministic numerical operations.
+        self._dynamics: Optional[DynamicsModel] = None
         self._dyn_motor_models: Optional[List[str]] = None
-        # Per-joint torque clip (Nm). Defaults applied in setup_dynamics.
         self._dyn_tau_limit: Optional[np.ndarray] = None
-        # Per-joint empirical torque gain applied right before sending. Used
-        # to calibrate gravity-comp on real hardware when the Nm->raw coeff
-        # is uncertain: bump it up until the arm just floats. Defaults to 1.0.
         self._dyn_torque_scale: np.ndarray = np.ones(self.num_joints)
         self._friction_params: Optional[FrictionParams] = None
         self._gravity_comp_active: bool = False
@@ -751,7 +516,7 @@ class FafuRobotController:
     @property
     def gripper_motor_id(self) -> Optional[int]:
         return self._gripper_motor_id
-        
+
     @property
     def driver(self) -> pm.HightorqueSerial:
         """Escape hatch to the underlying ``HightorqueSerial`` instance."""
@@ -834,7 +599,13 @@ class FafuRobotController:
         raise RobotStateError(
             f"{action} rejected: controller is busy (state={st})")
 
-    def _enter_operation(self, action: str, busy_state: RobotState):
+    def _enter_operation(
+        self,
+        action: str,
+        busy_state: RobotState,
+        *,
+        borrow_servo_writer: bool = False,
+    ):
         """Acquire the single per-controller writer lease.
 
         Reads remain concurrent. A second writer fails immediately instead of
@@ -842,6 +613,19 @@ class FafuRobotController:
         """
         core = getattr(self, "_core", None)
         if core is not None:
+            if (
+                action == "gripper_control"
+                and borrow_servo_writer
+                and core.active_operation == pm.OperationKind.SERVO
+                and core.operation_owned_by_current_thread()
+            ):
+                if not core.stream_link_ok():
+                    self._sync_state_from_core()
+                    raise RobotStateError(
+                        f"{action} rejected: {core.dead_reason}"
+                    )
+                return _BORROWED_SERVO_WRITER
+
             if action == "reset_zero":
                 kind = pm.OperationKind.RAW_STREAM
             elif busy_state is RobotState.MOVING:
@@ -855,7 +639,8 @@ class FafuRobotController:
             else:
                 kind = pm.OperationKind.RAW_STREAM
             try:
-                token = core.begin_operation(kind)
+                with self._config_lock:
+                    token = core.begin_operation(kind)
                 if not core.stream_link_ok():
                     core.end_operation(token)
                     self._sync_state_from_core()
@@ -891,6 +676,9 @@ class FafuRobotController:
             return True
 
     def _exit_operation(self, owns) -> None:
+        if owns is _BORROWED_SERVO_WRITER:
+            return
+
         core = getattr(self, "_core", None)
         if core is not None and not isinstance(owns, bool):
             try:
@@ -1096,16 +884,16 @@ class FafuRobotController:
         """Leave ``DEAD`` after motor power / CAN has been restored.
 
         ★ SAFETY ★ This never moves the arm.  It verifies the motors respond
-        again, restarts background RX / polling if needed, forces every motor
-        to the safe non-energised ``STOP`` (``0x00``) mode, and transitions to
-        ``DISABLED`` — **not** ``IDLE``.  You must then call :meth:`enable`
+        again, restarts background RX / polling if needed, leaves every motor
+        in short-circuit ``BRAKE`` (``0x0F``), and transitions to
+        ``BRAKED`` — **not** ``IDLE``.  You must then call :meth:`enable`
         explicitly to re-arm; ``enable`` holds the *current* measured pose (no
         jump), so the arm cannot lurch toward a stale pre-blackout target.
 
         ``confirm=True`` is required because this re-touches the bus after a
         fault; make sure the workspace is clear first.
 
-        Returns ``True`` if the link is back and we moved to ``DISABLED``;
+        Returns ``True`` if the link is back and we moved to ``BRAKED``;
         ``False`` if the motors are still unresponsive (stays ``DEAD``).
         """
         core = getattr(self, "_core", None)
@@ -1162,17 +950,17 @@ class FafuRobotController:
             print(f"[FafuRobot] recover: motors {missing} still unresponsive; "
                   "check power/wiring/USB/CAN and retry. (state stays DEAD)")
             return False
-        # Link is back. Force a known-safe non-energised state; never move.
+        # Link is back. Keep every responsive motor braked; never move.
         for mid in self._cfg.motor_ids:
             try:
-                self._ht.stop(mid)
+                self._ht.set_motor_mode(mid, self.MODE_BRAKE)
             except Exception:
                 pass
         self._last_cmd_turns = None
         self._dead_reason = None
-        self._set_state(RobotState.DISABLED)
-        print("[FafuRobot] recover: link restored; motors left in STOP (0x00, "
-              "free). Call enable() to re-arm (holds current pose, no jump) "
+        self._set_state(RobotState.BRAKED)
+        print("[FafuRobot] recover: link restored; motors left in BRAKE (0x0F). "
+              "Call enable() to re-arm (holds current pose, no jump) "
               "before commanding motion.")
         return True
 
@@ -1369,13 +1157,14 @@ class FafuRobotController:
         # block=False: single shot, no waiting.
         v_avg = (speed / 100.0) * _VEL_AVG_MAX_TPS
         cmds = self._build_many_cmds_holding_others(targets_turns, vel_rps=v_avg)
-        with self._command_guard():
-            self._ht.set_many_pos_vel_tqe(
-                cmds,
-                pm.PosUnit.Turns,
-                max(self._cfg.motor_ids),
-                0.05,
-            )
+        with self._brake_on_motion_error():
+            with self._command_guard():
+                self._ht.set_many_pos_vel_tqe(
+                    cmds,
+                    pm.PosUnit.Turns,
+                    max(self._cfg.motor_ids),
+                    0.05,
+                )
 
     def go_home(self, *, speed: int = 20, block: bool = True) -> None:
         """Move every manipulator joint back to 0 rad."""
@@ -1626,6 +1415,8 @@ class FafuRobotController:
         native.nominal_rate_hz = float(opts.rate_hz)
         native.input_is_radians = bool(opts.is_radians)
         native.feedforward_velocity = bool(opts.feedforward_vel)
+        native.position_error_deadband_rad = float(
+            opts.position_error_deadband_rad)
         native.lookahead_time_s = float(opts.lookahead_time)
         native.lag_abort_consecutive = int(opts.lag_abort_consecutive)
         native.channel = (
@@ -1640,17 +1431,27 @@ class FafuRobotController:
                 [float(opts.mit_kd)] if np.isscalar(opts.mit_kd)
                 else [float(x) for x in opts.mit_kd])
 
-        models = opts.motor_models or self._dyn_motor_models
-        if opts.use_mit and models is None:
-            raise ValueError(
-                "MIT servo requires exact per-joint motor_models; pass "
-                "ServoOpts(motor_models=[...]) or call set_motor_models()")
-        if models is not None:
-            self.set_motor_models(models)
-        core.servo_start(native)
-        self._last_cmd_turns = None
-        self._servo_opts = opts
-        self._servo_active = True
+        with self._config_lock:
+            models = (
+                list(opts.motor_models)
+                if opts.motor_models
+                else (
+                    list(self._dyn_motor_models)
+                    if self._dyn_motor_models is not None
+                    else None
+                )
+            )
+            if opts.use_mit and models is None:
+                raise ValueError(
+                    "MIT servo requires exact per-joint motor_models; pass "
+                    "ServoOpts(motor_models=[...]) or call set_motor_models()"
+                )
+            if models is not None:
+                self.set_motor_models(models)
+            core.servo_start(native)
+            self._last_cmd_turns = None
+            self._servo_opts = opts
+            self._servo_active = True
         self._sync_state_from_core()
 
     def servo_j(self, target_angles: Iterable[float]) -> bool:
@@ -1770,7 +1571,8 @@ class FafuRobotController:
 
             The URDF joint order is assumed to match
             :attr:`joint_motor_ids` (true for the 6-DoF Fafu
-            arm).  ``model.nq`` must equal :attr:`num_joints`.
+            arm).  Both ``model.nq`` and ``model.nv`` must equal
+            :attr:`num_joints`.
         gravity_vec : iterable of 3 float, optional
             Gravity direction/magnitude in the URDF base frame.  Default
             ``(0, 0, -9.81)`` (base ``z`` points up).  Flip / rotate this
@@ -1800,7 +1602,8 @@ class FafuRobotController:
         friction : FrictionParams, optional
             Default friction model used when
             :meth:`get_friction_compensation` is called without explicit
-            params.  Defaults to :meth:`FrictionParams.reference_6dof`.
+            params.  Defaults to :meth:`FrictionParams.reference_6dof`
+            for six joints and zero friction for other joint counts.
         eef_frame : str, optional
             Name of the URDF frame treated as the end effector for
             :meth:`forward_kinematics` / :meth:`inverse_kinematics` /
@@ -1815,129 +1618,149 @@ class FafuRobotController:
             ``pinocchio`` not installed, URDF not found, or the model's
             DoF count does not match :attr:`num_joints`.
         """
-        if not _PIN_EXIST:
-            raise RuntimeError(
-                "gravity/dynamics need the 'pinocchio' package, which is "
-                "not installed.\n"
-                "  - conda:  conda install -c conda-forge pinocchio\n"
-                "  - linux:  pip install pin\n"
-                "  (Windows pip wheels are unreliable; conda-forge or WSL "
-                "is the smooth path.)\n"
-                "Friction-only compensation does NOT need pinocchio."
+        if self.state in _BUSY_STATES:
+            raise RobotStateError(
+                "dynamics configuration cannot change during an operation"
             )
 
-        resolved = self._resolve_urdf_path(urdf_path)
+        resolved = resolve_urdf_path(_HERE, urdf_path)
         if resolved is None:
-            raise RuntimeError(
-                "setup_dynamics: could not find a URDF. Pass urdf_path "
-                "explicitly, or drop one under "
-                "'<package>/fafu_robot_description/'."
-            )
+            requested = repr(urdf_path) if urdf_path else "the vendored package"
+            raise RuntimeError(f"could not find a URDF in {requested}")
+        dynamics = DynamicsModel.load(
+            resolved,
+            num_joints=self.num_joints,
+            gravity_vector=gravity_vec,
+            eef_frame=eef_frame,
+        )
 
-        try:
-            model = pin.buildModelFromUrdf(resolved)
-        except Exception as e:
-            raise RuntimeError(f"setup_dynamics: failed to load URDF "
-                               f"{resolved!r}: {e}") from e
-
-        if model.nq != self.num_joints:
-            raise RuntimeError(
-                f"setup_dynamics: URDF DoF ({model.nq}) != num_joints "
-                f"({self.num_joints}). The URDF must describe exactly the "
-                f"{self.num_joints} manipulator joints (gripper excluded), "
-                f"as a simple revolute chain."
-            )
-
-        self._pin_model = model
-        self._pin_data = model.createData()
-        self._resolve_eef_frame(model, eef_frame)
-        self._dyn_gravity_vec = np.asarray(list(gravity_vec), dtype=float)
-        if self._dyn_gravity_vec.shape != (3,):
-            raise ValueError("gravity_vec must have exactly 3 elements")
-
+        models = None
         if motor_models is not None:
-            if len(motor_models) != self.num_joints:
+            models = [str(model) for model in motor_models]
+            if (
+                len(models) != self.num_joints
+                or any(not model for model in models)
+            ):
                 raise ValueError(
-                    f"motor_models must have {self.num_joints} entries "
-                    f"(one per joint), got {len(motor_models)}")
-            self.set_motor_models(motor_models)
-        else:
-            self._dyn_motor_models = None
-            if self._core is not None:
-                self._core.set_joint_motor_models([""] * self.num_joints)
-            print("[FafuRobot] setup_dynamics: no motor_models given; "
-                  "non-zero torque/MIT output remains disabled until exact "
-                  "models are configured.")
+                    f"motor_models must contain {self.num_joints} "
+                    "non-empty names"
+                )
 
         if tau_limit is not None:
-            tl = np.asarray(list(tau_limit), dtype=float)
-            if tl.shape != (self.num_joints,):
+            limit = np.asarray(list(tau_limit), dtype=float)
+            if limit.shape != (self.num_joints,):
                 raise ValueError(
-                    f"tau_limit must have {self.num_joints} elements")
-            self._dyn_tau_limit = np.abs(tl)
+                    f"tau_limit must have {self.num_joints} elements"
+                )
+            if not np.all(np.isfinite(limit)):
+                raise ValueError("tau_limit must contain only finite values")
+            limit = np.abs(limit)
+        elif self.num_joints == 6:
+            limit = np.array([15.0, 30.0, 30.0, 15.0, 5.0, 5.0])
         else:
-            ref = np.array([15.0, 30.0, 30.0, 15.0, 5.0, 5.0])
+            limit = np.full(self.num_joints, 5.0)
+
+        scale = np.asarray(
+            torque_scale if torque_scale is not None else 1.0,
+            dtype=float,
+        )
+        if scale.ndim == 0:
+            scale = np.full(self.num_joints, float(scale))
+        if scale.shape != (self.num_joints,):
+            raise ValueError(
+                f"torque_scale must be a scalar or "
+                f"{self.num_joints} values"
+            )
+        if not np.all(np.isfinite(scale)) or np.any(scale < 0.0):
+            raise ValueError(
+                "torque_scale values must be finite and non-negative"
+            )
+        scale = scale.copy()
+
+        if friction is None:
             if self.num_joints == 6:
-                self._dyn_tau_limit = ref
+                friction = FrictionParams.reference_6dof()
             else:
-                # Unknown geometry: pick a conservative blanket cap.
-                self._dyn_tau_limit = np.full(self.num_joints, 5.0)
+                friction = FrictionParams(
+                    fc=np.zeros(self.num_joints),
+                    fv=np.zeros(self.num_joints),
+                )
+        fc = np.asarray(friction.fc, dtype=float)
+        fv = np.asarray(friction.fv, dtype=float)
+        threshold = float(friction.vel_threshold)
+        if fc.shape != (self.num_joints,) or fv.shape != (self.num_joints,):
+            raise ValueError(
+                f"friction fc/fv must each have {self.num_joints} elements"
+            )
+        if (
+            not np.all(np.isfinite(fc))
+            or not np.all(np.isfinite(fv))
+            or not np.isfinite(threshold)
+            or threshold < 0.0
+        ):
+            raise ValueError(
+                "friction coefficients and threshold must be finite; "
+                "threshold must be non-negative"
+            )
+        friction_model = FrictionParams(
+            fc=fc.copy(),
+            fv=fv.copy(),
+            vel_threshold=threshold,
+        )
 
-        self.set_torque_scale(torque_scale if torque_scale is not None else 1.0)
+        with self._config_lock:
+            if self.state in _BUSY_STATES:
+                raise RobotStateError(
+                    "dynamics configuration cannot change during an operation"
+                )
+            core = getattr(self, "_core", None)
+            if core is not None:
+                core.set_joint_motor_models(
+                    models if models is not None else [""] * self.num_joints
+                )
 
-        self._friction_params = friction or FrictionParams.reference_6dof()
+            # Publish one coherent configuration only after native commit.
+            self._dyn_motor_models = models
+            self._dyn_tau_limit = limit
+            self._dyn_torque_scale = scale
+            self._friction_params = friction_model
+            self._dynamics = dynamics
 
-        print(f"[FafuRobot] dynamics ready: URDF={os.path.basename(resolved)}, "
-              f"dof={model.nq}, eef_frame={self._eef_frame_name!r}, "
-              f"gravity={self._dyn_gravity_vec.tolist()}, "
-              f"tau_limit={self._dyn_tau_limit.tolist()}, "
-              f"torque_scale={self._dyn_torque_scale.tolist()}")
-
-    def _resolve_eef_frame(self, model, eef_frame: Optional[str]) -> None:
-        """Pick and cache the end-effector frame used by FK/IK.
-
-        Preference: explicit argument, tool_link, then the child frame of the
-        last actuated joint.
-        """
-        candidates: List[str] = []
-        if eef_frame:
-            candidates.append(eef_frame)
-        candidates.append("tool_link")
-        # Last joint name in the chain (joint1..jointN for this arm).
-        try:
-            last_joint = model.names[model.njoints - 1]
-            candidates.append(last_joint)
-        except Exception:
-            pass
-
-        for name in candidates:
-            if model.existFrame(name):
-                self._eef_frame_name = name
-                self._eef_frame_id = model.getFrameId(name)
-                if eef_frame and name != eef_frame:
-                    print(f"[FafuRobot] setup_dynamics: requested eef_frame "
-                          f"{eef_frame!r} not found; using {name!r}.")
-                return
-
-        # Last resort: the very last frame in the model.
-        self._eef_frame_id = model.nframes - 1
-        self._eef_frame_name = model.frames[self._eef_frame_id].name
-        print(f"[FafuRobot] setup_dynamics: no tool frame found; using last "
-              f"frame {self._eef_frame_name!r} as end effector.")
+        if models is None:
+            print(
+                "[FafuRobot] setup_dynamics: no motor_models given; "
+                "non-zero torque/MIT output remains disabled until exact "
+                "models are configured."
+            )
+        if eef_frame and dynamics.eef_frame_name != eef_frame:
+            print(
+                f"[FafuRobot] setup_dynamics: requested eef_frame "
+                f"{eef_frame!r} not found; using "
+                f"{dynamics.eef_frame_name!r}."
+            )
+        print(
+            f"[FafuRobot] dynamics ready: URDF={os.path.basename(resolved)}, "
+            f"dof={dynamics.model.nq}, "
+            f"eef_frame={dynamics.eef_frame_name!r}, "
+            f"gravity={dynamics.gravity_vector.tolist()}, "
+            f"tau_limit={limit.tolist()}, "
+            f"torque_scale={scale.tolist()}"
+        )
 
     def set_motor_models(self, motor_models: Iterable[str]) -> None:
         """Configure exact per-joint models for torque and MIT conversion."""
-        if self.state in _BUSY_STATES:
-            raise RobotStateError(
-                "motor models cannot change during a control operation")
         models = [str(model) for model in motor_models]
         if len(models) != self.num_joints or any(not model for model in models):
             raise ValueError(
                 f"motor_models must contain {self.num_joints} non-empty names")
-        core = getattr(self, "_core", None)
-        if core is not None:
-            core.set_joint_motor_models(models)
-        self._dyn_motor_models = models
+        with self._config_lock:
+            if self.state in _BUSY_STATES:
+                raise RobotStateError(
+                    "motor models cannot change during a control operation")
+            core = getattr(self, "_core", None)
+            if core is not None:
+                core.set_joint_motor_models(models)
+            self._dyn_motor_models = models
 
     def set_torque_scale(self, scale: "float | Iterable[float]") -> None:
         """Set the empirical per-joint torque gain (see ``torque_scale`` in
@@ -1946,7 +1769,7 @@ class FafuRobotController:
         Can be called live (e.g. between calibration runs) without
         reloading the dynamics model.
         """
-        arr = np.asarray(scale, dtype=float)
+        arr = np.asarray(scale, dtype=float).copy()
         if arr.ndim == 0:
             arr = np.full(self.num_joints, float(arr))
         if arr.shape != (self.num_joints,):
@@ -1955,104 +1778,67 @@ class FafuRobotController:
         if not np.all(np.isfinite(arr)) or np.any(arr < 0.0):
             raise ValueError(
                 "torque_scale values must be finite and non-negative")
-        self._dyn_torque_scale = arr
+        with self._config_lock:
+            self._dyn_torque_scale = arr
 
     def tau_to_raw(self, tau: Iterable[float]) -> np.ndarray:
         """Convert per-joint torque in Nm with the native calibration table."""
         values = [float(x) for x in tau]
         if len(values) != self.num_joints:
             raise ValueError(f"tau must have {self.num_joints} elements")
-        models = self._dyn_motor_models or [""] * self.num_joints
+        with self._config_lock:
+            models = list(self._dyn_motor_models or [""] * self.num_joints)
         return np.asarray(
             pm.torques_to_raw(values, models, 1.0), dtype=np.int64)
 
     @property
     def has_dynamics(self) -> bool:
-        """``True`` once :meth:`setup_dynamics` has loaded a model."""
-        return self._pin_model is not None
+        """True once setup_dynamics has loaded a model."""
+        return getattr(self, "_dynamics", None) is not None
 
-    def _require_dynamics(self) -> None:
-        if self._pin_model is None:
+    def _require_dynamics(self) -> DynamicsModel:
+        dynamics = getattr(self, "_dynamics", None)
+        if dynamics is None:
             raise RuntimeError(
-                "dynamics model not loaded; call setup_dynamics() first")
+                "dynamics model not loaded; call setup_dynamics() first"
+            )
+        return dynamics
 
-    @staticmethod
-    def _resolve_urdf_path(urdf_path: Optional[str]) -> Optional[str]:
-        """Find a URDF: explicit arg → vendored copy under the package."""
-        if urdf_path:
-            return urdf_path if os.path.exists(urdf_path) else None
+    def _require_kinematics(self) -> DynamicsModel:
+        return self._require_dynamics()
 
-        candidates: List[str] = []
-        # vendored URDF, for a self-contained deployment.
-        desc = os.path.join(_HERE, "fafu_robot_description")
-        if os.path.isdir(desc):
-            for fn in sorted(os.listdir(desc)):
-                if fn.endswith(".urdf"):
-                    candidates.append(os.path.join(desc, fn))
-        for c in candidates:
-            if os.path.exists(c):
-                return c
-        return None
-
-    # ------------------------------------------------------------------
-    #  Kinematics (FK / IK) -- needs setup_dynamics() (pinocchio + URDF)
-    # ------------------------------------------------------------------
-    def _require_kinematics(self) -> None:
-        self._require_dynamics()
-        if self._eef_frame_id is None:
-            raise RuntimeError(
-                "end-effector frame not resolved; call setup_dynamics() "
-                "(optionally with eef_frame=...) first")
-
-    def _q_in(self, q: Optional[Iterable[float]], is_radians: bool) -> np.ndarray:
-        """Normalize a joint vector arg to a radians ndarray of length
-        ``num_joints`` (defaults to the live measured pose)."""
+    def _q_in(
+        self,
+        q: Optional[Iterable[float]],
+        is_radians: bool,
+    ) -> np.ndarray:
+        """Normalize a joint vector to radians."""
         if q is None:
             return self.get_joint_values()
-        arr = np.asarray(list(q), dtype=float)
-        if arr.size != self.num_joints:
+        value = np.asarray(list(q), dtype=float)
+        if value.shape != (self.num_joints,):
             raise ValueError(
-                f"expected {self.num_joints} joint values, got {arr.size}")
-        return arr if is_radians else np.deg2rad(arr)
+                f"expected {self.num_joints} joint values, got {value.size}"
+            )
+        if not np.all(np.isfinite(value)):
+            raise ValueError("joint values must be finite")
+        return value if is_radians else np.deg2rad(value)
 
-    @staticmethod
-    def _rot_from_arg(rot, is_euler: bool, is_radians: bool) -> np.ndarray:
-        """Accept either a 3x3 rotation matrix or an Euler/RPY triple and
-        return a 3x3 rotation matrix."""
-        if rot is None:
-            return np.eye(3)
-        arr = np.asarray(rot, dtype=float)
-        if is_euler or arr.shape == (3,):
-            rpy = arr.reshape(3)
-            if not is_radians:
-                rpy = np.deg2rad(rpy)
-            return np.asarray(pin.rpy.rpyToMatrix(rpy[0], rpy[1], rpy[2]),
-                              dtype=float)
-        if arr.shape != (3, 3):
-            raise ValueError(
-                "rot must be a 3x3 rotation matrix or a length-3 RPY triple")
-        return arr
-
-    def _fk_se3(self, q_rad: np.ndarray):
-        """Internal: return the end-effector ``pin.SE3`` for ``q`` (rad)."""
-        pin.forwardKinematics(self._pin_model, self._pin_data, q_rad)
-        pin.updateFramePlacements(self._pin_model, self._pin_data)
-        return self._pin_data.oMf[self._eef_frame_id]
-
-    def _joint_limits_rad(self) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-        """Per-joint (lower, upper) soft limits in radians, or ``None`` if
-        any joint has no configured limit."""
-        lo = np.empty(self.num_joints)
-        hi = np.empty(self.num_joints)
-        for i, mid in enumerate(self._joint_motor_ids):
+    def _joint_limits_rad(
+        self,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Return configured joint limits in radians, or None."""
+        lower = np.empty(self.num_joints)
+        upper = np.empty(self.num_joints)
+        for index, motor_id in enumerate(self._joint_motor_ids):
             try:
-                lim = self.get_limit(mid, is_radians=True)
+                limit = self.get_limit(motor_id, is_radians=True)
             except Exception:
-                lim = None
-            if lim is None:
+                limit = None
+            if limit is None:
                 return None
-            lo[i], hi[i] = lim
-        return lo, hi
+            lower[index], upper[index] = limit
+        return lower, upper
 
     def forward_kinematics(
         self,
@@ -2079,21 +1865,8 @@ class FafuRobotController:
             ``transform`` (4, 4) homogeneous transform,
             ``q`` (num_joints,) the joint configuration used (rad).
         """
-        self._require_kinematics()
-        qv = self._q_in(q, is_radians)
-        oMf = self._fk_se3(qv)
-        pos = np.asarray(oMf.translation, dtype=float).copy()
-        rot = np.asarray(oMf.rotation, dtype=float).copy()
-        T = np.eye(4)
-        T[:3, :3] = rot
-        T[:3, 3] = pos
-        return {
-            "position": pos,
-            "rotation": rot,
-            "rpy": np.asarray(pin.rpy.matrixToRpy(rot), dtype=float),
-            "transform": T,
-            "q": qv,
-        }
+        dynamics = self._require_kinematics()
+        return dynamics.forward_kinematics(self._q_in(q, is_radians))
 
     def inverse_kinematics(
         self,
@@ -2145,100 +1918,40 @@ class FafuRobotController:
             ``num_joints`` joint angles (rad by default, deg if
             ``is_radians=False``) on success, else ``None``.
         """
-        self._require_kinematics()
-        R = self._rot_from_arg(target_rotation, is_euler, is_radians)
-        p = np.asarray(list(target_position), dtype=float).reshape(3)
-        oMdes = pin.SE3(R, p)
-
-        limits = self._joint_limits_rad() if clamp_limits else None
-
+        dynamics = self._require_kinematics()
+        initial = None if init_q is None else self._q_in(init_q, is_radians)
         if multi_init:
-            q_sol = self._ik_multi_init(oMdes, num_attempts, max_iter, eps,
-                                        damping, adaptive_damping, limits)
-        else:
-            seed = (self.get_joint_values() if init_q is None
-                    else self._q_in(init_q, is_radians))
-            q_sol = self._ik_single(oMdes, seed, max_iter, eps, damping,
-                                    adaptive_damping, limits)
-
-        if q_sol is None:
-            return None
-        return q_sol if is_radians else np.rad2deg(q_sol)
-
-    def _ik_single(self, oMdes, seed, max_iter, eps, damping,
-                   adaptive_damping, limits) -> Optional[np.ndarray]:
-        """Single-seed damped least-squares loop (q in/out are rad)."""
-        q = np.asarray(seed, dtype=float).copy()
-        fid = self._eef_frame_id
-        dt = 1e-1
-        err_norm = float("inf")
-        for _ in range(max_iter):
-            pin.forwardKinematics(self._pin_model, self._pin_data, q)
-            pin.updateFramePlacements(self._pin_model, self._pin_data)
-            iMd = self._pin_data.oMf[fid].actInv(oMdes)
-            err = pin.log(iMd).vector
-            err_norm = float(np.linalg.norm(err))
-            if err_norm < eps:
-                return q
-            J = pin.computeFrameJacobian(self._pin_model, self._pin_data, q,
-                                         fid, pin.LOCAL)
-            J = -np.dot(pin.Jlog6(iMd.inverse()), J)
-            lam = (damping * (1.0 + 1.0 / (err_norm + 0.1))
-                   if adaptive_damping else damping)
-            JJT = J.dot(J.T) + (lam ** 2) * np.eye(6)
             try:
-                alpha = np.linalg.solve(JJT, err)
-            except np.linalg.LinAlgError:
-                return None
-            v = -J.T.dot(alpha)
-            v_norm = np.linalg.norm(v)
-            if v_norm > 10.0:
-                v *= 10.0 / v_norm
-            q = pin.integrate(self._pin_model, q, v * dt)
-            if limits is not None:
-                lo, hi = limits
-                if np.any(q < lo) or np.any(q > hi):
-                    return None
-        return None
-
-    def _ik_multi_init(self, oMdes, num_attempts, max_iter, eps, damping,
-                       adaptive_damping, limits) -> Optional[np.ndarray]:
-        """Try several seeds; return the configuration with the smallest
-        Cartesian error (early-out once within ``eps``)."""
-        seeds: List[np.ndarray] = []
-        try:
-            seeds.append(self.get_joint_values())
-        except Exception:
-            pass
-        seeds.append(np.zeros(self.num_joints))
-        if limits is not None:
-            lo, hi = limits
-            seeds.append((lo + hi) / 2.0)
-            rng = np.random.default_rng()
-            while len(seeds) < num_attempts:
-                seeds.append(rng.uniform(lo, hi))
+                current_q = self.get_joint_values()
+            except Exception:
+                current_q = np.zeros(self.num_joints)
+        elif initial is not None:
+            current_q = initial
         else:
-            while len(seeds) < num_attempts:
-                seeds.append(np.random.uniform(
-                    -np.pi / 4, np.pi / 4, self.num_joints))
+            current_q = self.get_joint_values()
+        result = dynamics.inverse_kinematics(
+            target_position,
+            target_rotation,
+            current_q=current_q,
+            init_q=initial,
+            is_euler=is_euler,
+            rotation_is_radians=is_radians,
+            max_iter=max_iter,
+            eps=eps,
+            damping=damping,
+            adaptive_damping=adaptive_damping,
+            multi_init=multi_init,
+            num_attempts=num_attempts,
+            limits=self._joint_limits_rad() if clamp_limits else None,
+        )
+        if result is None:
+            return None
+        return result if is_radians else np.rad2deg(result)
 
-        best_q = None
-        best_err = float("inf")
-        p_des = np.asarray(oMdes.translation, dtype=float)
-        for seed in seeds[:num_attempts]:
-            q = self._ik_single(oMdes, seed, max_iter, eps, damping,
-                                 adaptive_damping, limits)
-            if q is None:
-                continue
-            actual = np.asarray(self._fk_se3(q).translation, dtype=float)
-            err = float(np.linalg.norm(actual - p_des))
-            if err < best_err:
-                best_err, best_q = err, q
-            if err < eps:
-                return q
-        return best_q
-
-    def get_gravity(self, q: Optional[Iterable[float]] = None) -> np.ndarray:
+    def get_gravity(
+        self,
+        q: Optional[Iterable[float]] = None,
+    ) -> np.ndarray:
         """Generalized gravity torque ``G(q)`` (Nm), one entry per joint.
 
         Parameters
@@ -2246,39 +1959,29 @@ class FafuRobotController:
         q : iterable of float, optional
             Joint angles (rad).  Defaults to the live measured pose.
         """
-        self._require_dynamics()
-        qv = (self.get_joint_values() if q is None
-              else np.asarray(list(q), dtype=float))
-        original_linear = self._pin_model.gravity.linear.copy()
-        self._pin_model.gravity.linear = self._dyn_gravity_vec
-        try:
-            g = pin.computeGeneralizedGravity(self._pin_model, self._pin_data, qv)
-        finally:
-            self._pin_model.gravity.linear = original_linear
-        return np.asarray(g, dtype=float)
+        dynamics = self._require_dynamics()
+        value = self.get_joint_values() if q is None else list(q)
+        return dynamics.gravity(value)
 
-    def get_mass_matrix(self, q: Optional[Iterable[float]] = None) -> np.ndarray:
-        """Joint-space inertia matrix ``M(q)`` (CRBA)."""
-        self._require_dynamics()
-        qv = (self.get_joint_values() if q is None
-              else np.asarray(list(q), dtype=float))
-        M = pin.crba(self._pin_model, self._pin_data, qv)
-        n = len(qv)
-        return np.asarray(M[:n, :n], dtype=float)
+    def get_mass_matrix(
+        self,
+        q: Optional[Iterable[float]] = None,
+    ) -> np.ndarray:
+        """Return the joint-space inertia matrix."""
+        dynamics = self._require_dynamics()
+        value = self.get_joint_values() if q is None else list(q)
+        return dynamics.mass_matrix(value)
 
     def get_coriolis(
         self,
         q: Optional[Iterable[float]] = None,
         v: Optional[Iterable[float]] = None,
     ) -> np.ndarray:
-        """Coriolis/centrifugal matrix ``C(q, v)``."""
-        self._require_dynamics()
-        qv = (self.get_joint_values() if q is None
-              else np.asarray(list(q), dtype=float))
-        vv = (self.get_joint_velocities() if v is None
-              else np.asarray(list(v), dtype=float))
-        C = pin.computeCoriolisMatrix(self._pin_model, self._pin_data, qv, vv)
-        return np.asarray(C, dtype=float)
+        """Return the Coriolis/centrifugal matrix."""
+        dynamics = self._require_dynamics()
+        q_value = self.get_joint_values() if q is None else list(q)
+        v_value = self.get_joint_velocities() if v is None else list(v)
+        return dynamics.coriolis(q_value, v_value)
 
     def get_dynamics(
         self,
@@ -2286,21 +1989,12 @@ class FafuRobotController:
         v: Optional[Iterable[float]] = None,
         a: Optional[Iterable[float]] = None,
     ) -> np.ndarray:
-        """Full inverse dynamics ``tau = M(q)a + C(q,v)v + G(q)`` (RNEA)."""
-        self._require_dynamics()
-        qv = (self.get_joint_values() if q is None
-              else np.asarray(list(q), dtype=float))
-        vv = (self.get_joint_velocities() if v is None
-              else np.asarray(list(v), dtype=float))
-        av = (np.zeros(self.num_joints) if a is None
-              else np.asarray(list(a), dtype=float))
-        original_linear = self._pin_model.gravity.linear.copy()
-        self._pin_model.gravity.linear = self._dyn_gravity_vec
-        try:
-            tau = pin.rnea(self._pin_model, self._pin_data, qv, vv, av)
-        finally:
-            self._pin_model.gravity.linear = original_linear
-        return np.asarray(tau, dtype=float)
+        """Return full inverse dynamics torque in Nm."""
+        dynamics = self._require_dynamics()
+        q_value = self.get_joint_values() if q is None else list(q)
+        v_value = self.get_joint_velocities() if v is None else list(v)
+        a_value = np.zeros(self.num_joints) if a is None else list(a)
+        return dynamics.inverse_dynamics(q_value, v_value, a_value)
 
     def get_friction_compensation(
         self,
@@ -2323,21 +2017,13 @@ class FafuRobotController:
             Override the model.  Defaults to the one given to
             :meth:`setup_dynamics`, else :meth:`FrictionParams.reference_6dof`.
         """
-        if vel is None:
-            vel = self.get_joint_velocities()
-        vel = np.asarray(list(vel), dtype=float)
-
-        p = params or self._friction_params or FrictionParams.reference_6dof()
-        fc = np.asarray(p.fc, dtype=float)
-        fv = np.asarray(p.fv, dtype=float)
-        if fc.shape != vel.shape or fv.shape != vel.shape:
-            raise ValueError(
-                f"friction fc/fv length {fc.shape}/{fv.shape} != velocity "
-                f"length {vel.shape}")
-
-        full = fc * np.sign(vel) + fv * vel
-        low = fv * vel
-        return np.where(np.abs(vel) < p.vel_threshold, low, full)
+        velocity = self.get_joint_velocities() if vel is None else vel
+        model = (
+            params
+            or self._friction_params
+            or FrictionParams.reference_6dof()
+        )
+        return friction_compensation(velocity, model)
 
     def compute_compensation_torque(
         self,
@@ -2346,17 +2032,17 @@ class FafuRobotController:
         *,
         friction: bool = True,
     ) -> np.ndarray:
-        """Gravity (+ optional friction) feed-forward torque, clipped (Nm).
-
-        ``tau = clip( G(q) + [friction(v)], ±tau_limit )``.
-        """
-        self._require_dynamics()
-        tau = self.get_gravity(q)
+        """Return clipped gravity and optional friction feed-forward torque."""
+        torque = self.get_gravity(q)
         if friction:
-            tau = tau + self.get_friction_compensation(v)
+            torque = torque + self.get_friction_compensation(v)
         if self._dyn_tau_limit is not None:
-            tau = np.clip(tau, -self._dyn_tau_limit, self._dyn_tau_limit)
-        return tau
+            torque = np.clip(
+                torque,
+                -self._dyn_tau_limit,
+                self._dyn_tau_limit,
+            )
+        return torque
 
     @_guard_operation(
         "apply_compensation_torque", RobotState.GRAVITY_COMP)
@@ -2840,17 +2526,18 @@ class FafuRobotController:
         t0 = time.monotonic()
         last_t = t0
         last_log = t0
-        self._gravity_comp_active = True
-        self._gravity_comp_owner_thread_id = threading.get_ident()
         if not dry_run:
             if self._core is not None:
-                self._gravity_core_token = int(
-                    self._core.begin_operation(
-                        pm.OperationKind.GRAVITY_COMP))
+                with self._config_lock:
+                    self._gravity_core_token = int(
+                        self._core.begin_operation(
+                            pm.OperationKind.GRAVITY_COMP))
                 with self._state_lock:
                     self._state = RobotState.GRAVITY_COMP
             else:
                 self._set_state(RobotState.GRAVITY_COMP)
+        self._gravity_comp_active = True
+        self._gravity_comp_owner_thread_id = threading.get_ident()
         try:
             while True:
                 tick_start = time.monotonic()
@@ -2965,13 +2652,14 @@ class FafuRobotController:
                 RobotState.DEAD,
                 RobotState.DISCONNECTED,
             )
-            # Once safety is latched, RobotCore has already serialized STOP.
+            # RobotCore already serialized the state-specific safety action:
+            # ESTOP -> STOP; DEAD/feedback timeout -> BRAKE.
             # Do not emit a later brake/hold/home command from this cleanup.
             if dry_run:
                 pass
             elif safety_latched:
                 print(f"[FafuRobot] gravity-comp stopped ({current.name}); "
-                      "hardware cleanup skipped after safety STOP.")
+                      "hardware cleanup skipped after latched safety action.")
             elif home_on_exit:
                 # Sequence: brake (arrest motion gently) -> pause -> re-enable
                 # position mode -> slow S-curve home to 0 -> brake at home.
@@ -3112,15 +2800,21 @@ class FafuRobotController:
         """
         self._require_kinematics()
         q = self.inverse_kinematics(
-            pos, rot, is_euler=is_euler, is_radians=True,
-            init_q=init_q, **ik_kwargs,
+            pos,
+            rot,
+            is_euler=is_euler,
+            is_radians=is_radians,
+            init_q=init_q,
+            **ik_kwargs,
         )
         if q is None:
             raise RuntimeError(
                 "move_p: IK failed to converge; target pose is likely "
-                "outside the reachable workspace or near a singularity.")
-        self.move_j(q, is_radians=True, speed=speed, block=block)
-        return q
+                "outside the reachable workspace or near a singularity."
+            )
+        q_rad = q if is_radians else np.deg2rad(q)
+        self.move_j(q_rad, is_radians=True, speed=speed, block=block)
+        return q_rad
 
     @_guard_operation("move_l", RobotState.MOVING)
     def move_l(
@@ -3160,28 +2854,30 @@ class FafuRobotController:
         RuntimeError
             IK failed at some waypoint (path leaves the workspace).
         """
-        self._require_kinematics()
+        dynamics = self._require_kinematics()
         steps = max(1, int(steps))
-        R = self._rot_from_arg(rot, is_euler, is_radians)
-        p = np.asarray(list(pos), dtype=float).reshape(3)
-        goal = pin.SE3(R, p)
-
         q_now = self.get_joint_values()
-        start = self._fk_se3(q_now)
-        # Geodesic twist from start to goal in the start frame.
-        rel = pin.log6(start.actInv(goal))
+        waypoints = dynamics.cartesian_waypoints(
+            q_now,
+            pos,
+            rot,
+            is_euler=is_euler,
+            rotation_is_radians=is_radians,
+            steps=steps,
+        )
 
         # multi_init off for waypoints: we want continuity from the seed.
         ik_kwargs.setdefault("multi_init", False)
 
         path: List[np.ndarray] = []
         prev_q = q_now
-        for k in range(1, steps + 1):
-            u = k / steps
-            Tk = start * pin.exp6(rel * u)
+        for k, (translation, rotation) in enumerate(waypoints, start=1):
             q = self.inverse_kinematics(
-                Tk.translation, Tk.rotation, is_radians=True,
-                init_q=prev_q, **ik_kwargs,
+                translation,
+                rotation,
+                is_radians=True,
+                init_q=prev_q,
+                **ik_kwargs,
             )
             if q is None:
                 raise RuntimeError(
@@ -3262,7 +2958,11 @@ class FafuRobotController:
     _GRIPPER_STALL_VEL_TPS = 0.005            # < 1.8 deg/s ⇒ "not moving"
     _GRIPPER_STALL_PATIENCE_S = 0.3           # treat as done if stalled this long
 
-    @_guard_operation("gripper_control", RobotState.GRASPING)
+    @_guard_operation(
+        "gripper_control",
+        RobotState.GRASPING,
+        allow_servo_nonblocking=True,
+    )
     def gripper_control(
         self,
         angle: float,
@@ -3328,6 +3028,9 @@ class FafuRobotController:
               reaches the target (within ``tolerance_deg``), stalls,
               ``effort_threshold`` is exceeded, or ``timeout`` elapses.
             * ``False``: just send the command and return immediately.
+              The Servo owner thread may use this form during a Servo session;
+              it borrows the existing writer lease without changing the
+              active operation. No other gripper form gets this exception.
         timeout : float, optional
             Maximum seconds to wait when ``block`` is True.
         tolerance_deg : float, optional
@@ -3798,9 +3501,7 @@ class FafuRobotController:
                 pass
         self._last_cmd_turns = None
         self._servo_active = False
-        # Preserve a latched DEAD (needs recover(), not resume()); otherwise latch ESTOP.
-        if self._state is not RobotState.DEAD:
-            self._set_state(RobotState.ESTOP)
+        self._set_state(RobotState.ESTOP)
         print("[FafuRobot] EMERGENCY STOP issued (all motors → mode 0x00).")
 
     def resume(self) -> None:
@@ -3859,10 +3560,12 @@ class FafuRobotController:
     def close_connection(
         self,
         *,
-        joint_release: str = "stop",
+        joint_release: str = "brake",
         gripper_release: str = "brake",
     ) -> None:
-        """Cancel active work, release motors and close the serial port."""
+        """Cancel active work, release motors and close the serial port.
+
+        Both joint and gripper release default to short-circuit brake."""
         valid = {"stop", "brake", "hold"}
         if joint_release not in valid:
             raise ValueError(f"joint_release must be one of {valid}")
@@ -4167,6 +3870,16 @@ class FafuRobotController:
                 cmds.append(pm.ManyMotorCmd(mid, hold_pos, 0.0, max_torque))
         return cmds
 
+    @contextmanager
+    def _brake_on_motion_error(self):
+        """Brake a started joint motion before propagating its failure."""
+        try:
+            yield
+        except BaseException:
+            self._last_cmd_turns = None
+            self._core.brake_active_operation()
+            raise
+
     def _move_scurve(
         self,
         targets_turns: Dict[int, float],
@@ -4266,23 +3979,21 @@ class FafuRobotController:
             return True
 
         # The control loop runs on the C++ side with GIL released.
-        rc = self._ht.run_control_loop(
-            rate_hz,
-            list(self._cfg.motor_ids),
-            on_tick,
-            abort_check=self._combined_abort_check(abort_check),
-            on_exception=lambda msg: print(f"[FafuRobot] ctrl-loop exception: {msg}"),
-            stop_on_finish=False,
-            stop_on_abort=True,
-        )
-        if rc == 1:
-            # Aborted mid-trajectory: the commanded position is no longer
-            # the planned target, so we cannot trust it for continuity.
-            self._last_cmd_turns = None
-            raise RuntimeError("move_j aborted (abort_check returned True)")
-        if rc == 2:
-            self._last_cmd_turns = None
-            raise RuntimeError("move_j control loop exited after a send error")
+        with self._brake_on_motion_error():
+            rc = self._ht.run_control_loop(
+                rate_hz,
+                list(self._cfg.motor_ids),
+                on_tick,
+                abort_check=self._combined_abort_check(abort_check),
+                on_exception=lambda msg: print(
+                    f"[FafuRobot] ctrl-loop exception: {msg}"),
+                stop_on_finish=False,
+                stop_on_abort=False,
+            )
+            if rc in (1, 2):
+                raise RuntimeError(
+                    "move_j aborted (abort_check returned True)" if rc == 1
+                    else "move_j control loop exited after a send error")
 
         # Remember what we last *commanded* every motor to, so the next
         # blocking move can start continuously from here (see start_pos
@@ -4371,9 +4082,10 @@ class FafuRobotController:
 
         max_mid = max(self._cfg.motor_ids)
         # first broadcast == posVelMaxTorque() + motor_send_cmd()
-        with self._command_guard():
-            self._ht.set_many_pos_vel_tqe(
-                cmds, pm.PosUnit.Turns, max_mid, 0.05)
+        with self._brake_on_motion_error():
+            with self._command_guard():
+                self._ht.set_many_pos_vel_tqe(
+                    cmds, pm.PosUnit.Turns, max_mid, 0.05)
 
         last_cmd: Dict[int, float] = {}
         for mid in self._cfg.motor_ids:
@@ -4389,39 +4101,40 @@ class FafuRobotController:
         #    motion on the streaming 0x8090 channel while polling until every
         #    targeted joint settles.  A single one-shot frame does NOT move
         #    the joint here (see docstring), so the resend is mandatory.
-        deadline = time.monotonic() + max(0.1, float(timeout_s))
-        reached = False
-        while time.monotonic() < deadline:
-            if self._combined_abort_check(abort_check)():
-                self._last_cmd_turns = None
-                raise RuntimeError(
-                    "move_j(style=linear) aborted (abort_check returned True)"
-                )
-            # keep-alive resend (fire-and-forget, no reply wait) — refreshes
-            # the position loop / watchdog exactly like the S-curve loop.
-            with self._command_guard():
-                self._ht.set_many_pos_vel_tqe(
-                    cmds, pm.PosUnit.Turns, max_mid, 0.0)
-            ok = True
-            for mid, tgt in targets_turns.items():
-                s = self._ht.read_motor_state(mid, 0.1)
-                if s is None or abs(s.position - float(tgt)) > tolerance_turns:
-                    ok = False
+        with self._brake_on_motion_error():
+            deadline = time.monotonic() + max(0.1, float(timeout_s))
+            reached = False
+            while time.monotonic() < deadline:
+                if self._combined_abort_check(abort_check)():
+                    self._last_cmd_turns = None
+                    raise RuntimeError(
+                        "move_j(style=linear) aborted (abort_check returned True)"
+                    )
+                # keep-alive resend (fire-and-forget, no reply wait) — refreshes
+                # the position loop / watchdog exactly like the S-curve loop.
+                with self._command_guard():
+                    self._ht.set_many_pos_vel_tqe(
+                        cmds, pm.PosUnit.Turns, max_mid, 0.0)
+                ok = True
+                for mid, tgt in targets_turns.items():
+                    s = self._ht.read_motor_state(mid, 0.1)
+                    if s is None or abs(s.position - float(tgt)) > tolerance_turns:
+                        ok = False
+                        break
+                if ok:
+                    reached = True
                     break
-            if ok:
-                reached = True
-                break
-            time.sleep(0.02)
+                time.sleep(0.02)
 
-        if not reached:
-            print(
-                f"[FafuRobot] move_j(style=linear): not settled within "
-                f"{timeout_s:.1f}s. If the residual is small (~1 deg) it is "
-                f"the pos_vel_MAXtqe gravity steady-state error; if the joint "
-                f"barely moved, raise speed/max_torque or check for a leftover "
-                f"watchdog from a prior MIT/servo session."
-            )
-        self._last_cmd_turns = last_cmd
+            if not reached:
+                print(
+                    f"[FafuRobot] move_j(style=linear): not settled within "
+                    f"{timeout_s:.1f}s. If the residual is small (~1 deg) it is "
+                    f"the pos_vel_MAXtqe gravity steady-state error; if the joint "
+                    f"barely moved, raise speed/max_torque or check for a leftover "
+                    f"watchdog from a prior MIT/servo session."
+                )
+            self._last_cmd_turns = last_cmd
 
     def _move_acc_sync(
         self,
@@ -4457,12 +4170,13 @@ class FafuRobotController:
         # so the start is not a hard step like style="linear".
         acc = float(acc_rpss) if acc_rpss is not None else max(0.05, v_max / 0.3)
 
-        with self._command_guard():
-            for mid, tgt in targets_turns.items():
-                self._ht.set_pos_vel_acc(
-                    int(mid), float(tgt), float(v_max), float(acc),
-                    pm.PosUnit.Turns,
-                )
+        with self._brake_on_motion_error():
+            with self._command_guard():
+                for mid, tgt in targets_turns.items():
+                    self._ht.set_pos_vel_acc(
+                        int(mid), float(tgt), float(v_max), float(acc),
+                        pm.PosUnit.Turns,
+                    )
 
         last_cmd: Dict[int, float] = {}
         cur = self._last_cmd_turns or {}
@@ -4476,145 +4190,30 @@ class FafuRobotController:
             self._last_cmd_turns = last_cmd or None
             return
 
-        deadline = time.monotonic() + max(0.1, float(timeout_s))
-        reached = False
-        while time.monotonic() < deadline:
-            if self._combined_abort_check(abort_check)():
-                self._last_cmd_turns = None
-                raise RuntimeError(
-                    "move_j(style=acc) aborted (cancellation requested)"
+        with self._brake_on_motion_error():
+            deadline = time.monotonic() + max(0.1, float(timeout_s))
+            reached = False
+            while time.monotonic() < deadline:
+                if self._combined_abort_check(abort_check)():
+                    self._last_cmd_turns = None
+                    raise RuntimeError(
+                        "move_j(style=acc) aborted (cancellation requested)"
+                    )
+                ok = True
+                for mid, tgt in targets_turns.items():
+                    s = self._ht.read_motor_state(mid, 0.1)
+                    if s is None or abs(s.position - float(tgt)) > tolerance_turns:
+                        ok = False
+                        break
+                if ok:
+                    reached = True
+                    break
+                time.sleep(0.02)
+
+            if not reached:
+                print(
+                    f"[FafuRobot] move_j(style=acc): not settled within "
+                    f"{timeout_s:.1f}s (if the residual is still ~1 deg, the "
+                    f"firmware acc loop has no integral either)."
                 )
-            ok = True
-            for mid, tgt in targets_turns.items():
-                s = self._ht.read_motor_state(mid, 0.1)
-                if s is None or abs(s.position - float(tgt)) > tolerance_turns:
-                    ok = False
-                    break
-            if ok:
-                reached = True
-                break
-            time.sleep(0.02)
-
-        if not reached:
-            print(
-                f"[FafuRobot] move_j(style=acc): not settled within "
-                f"{timeout_s:.1f}s (if the residual is still ~1 deg, the "
-                f"firmware acc loop has no integral either)."
-            )
-        self._last_cmd_turns = last_cmd or None
-
-
-# ============================================================================
-#  Demo
-# ============================================================================
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="FafuRobotController demo (Piper-style high-level API)"
-    )
-    parser.add_argument(
-        "config",
-        nargs="?",
-        default=os.path.join(_HERE, "robot.cfg"),
-        help="path to robot.cfg",
-    )
-    parser.add_argument(
-        "--gripper-id",
-        type=int,
-        default=None,
-        help="motor id of the gripper (omit if no gripper)",
-    )
-    parser.add_argument("--speed", type=int, default=15,
-                        help="speed percent for the demo (default 15)")
-    parser.add_argument("--no-move", action="store_true",
-                        help="only read state, do not issue any motion")
-    args = parser.parse_args()
-
-    has_gripper = args.gripper_id is not None
-    arm = FafuRobotController(
-        cfg_path=args.config,
-        has_gripper=has_gripper,
-        gripper_motor_id=args.gripper_id,
-    )
-
-    def _print(*a, **kw):
-        # The 50Hz polling thread can interleave its log output with
-        # ours. Sleep briefly so its line is fully flushed first,
-        # then print our own line with explicit flush.
-        time.sleep(0.02)
-        kw.setdefault("flush", True)
-        print(*a, **kw)
-
-    try:
-        _print("\n--- Initial state ---")
-        q = arm.get_joint_values()
-        _print(f"  joint angles (deg): {np.degrees(q).round(2).tolist()}")
-        _print(f"  is_enabled        : {arm.is_enabled}")
-        _print(f"  stats             : {arm.get_status().to_string()}")
-
-        if args.no_move:
-            _print("\n[--no-move] skipping motion demo.")
-        else:
-            _print("\n--- Going home (joint zero) ---")
-            arm.go_home(speed=args.speed, block=True)
-
-            _print("\n--- Tiny sinusoidal demo (block=False) ---")
-            base = arm.get_joint_values()
-            q0 = base.copy()
-            amp = math.radians(10.0)      # swing amplitude
-            margin = math.radians(2.0)    # keep this far inside soft limits
-
-            # Pick a joint whose [q0-amp, q0+amp] swing stays inside its
-            # soft limits.  This avoids the old bug of driving the last
-            # joint to an *absolute* +-10 deg around 0, which on this arm
-            # slams J7 into its soft limit (upper bound -1.836 deg).
-            lims = arm._joint_limits_rad()
-            demo_idx = None
-            # Prefer the wrist/last joints first, then fall back inward.
-            for idx in range(arm.num_joints - 1, -1, -1):
-                if lims is None:
-                    demo_idx = idx          # no limits known: trust the swing
-                    break
-                lo, hi = lims[0][idx], lims[1][idx]
-                if (q0[idx] - amp) >= (lo + margin) and \
-                   (q0[idx] + amp) <= (hi - margin):
-                    demo_idx = idx
-                    break
-
-            if demo_idx is None:
-                _print("  no joint has +-10 deg of room inside its soft "
-                       "limits at this pose; skipping the sinusoidal demo.")
-            else:
-                _print(f"  swinging J{demo_idx + 1} around its current angle "
-                       f"({math.degrees(q0[demo_idx]):+.1f} deg) by +-10 deg")
-                for i in range(40):
-                    # Oscillate *around the current angle*, not around 0.
-                    base[demo_idx] = q0[demo_idx] + amp * math.sin(i * math.pi / 20.0)
-                    arm.move_j(base, speed=args.speed, block=False)
-                    time.sleep(0.05)
-                # Return that joint to where it started.
-                base[demo_idx] = q0[demo_idx]
-                arm.move_j(base, speed=args.speed, block=False)
-
-            if has_gripper:
-                _print("\n--- Gripper demo (open -> close, using soft limits) ---")
-                arm.open_gripper()        # blocking, default vel 0.3 turns/s
-                gs = arm.get_gripper_state()
-                _print(f"  after open : gripper "
-                       f"{math.degrees(arm._turns_to_rad(gs.position)):+.2f} deg")
-                time.sleep(0.3)
-                arm.close_gripper()
-                gs = arm.get_gripper_state()
-                _print(f"  after close: gripper "
-                       f"{math.degrees(arm._turns_to_rad(gs.position)):+.2f} deg")
-
-        _print("\n--- Final state ---")
-        q = arm.get_joint_values()
-        _print(f"  joint angles (deg): {np.degrees(q).round(2).tolist()}")
-        if has_gripper:
-            gs = arm.get_gripper_state()
-            _print(f"  gripper           : "
-                   f"{math.degrees(arm._turns_to_rad(gs.position)):+.2f} deg")
-    finally:
-        arm.close_connection()
+            self._last_cmd_turns = last_cmd or None

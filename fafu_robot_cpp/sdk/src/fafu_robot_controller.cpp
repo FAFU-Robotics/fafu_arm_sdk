@@ -47,8 +47,22 @@ fafu::core::FinishMode to_finish_mode(ReleaseMode mode) {
 
 class CoreLease {
 public:
-    CoreLease(fafu::core::RobotCore& core, fafu::core::OperationKind kind)
-        : core_(&core), token_(core.begin_operation(kind)) {}
+    CoreLease(fafu::core::RobotCore& core,
+              fafu::core::OperationKind kind,
+              bool borrow_owned_servo = false)
+        : core_(nullptr), token_(0) {
+        // A non-blocking gripper position command may share the current
+        // thread's Servo writer. Do not acquire/end another operation: the
+        // controller must remain SERVOING for the whole Servo session.
+        if (borrow_owned_servo &&
+            kind == fafu::core::OperationKind::GripperMotion &&
+            core.active_operation() == fafu::core::OperationKind::Servo &&
+            core.operation_owned_by_current_thread()) {
+            return;
+        }
+        core_ = &core;
+        token_ = core.begin_operation(kind);
+    }
 
     ~CoreLease() {
         if (core_ != nullptr) {
@@ -314,6 +328,7 @@ bool FafuRobotController::move_j(const std::vector<double>& joint_angles,
         ht_->set_many_pos_vel_tqe(
             cmds, hightorque::PosUnit::Turns, max_mid, 0.05);
     } catch (const std::exception& e) {
+        core_->brake_active_operation();
         log_warn(std::string("move_j (no block) 失败: ") + e.what());
         return false;
     }
@@ -351,6 +366,7 @@ void FafuRobotController::servo_start(const ServoOpts& opts) {
     native.nominal_rate_hz = opts.rate_hz;
     native.input_is_radians = opts.is_radians;
     native.feedforward_velocity = opts.feedforward_vel;
+    native.position_error_deadband_rad = opts.position_error_deadband_rad;
     native.lookahead_time_s = opts.lookahead_time;
     native.lag_abort_consecutive = opts.lag_abort_consecutive;
     native.channel = opts.use_mit
@@ -440,7 +456,10 @@ FafuRobotController::gripper_control(double angle) {
 std::optional<GraspResult>
 FafuRobotController::gripper_control(double angle, const GripperOpts& opts) {
     if (!core_) throw std::runtime_error("controller core is unavailable");
-    CoreLease operation(*core_, fafu::core::OperationKind::GripperMotion);
+    CoreLease operation(
+        *core_,
+        fafu::core::OperationKind::GripperMotion,
+        /*borrow_owned_servo=*/!opts.block);
     if (!has_gripper_)
         throw std::runtime_error("FafuRobotController was constructed without a gripper");
     if (!core_->stream_link_ok()) {
@@ -989,18 +1008,26 @@ void FafuRobotController::move_scurve_(const std::map<int, double>& targets_turn
     loop_opts.rate_hz             = rate_hz;
     loop_opts.stop_motor_ids      = cfg_.motor_ids;
     loop_opts.stop_on_finish      = false;   // 跟 Python 一致: 正常完成保持 mode=10
-    loop_opts.stop_on_abort       = true;
+    loop_opts.stop_on_abort       = false;  // Core already applies ESTOP=Stop / DEAD=Brake.
     loop_opts.abort_check = [this] {
         return !core_ || core_->cancel_requested() ||
                !core_->stream_link_ok();
     };
 
-    const int result = ht_->run_control_loop(loop_opts, on_tick);
-    if (result == 1) {
-        throw std::runtime_error("control loop was cancelled");
+    int result = 0;
+    try {
+        result = ht_->run_control_loop(loop_opts, on_tick);
+    } catch (...) {
+        core_->brake_active_operation();
+        throw;
     }
-    if (result == 2) {
-        throw std::runtime_error("control loop exited after a send error");
+    if (result == 1 || result == 2) {
+        // Generic cancellation/send failure brakes in place. If DEAD/ESTOP
+        // already won, RobotCore preserves its authoritative Brake/Stop.
+        core_->brake_active_operation();
+        throw std::runtime_error(
+            result == 1 ? "control loop was cancelled"
+                        : "control loop exited after a send error");
     }
 }
 

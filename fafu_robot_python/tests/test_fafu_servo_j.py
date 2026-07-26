@@ -48,7 +48,7 @@ test_fafu_servo_j.py
         per-joint max |lag| (deg): [0.42, 0.55, 0.61, 0.34, 0.48, 0.71]
         loop jitter p99 = 2.1ms
     [FafuRobot] servo_end (brake): 600 ticks in 6.02s (~99.7 Hz)
-    [FafuRobot] connection closed (joints=stop, gripper=brake).
+    [FafuRobot] connection closed (joints=brake, gripper=brake).
 """
 from __future__ import annotations
 

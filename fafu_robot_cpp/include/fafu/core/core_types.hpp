@@ -6,7 +6,7 @@
 
 namespace fafu::core {
 
-inline constexpr int CORE_ABI_VERSION = 2;
+inline constexpr int CORE_ABI_VERSION = 3;
 inline constexpr int MODE_STOP = 0x00;
 inline constexpr int MODE_ACTIVE = 0x0A;
 inline constexpr int MODE_MIT = 0x0B;
@@ -98,6 +98,8 @@ struct ServoOptions {
     ServoChannel channel = ServoChannel::Mit;
     std::vector<double> mit_kp;
     std::vector<double> mit_kd;
+    // Appended to preserve aggregate-initializer field order.
+    double position_error_deadband_rad = 0.001;
 };
 
 struct ServoTickResult {

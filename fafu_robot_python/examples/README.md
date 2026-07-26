@@ -1,6 +1,6 @@
 # 基础示例
 
-这里的示例刻意保持简单：不使用 `argparse`，不需要传命令行参数。
+01–06 示例刻意保持简单：不使用 `argparse`，不需要传命令行参数。
 串口、电机 ID 和软限位统一从上一级的 `robot.cfg` 读取；需要修改的少量参数都写在脚本顶部。
 
 | 文件 | 展示内容 |
@@ -11,6 +11,7 @@
 | `04_enable_disable.py` | `enable`、`brake`、`disable` 生命周期 |
 | `05_servo_joint.py` | 使用 `servo_start/servo_j/servo_end` 流式发送目标 |
 | `06_emergency_stop.py` | 急停状态和人工确认后的恢复 |
+| `07_full_demo.py` | 原 Controller 内置的完整命令行演示 |
 | `visible_motion.py` | 幅度更明显的综合真机演示 |
 
 在 SDK 根目录运行，例如：

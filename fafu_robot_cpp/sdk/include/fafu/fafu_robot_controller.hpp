@@ -26,7 +26,7 @@
 //      arm.open_gripper();
 //      auto r = arm.grasp({.force_threshold = 500});    // 力控抓取
 //      if (r.grasped) std::cout << "got it!\n";
-//      // 析构时自动 close_connection (gripper=brake, joints=stop)
+//      // 析构时自动 close_connection (gripper=brake, joints=brake)
 //
 //  线程模型:
 //    - 构造完成后内部有 1 个 RX 线程 (异步串口接收) + 1 个 polling 线程 (50Hz 缓存
@@ -75,8 +75,8 @@ inline constexpr uint8_t MODE_POSITION = MODE_ACTIVE;
 
 // close_connection() 时如何对待电机
 enum class ReleaseMode {
-    Stop,   // 0x00, PWM off, 自由可手推                 (默认: joints)
-    Brake,  // 0x0F, 短路刹车, 抗动但不出力              (默认: gripper)
+    Stop,   // 0x00, PWM off, 自由可手推
+    Brake,  // 0x0F, 短路刹车, 抗动但不出力              (默认: joints/gripper)
     Hold,   // 0x0A, 继续维持上一次位置 (耗电, 不要久挂)
 };
 
@@ -163,7 +163,7 @@ public:
     explicit FafuRobotController(const std::string& cfg_path);
     explicit FafuRobotController(const std::string& cfg_path, const Options& opts);
 
-    // 析构会自动调 close_connection({Stop, Brake}) (跟 Python __exit__ 一致).
+    // 析构会自动调 close_connection({Brake, Brake}) (跟 Python __exit__ 一致).
     ~FafuRobotController();
 
     FafuRobotController(const FafuRobotController&)            = delete;
@@ -264,8 +264,8 @@ public:
         // 0 = 禁用看门狗 (★ 不推荐, 上位机崩溃后电机会保持上一指令冲到限位 ★).
         int    watchdog_ms      = 100;
 
-        // 每关节最大速度 (rad/s), 写到 set_many_pos_vel_tqe 的 vel 字段.
-        // 电机内部用此速度跟随目标点. 取保守值, 默认 1.0 rad/s (~57 deg/s).
+        // 每关节最大速度 (rad/s). Position 通道把 vel 解释为非负速度上限;
+        // MIT 通道把它作为有符号期望速度的绝对上界. 默认 1.0 rad/s.
         double max_vel          = 1.0;
 
         // 单步最大跳变 (rad). 跟上次 target 比, |Δ| > max_step_rad 会被
@@ -279,6 +279,9 @@ public:
         double max_lag_rad      = 0.2;
 
         // 进阶选项由共享 C++ core 实现; 默认保持旧 C++ SDK 的 position 通道.
+        // Position + feedforward: 正速度上限取路径速度和实测误差追赶速度的较大值;
+        // 目标静止后仍会追赶, 仅进入 deadband 后归零. feedforward=false 时固定
+        // 使用 max_vel. MIT 前馈仍保留正负号.
         double rate_hz           = 100.0;
         bool   feedforward_vel   = true;
         double lookahead_time    = 0.0;
@@ -292,6 +295,10 @@ public:
 
         // joint_angles 单位 (true=弧度, false=度). 跟 move_j 一致.
         bool   is_radians       = true;
+
+        // Position 实测跟踪误差在此范围内时, 静止目标允许速度上限归零.
+        // Appended to preserve aggregate-initializer field order.
+        double position_error_deadband_rad = 0.001;
     };
 
     // 进入 servo 会话. 失败抛 std::runtime_error.
@@ -338,6 +345,8 @@ public:
         double vel             = 0.3;    // turns/s
         double acc             = 0.5;    // turns/s^2 (effort 提供时无效)
         bool   block           = true;
+        // Servo owner 线程仅可复用 writer 发送 block=false 的单帧位置命令;
+        // block=true、其他线程、grasp() 和新的关节运动仍会报 BusyError.
         double timeout_s       = 8.0;
         double tolerance_deg   = 1.5;
 
@@ -427,7 +436,7 @@ public:
     //
     //  析构里也会调一次, 但显式调用允许定制 joint_release / gripper_release 策略.
     // ----------------------------------------------------------------------
-    void close_connection(ReleaseMode joint_release   = ReleaseMode::Stop,
+    void close_connection(ReleaseMode joint_release   = ReleaseMode::Brake,
                           ReleaseMode gripper_release = ReleaseMode::Brake);
 
 private:
