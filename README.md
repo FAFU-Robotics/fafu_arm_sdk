@@ -55,7 +55,7 @@ fafu_robot_sdk/
 
 ### 情况 A — `.pyd` 已经在 `fafu_robot_python/` 里 (大多数用户)
 
-仓库里已经带好了 `fafu_motor.cp310-win_amd64.pyd`，只要你的 Python 是 cp310：
+仓库里已经带好了 Python 3.10 / 3.12 对应的预编译 `.pyd`：
 
 ```bash
 cd fafu_robot_sdk/fafu_robot_python

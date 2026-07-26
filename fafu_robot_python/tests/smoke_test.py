@@ -117,13 +117,12 @@ def step_import_controller() -> int:
         return failed(f"FafuRobotController 缺少方法: {miss}")
     passed(f"FafuRobotController 接口完整 ({len(expected_methods)} 个方法)")
 
-    rad = FafuRobotController._rad_to_turns(3.141592653589793)
-    if abs(rad - 0.5) > 1e-9:
-        return failed(f"_rad_to_turns(pi) 应该 = 0.5, 得到 {rad}")
+    if hasattr(FafuRobotController, "_rad_to_turns"):
+        return failed("控制器不应暴露 radians -> turns 下发转换 helper")
     rad2 = FafuRobotController._turns_to_rad(0.5)
     if abs(rad2 - 3.141592653589793) > 1e-9:
         return failed(f"_turns_to_rad(0.5) 应该 = pi, 得到 {rad2}")
-    passed("单位换算 (rad ↔ turns) 正确")
+    passed("radians API 边界与反馈单位换算正确")
     return 0
 
 

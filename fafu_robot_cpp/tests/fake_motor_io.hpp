@@ -3,6 +3,7 @@
 #include "fafu/core/core_types.hpp"
 #include "fafu/core/motor_io.hpp"
 
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -35,12 +36,17 @@ public:
 
     bool is_open() const override {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (throw_on_is_open_) {
+            throw std::runtime_error("injected is_open failure");
+        }
         return open_;
     }
 
     std::optional<hightorque::MotorState> read_state(
             int motor_id, double) override {
         std::lock_guard<std::mutex> lock(mutex_);
+        ++read_counts_[motor_id];
+        if (fail_next_reads_.erase(motor_id) != 0) return std::nullopt;
         if (!open_ || missing_.count(motor_id) != 0) {
             return std::nullopt;
         }
@@ -65,6 +71,15 @@ public:
         return it == ages_ms_.end()
             ? std::numeric_limits<double>::infinity()
             : it->second;
+    }
+
+    std::optional<std::pair<double, double>> position_limit_turns(
+            int motor_id) const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (position_limit_observer_) position_limit_observer_();
+        const auto it = limits_.find(motor_id);
+        if (it == limits_.end()) return std::nullopt;
+        return it->second;
     }
 
     std::optional<hightorque::MotorState> set_mode(
@@ -165,6 +180,53 @@ public:
         states_.at(motor_id).position = turns;
     }
 
+    void set_position_limit(int motor_id, double lo, double hi) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        limits_[motor_id] = {lo, hi};
+    }
+
+    void set_position_limit_observer(std::function<void()> observer) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        position_limit_observer_ = std::move(observer);
+    }
+
+    void fail_next_read(int motor_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fail_next_reads_.insert(motor_id);
+    }
+
+    void fail_next_send() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        fail_next_send_ = true;
+    }
+
+    void set_open(bool open) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        open_ = open;
+    }
+
+    void set_throw_on_is_open(bool enabled) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        throw_on_is_open_ = enabled;
+    }
+
+    int read_count(int motor_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = read_counts_.find(motor_id);
+        return it == read_counts_.end() ? 0 : it->second;
+    }
+
+    void clear_read_counts() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        read_counts_.clear();
+    }
+
+    int watchdog(int motor_id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = watchdogs_.find(motor_id);
+        return it == watchdogs_.end() ? 0 : it->second;
+    }
+
     void set_mode_direct(int motor_id, int mode) {
         std::lock_guard<std::mutex> lock(mutex_);
         states_.at(motor_id).mode = mode;
@@ -189,6 +251,11 @@ public:
         false_negative_mode_switches_ = count;
     }
 
+    void set_follow_position_commands(bool follow) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        follow_position_commands_ = follow;
+    }
+
     int reset_count() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return reset_count_;
@@ -209,10 +276,16 @@ private:
         if (!open_) {
             throw std::runtime_error("fake transport is closed");
         }
+        if (fail_next_send_) {
+            fail_next_send_ = false;
+            throw std::runtime_error("injected send failure");
+        }
         frames_.push_back(
             SentFrame{mit, motor_ids, positions, velocities, torques});
         for (std::size_t i = 0; i < motor_ids.size(); ++i) {
-            states_.at(motor_ids[i]).position = positions[i];
+            if (mit || follow_position_commands_) {
+                states_.at(motor_ids[i]).position = positions[i];
+            }
             states_.at(motor_ids[i]).velocity = velocities[i];
             states_.at(motor_ids[i]).mode =
                 mit ? MODE_MIT : MODE_ACTIVE;
@@ -222,15 +295,22 @@ private:
 
     mutable std::mutex mutex_;
     bool open_ = true;
+    bool throw_on_is_open_ = false;
     bool async_rx_ = false;
     bool polling_ = false;
     bool reset_clears_mit_ = true;
+    bool follow_position_commands_ = true;
+    bool fail_next_send_ = false;
     int false_negative_mode_switches_ = 0;
     int reset_count_ = 0;
     std::map<int, hightorque::MotorState> states_;
     std::map<int, double> ages_ms_;
     std::map<int, int> watchdogs_;
+    std::map<int, int> read_counts_;
+    std::map<int, std::pair<double, double>> limits_;
+    std::function<void()> position_limit_observer_;
     std::set<int> missing_;
+    std::set<int> fail_next_reads_;
     std::vector<SentFrame> frames_;
 };
 

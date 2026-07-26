@@ -51,6 +51,7 @@ test_fafu_grasp_calibrate.py
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -101,8 +102,8 @@ def main() -> int:
                         help="夹爪 motor id (必填; 通常 7)")
     parser.add_argument("--samples", type=int, default=3,
                         help="每个阶段重复多少次 (默认 3)")
-    parser.add_argument("--vel", type=float, default=0.15,
-                        help="抓取速度 turns/s (默认 0.15 ~ 54 deg/s)")
+    parser.add_argument("--vel", type=float, default=0.15 * 2.0 * math.pi,
+                        help="抓取速度 rad/s (默认约 0.94，即 54 deg/s)")
     parser.add_argument("--timeout", type=float, default=6.0,
                         help="单次 grasp 超时 秒 (默认 6)")
     parser.add_argument("--safety-factor", type=float, default=0.5,

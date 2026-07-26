@@ -85,6 +85,11 @@ double  int16_to_turns(int16_t val);
 int16_t rps_to_int16(double rps);
 double  int16_to_rps(int16_t val);
 
+// Position control uses velocity/acceleration as non-negative limits. Motion
+// direction comes from target position relative to the current position.
+int16_t position_speed_limit_to_int16(double rps);
+int16_t position_acceleration_limit_to_int16(double rpss);
+
 int16_t rad_to_int16(double rad);
 double  int16_to_rad(int16_t val);
 
@@ -335,6 +340,10 @@ public:
     std::optional<MotorState> set_pos_vel_tqe(int motor_id, double pos,
                                               double vel_rps, int tqe_raw,
                                               PosUnit unit = PosUnit::Turns);
+    // Radians-only adapter for high-level SDKs. Protocol turns stay here.
+    std::optional<MotorState> set_pos_vel_tqe_rad(
+        int motor_id, double pos_rad, double vel_rad_s, int tqe_raw);
+
     // 推荐的位置控制方式 (梯形): 位置 + 最大速度 + 加速度
     //   pos:           默认圈, 可指定 unit 为 Radians / Degrees
     //   vel_max_rps:   转/秒
@@ -342,6 +351,9 @@ public:
     std::optional<MotorState> set_pos_vel_acc(int motor_id, double pos,
                                               double vel_max_rps, double acc_rpss,
                                               PosUnit unit = PosUnit::Turns);
+    std::optional<MotorState> set_pos_vel_acc_rad(
+        int motor_id, double pos_rad, double vel_max_rad_s,
+        double acc_rad_s2);
 
     // 速度 + 加速度模式 (协议文档 3.1.9):
     //   以 acc_rpss 的恒定加速度加速到 vel_rps, 然后保持该速度持续转动.
@@ -437,6 +449,15 @@ public:
         PosUnit pos_unit     = PosUnit::Turns,
         int     max_motor_id = 0,
         double  timeout_s    = 0.05);
+    std::map<int, MotorState> set_many_mit_rad(
+        const std::vector<int>&    motor_ids,
+        const std::vector<double>& pos_rad,
+        const std::vector<double>& vel_rad_s,
+        const std::vector<int>&    tqe_raw,
+        const std::vector<int>&    kp_raw,
+        const std::vector<int>&    kd_raw,
+        int     max_motor_id = 0,
+        double  timeout_s    = 0.05);
 
     // motor_model 用于查 TORQUE_COEFF 表换算 Nm; 留空则当作系数 1.0
     std::optional<MotorState> set_torque(int motor_id, double tqe_nm,
@@ -449,6 +470,10 @@ public:
                                                     double tqe_nm, double kp, double kd,
                                                     const std::string& motor_model = "",
                                                     PosUnit unit = PosUnit::Turns);
+    std::optional<MotorState> set_pos_vel_tqe_kp_kd_rad(
+        int motor_id, double pos_rad, double vel_rad_s,
+        double tqe_nm, double kp, double kd,
+        const std::string& motor_model = "");
 
     std::string reset_zero(int motor_id);
     std::string save_config(int motor_id);

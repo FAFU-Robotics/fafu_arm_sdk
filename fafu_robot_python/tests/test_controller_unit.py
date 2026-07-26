@@ -31,6 +31,16 @@ class _ServoOptions:
     pass
 
 
+class _MoveJOptions:
+    def __init__(self):
+        self.block = True
+        self.max_velocity_rad_s = 1.0
+        self.control_rate_hz = 100.0
+        self.min_duration_s = 0.3
+        self.tolerance_rad = 0.01
+        self.settle_timeout_s = 1.0
+
+
 class _NativeRobotState(Enum):
     DISCONNECTED = 0
     DISABLED = 1
@@ -61,16 +71,33 @@ class _FinishMode(Enum):
     HOLD = 2
 
 
+class _StateError(RuntimeError):
+    pass
+
+
+class _BusyError(_StateError):
+    pass
+
+
+class _EnableOptions:
+    def __init__(self):
+        self.allow_motor_reset = True
+
+
 # The controller imports the native extension at module import time. These unit
 # tests exercise Python policy only, so provide the smallest compatible module.
 _fake_motor = types.ModuleType("fafu_motor")
-_fake_motor.CORE_ABI_VERSION = 3
+_fake_motor.CORE_ABI_VERSION = 4
 _fake_motor.PosUnit = _PosUnit
 _fake_motor.ServoChannel = _ServoChannel
 _fake_motor.ServoOptions = _ServoOptions
+_fake_motor.MoveJOptions = _MoveJOptions
 _fake_motor.OperationKind = _OperationKind
 _fake_motor.RobotState = _NativeRobotState
 _fake_motor.FinishMode = _FinishMode
+_fake_motor.StateError = _StateError
+_fake_motor.BusyError = _BusyError
+_fake_motor.EnableOptions = _EnableOptions
 _fake_motor.gain_to_raw = lambda gain, _model: int(round(gain * 10.0 * 2.0 * np.pi))
 _fake_motor.torques_to_raw = lambda values, _models, scale=1.0: [
     int(round(value * scale / 0.01)) for value in values
@@ -88,6 +115,22 @@ sys.modules[_spec.name] = controller
 _spec.loader.exec_module(controller)
 
 
+class _FakeRobotConfig:
+    def __init__(self):
+        self.motor_ids = [1, 2]
+        self.control_rate_hz = 100.0
+        self.trajectory_dt_s = 0.3
+        self._limits = {}
+
+    @property
+    def limits(self):
+        return dict(self._limits)
+
+    @limits.setter
+    def limits(self, value):
+        self._limits = dict(value)
+
+
 class _FakeDriver:
     def __init__(self, ages=None, responses=None):
         self.ages = dict(ages or {1: 0.0, 2: 0.0})
@@ -95,8 +138,12 @@ class _FakeDriver:
         self.mit_calls = []
         self.pos_vel_tqe_calls = []
         self.pos_vel_acc_calls = []
-        self.control_loop_result = 0
-        self.control_loop_calls = []
+        self.position_limit_calls = []
+        self.position_limits = {}
+        self.disable_limit_calls = []
+        self.clear_limit_calls = 0
+        self.mode_calls = []
+        self.stop_calls = []
         self.open = True
 
     def is_async_rx(self):
@@ -119,15 +166,43 @@ class _FakeDriver:
         self.mit_calls.append(args)
         return {}
 
+    def set_many_mit_rad(self, *args):
+        self.mit_calls.append(args)
+        return {}
+
     def set_pos_vel_tqe(self, *args):
+        self.pos_vel_tqe_calls.append(args)
+
+    def set_pos_vel_tqe_rad(self, *args):
         self.pos_vel_tqe_calls.append(args)
 
     def set_pos_vel_acc(self, *args):
         self.pos_vel_acc_calls.append(args)
 
-    def run_control_loop(self, *args, **kwargs):
-        self.control_loop_calls.append((args, kwargs))
-        return self.control_loop_result
+    def set_pos_vel_acc_rad(self, *args):
+        self.pos_vel_acc_calls.append(args)
+
+    def enable_position_limit(self, motor_id, lo, hi, unit):
+        self.position_limit_calls.append((motor_id, lo, hi, unit))
+        scale = 2.0 * np.pi if unit is _PosUnit.Radians else 360.0
+        self.position_limits[motor_id] = (lo / scale, hi / scale)
+
+    def get_position_limit_turns(self, motor_id):
+        return self.position_limits.get(motor_id)
+
+    def disable_position_limit(self, motor_id):
+        self.disable_limit_calls.append(motor_id)
+        self.position_limits.pop(motor_id, None)
+
+    def clear_all_position_limits(self):
+        self.clear_limit_calls += 1
+        self.position_limits.clear()
+
+    def set_motor_mode(self, motor_id, mode):
+        self.mode_calls.append((motor_id, mode))
+
+    def stop(self, motor_id):
+        self.stop_calls.append(motor_id)
 
     def is_open(self):
         return self.open
@@ -136,80 +211,367 @@ class _FakeDriver:
         self.open = False
 
 
-class _FakeServoCore:
-    def __init__(self):
-        self.state = _NativeRobotState.SERVOING
-        self.active_operation = _OperationKind.SERVO
-        self.dead_reason = ""
+class _FakeRobotCore:
+    _BUSY_STATE = {
+        _OperationKind.JOINT_MOTION: _NativeRobotState.MOVING,
+        _OperationKind.RAW_STREAM: _NativeRobotState.MOVING,
+        _OperationKind.SERVO: _NativeRobotState.SERVOING,
+        _OperationKind.GRIPPER_MOTION: _NativeRobotState.GRASPING,
+        _OperationKind.GRASP: _NativeRobotState.GRASPING,
+        _OperationKind.GRAVITY_COMP: _NativeRobotState.GRAVITY_COMP,
+    }
+
+    def __init__(
+        self,
+        *,
+        state=_NativeRobotState.IDLE,
+        link_ok=True,
+        alive=True,
+        dead_reason="",
+    ):
+        self.state = state
+        self.active_operation = _OperationKind.NONE
         self.cancel_requested = False
-        self.is_servoing = True
-        self._owner = threading.get_ident()
-        self._depth = 1
-        self._token = 41
+        self.dead_reason = dead_reason
+        self.is_servoing = False
+        self.closing = False
+        self.link_ok = bool(link_ok)
+        self.alive = bool(alive)
+        self._lock = threading.RLock()
+        self._idle = threading.Condition(self._lock)
+        self._owner = None
+        self._depth = 0
+        self._token = 0
         self.begin_calls = []
         self.end_calls = []
         self.servo_tick_calls = []
+        self.servo_start_calls = []
+        self.move_j_calls = []
+        self.shutdown_calls = []
+        self.motor_model_calls = []
+        self.brake_active_calls = 0
+
+        if state is _NativeRobotState.SERVOING:
+            self.active_operation = _OperationKind.SERVO
+            self.is_servoing = True
+            self._owner = threading.get_ident()
+            self._depth = 1
+            self._token = 1
 
     def operation_owned_by_current_thread(self):
-        return self._owner == threading.get_ident() and self._depth > 0
-
-    def stream_link_ok(self):
-        return True
+        with self._lock:
+            return (
+                self._depth > 0
+                and self._owner == threading.get_ident()
+            )
 
     def begin_operation(self, kind):
-        self.begin_calls.append((threading.get_ident(), kind))
-        if not self.operation_owned_by_current_thread():
-            raise RuntimeError("another thread owns the active control operation")
-        if kind != self.active_operation:
-            raise RuntimeError("nested control operations must have the same kind")
-        self._depth += 1
-        return self._token
+        caller = threading.get_ident()
+        self.begin_calls.append((caller, kind))
+        with self._lock:
+            if self.closing:
+                raise _StateError("controller is closing")
+            if self._depth > 0:
+                if self._owner != caller:
+                    raise _BusyError(
+                        "another thread owns the active control operation"
+                    )
+                if kind is not self.active_operation:
+                    raise _BusyError(
+                        "nested control operations must have the same kind"
+                    )
+                self._depth += 1
+                return self._token
+
+            if self.state is _NativeRobotState.DISCONNECTED:
+                raise _StateError("controller is disconnected")
+            if self.state is _NativeRobotState.DEAD:
+                raise _StateError(f"controller is DEAD: {self.dead_reason}")
+            if self.state is _NativeRobotState.ESTOP:
+                raise _StateError("controller is in ESTOP")
+            if (
+                kind is not _OperationKind.LIFECYCLE
+                and self.state is not _NativeRobotState.IDLE
+            ):
+                raise _StateError(
+                    f"control operation requires IDLE; current state={self.state.name}"
+                )
+
+            self._token += 1
+            self._owner = caller
+            self._depth = 1
+            self.active_operation = kind
+            busy_state = self._BUSY_STATE.get(kind)
+            if busy_state is not None:
+                self.state = busy_state
+            return self._token
 
     def end_operation(self, token):
         self.end_calls.append(token)
-        if token != self._token:
-            raise RuntimeError("operation token is stale")
-        if not self.operation_owned_by_current_thread():
-            raise RuntimeError("operation must be ended by its owner thread")
-        self._depth -= 1
+        with self._lock:
+            if self._depth == 0:
+                return
+            if token != self._token:
+                raise _StateError("operation token is stale")
+            if self._owner != threading.get_ident():
+                raise _StateError(
+                    "operation must be ended by its owner thread"
+                )
+
+            self._depth -= 1
+            if self._depth:
+                return
+
+            operation = self.active_operation
+            self.active_operation = _OperationKind.NONE
+            self._owner = None
+            if (
+                not self.closing
+                and self.state is self._BUSY_STATE.get(operation)
+            ):
+                self.state = _NativeRobotState.IDLE
+            self._idle.notify_all()
 
     def command_guard(self):
         if not self.operation_owned_by_current_thread():
-            raise RuntimeError(
+            raise _BusyError(
                 "command send requires ownership of the active operation"
             )
+        if self.closing:
+            raise _StateError("controller is closing")
+        if self.state is _NativeRobotState.DISCONNECTED:
+            raise _StateError("controller is disconnected")
+        if self.state is _NativeRobotState.DEAD:
+            raise _StateError(f"controller is DEAD: {self.dead_reason}")
+        if self.state is _NativeRobotState.ESTOP:
+            raise _StateError("controller is in ESTOP")
         return nullcontext()
 
+    def _latch_dead(self, reason):
+        if self.state not in (
+            _NativeRobotState.DISCONNECTED,
+            _NativeRobotState.ESTOP,
+        ):
+            self.dead_reason = str(reason)
+            self.state = _NativeRobotState.DEAD
+            self.cancel_requested = True
+
+    def stream_link_ok(self):
+        if not self.link_ok:
+            self._latch_dead(
+                self.dead_reason or "stale motor feedback"
+            )
+            return False
+        return self.state not in (
+            _NativeRobotState.DEAD,
+            _NativeRobotState.DISCONNECTED,
+        )
+
+    def health(self):
+        return types.SimpleNamespace(
+            state=self.state,
+            active_operation=self.active_operation,
+            closing=self.closing,
+            cancel_requested=self.cancel_requested,
+            dead_reason=self.dead_reason,
+            stale_motor_ids=[],
+            link_ok=self.link_ok,
+        )
+
+    def check_alive(self, fresh=True, timeout=0.1):
+        del fresh, timeout
+        if not self.alive:
+            self._latch_dead(
+                self.dead_reason or "one or more motors did not respond"
+            )
+            return False
+        return self.state is not _NativeRobotState.DISCONNECTED
+
+    def recover(self, confirm, timeout=0.2):
+        del timeout
+        if not confirm:
+            raise _StateError("recover requires confirmation")
+        if self._depth:
+            raise _BusyError("active operation has not stopped yet")
+        if self.state is not _NativeRobotState.DEAD:
+            return True
+        if not self.alive:
+            return False
+        self.dead_reason = ""
+        self.cancel_requested = False
+        self.state = _NativeRobotState.BRAKED
+        return True
+
+    def transition(self, state):
+        if (
+            self.state in (_NativeRobotState.DEAD, _NativeRobotState.ESTOP)
+            and state is not self.state
+        ):
+            raise _StateError("latched safety state requires explicit recovery")
+        self.state = state
+
+    def enable(self, options):
+        del options
+        token = self.begin_operation(_OperationKind.LIFECYCLE)
+        try:
+            self.state = _NativeRobotState.IDLE
+            return types.SimpleNamespace(
+                success=True,
+                failed_motor_ids=[],
+                message="",
+            )
+        finally:
+            self.end_operation(token)
+
+    def disable(self):
+        token = self.begin_operation(_OperationKind.LIFECYCLE)
+        try:
+            self.state = _NativeRobotState.DISABLED
+        finally:
+            self.end_operation(token)
+
+    def brake(self):
+        token = self.begin_operation(_OperationKind.LIFECYCLE)
+        try:
+            self.state = _NativeRobotState.BRAKED
+        finally:
+            self.end_operation(token)
+
+    def brake_active_operation(self):
+        self.brake_active_calls += 1
+
+    def emergency_stop(self):
+        self.state = _NativeRobotState.ESTOP
+        self.cancel_requested = True
+        self.is_servoing = False
+
+    def resume(self):
+        if self.state is _NativeRobotState.DEAD or self._depth:
+            return False
+        self.state = _NativeRobotState.IDLE
+        self.cancel_requested = False
+        return True
+
+    def shutdown(self, joint_mode, gripper_mode, timeout):
+        self.shutdown_calls.append((joint_mode, gripper_mode, timeout))
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._idle:
+            if (
+                self._depth
+                and self._owner == threading.get_ident()
+                and self.active_operation is not _OperationKind.SERVO
+            ):
+                raise _BusyError(
+                    "shutdown cannot be called by the active operation owner"
+                )
+            self.closing = True
+            self.cancel_requested = True
+            if self.active_operation is _OperationKind.SERVO:
+                self.active_operation = _OperationKind.NONE
+                self._depth = 0
+                self._owner = None
+                self.is_servoing = False
+                self._idle.notify_all()
+            while self._depth:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    raise _BusyError(
+                        "timed out waiting for the active operation to stop"
+                    )
+                self._idle.wait(remaining)
+            self.state = _NativeRobotState.DISCONNECTED
+            self.active_operation = _OperationKind.NONE
+            self.is_servoing = False
+            self._owner = None
+
+    def set_joint_motor_models(self, models):
+        self.motor_model_calls.append(list(models))
+
+    def move_j(self, joint_angles_rad, options):
+        token = self.begin_operation(_OperationKind.JOINT_MOTION)
+        try:
+            self.move_j_calls.append(
+                (list(joint_angles_rad), options)
+            )
+            return types.SimpleNamespace(
+                sent=True,
+                reached=bool(options.block),
+                elapsed_s=0.0,
+                max_error_rad=0.0,
+            )
+        finally:
+            self.end_operation(token)
+
+    def servo_start(self, options):
+        if self.is_servoing:
+            if self.operation_owned_by_current_thread():
+                return
+            raise _BusyError(
+                "another thread owns the active servo session"
+            )
+        token = self.begin_operation(_OperationKind.SERVO)
+        self.servo_start_calls.append(options)
+        self.is_servoing = True
+        self._token = token
+
     def servo_tick(self, target_angles, torque_ff):
-        if not self.operation_owned_by_current_thread():
-            raise RuntimeError("another thread owns the active servo session")
+        if (
+            not self.is_servoing
+            or not self.operation_owned_by_current_thread()
+        ):
+            raise _BusyError("another thread owns the active servo session")
         self.servo_tick_calls.append((target_angles, torque_ff))
-        return types.SimpleNamespace(sent=True, message="", aborted=False)
+        return types.SimpleNamespace(
+            sent=True,
+            message="",
+            aborted=False,
+        )
+
+    def servo_end(self, finish_mode):
+        if self.is_servoing:
+            token = self._token
+            self.is_servoing = False
+            self.end_operation(token)
+        if finish_mode is _FinishMode.BRAKE:
+            self.state = _NativeRobotState.BRAKED
+        elif finish_mode is _FinishMode.STOP:
+            self.state = _NativeRobotState.DISABLED
+        return self.servo_summary()
+
+    def servo_summary(self):
+        return types.SimpleNamespace(
+            tick_count=len(self.servo_tick_calls),
+            clamp_count=0,
+            lag_count=0,
+            elapsed_s=0.0,
+            average_rate_hz=0.0,
+            aborted_reason="",
+        )
 
 
-def _make_arm(*, state=None, ages=None, responses=None):
+def _make_arm(
+    *,
+    state=None,
+    core=None,
+    driver=None,
+    ages=None,
+    responses=None,
+):
     arm = controller.FafuRobotController.__new__(controller.FafuRobotController)
+    public_state = state or controller.RobotState.IDLE
+    native_state = getattr(_NativeRobotState, public_state.name)
+    arm._core = core or _FakeRobotCore(state=native_state)
     arm._joint_motor_ids = [1, 2]
-    arm._ht = _FakeDriver(ages=ages, responses=responses)
+    arm._ht = driver or _FakeDriver(ages=ages, responses=responses)
+    arm._cfg = _FakeRobotConfig()
     arm._config_lock = threading.RLock()
-    arm._state_lock = threading.RLock()
-    arm._state = state or controller.RobotState.IDLE
     arm._state_verbose = False
-    arm._op_depth = 0
-    arm._op_owner_thread_id = None
-    arm._gravity_comp_active = False
-    arm._gravity_comp_owner_thread_id = None
-    arm._dead_rx_timeout_ms = 500.0
-    arm._dead_reason = None
-    arm._motor_last_seen_monotonic = {
-        1: time.monotonic(),
-        2: time.monotonic(),
-    }
+    arm._last_reported_state = public_state
     arm._servo_opts = None
-    arm._servo_active = False
-    arm._last_cmd_turns = None
     arm._dyn_torque_scale = np.ones(2)
     arm._dyn_motor_models = None
+    arm._dyn_tau_limit = None
+    arm._friction_params = None
     arm._use_group_mit = True
     arm._dynamics = None
     arm._has_gripper = True
@@ -254,6 +616,14 @@ class ControllerSafetyTests(unittest.TestCase):
         np.testing.assert_array_equal(
             arm._dyn_torque_scale, np.array([1.0, 2.0]))
 
+    def test_torque_scale_rejects_busy_operation(self):
+        arm = _make_arm(state=controller.RobotState.MOVING)
+        before = arm._dyn_torque_scale.copy()
+
+        with self.assertRaises(controller.RobotStateError):
+            arm.set_torque_scale(2.0)
+        np.testing.assert_array_equal(arm._dyn_torque_scale, before)
+
     def test_joint_validation_rejects_non_finite_and_wrong_shape(self):
         arm = _make_arm()
 
@@ -266,6 +636,7 @@ class ControllerSafetyTests(unittest.TestCase):
 
     def test_operation_nesting_is_same_thread_only(self):
         arm = _make_arm()
+        core = arm._core
         owns = arm._enter_operation("outer", controller.RobotState.MOVING)
         errors = []
 
@@ -281,20 +652,160 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], controller.RobotStateError)
-        self.assertEqual(arm._op_depth, 1)
+        self.assertIs(
+            core.active_operation,
+            _OperationKind.JOINT_MOTION,
+        )
+        self.assertTrue(core.operation_owned_by_current_thread())
 
         arm._exit_operation(owns)
+        self.assertIs(core.active_operation, _OperationKind.NONE)
         self.assertIs(arm.state, controller.RobotState.IDLE)
 
+    def test_operation_token_is_released_when_link_check_raises(self):
+        arm = _make_arm()
+        core = arm._core
+        core.stream_link_ok = mock.Mock(
+            side_effect=_StateError("link check failed")
+        )
+
+        with self.assertRaisesRegex(
+            controller.RobotStateError, "link check failed"
+        ):
+            arm._enter_operation("move", controller.RobotState.MOVING)
+
+        self.assertEqual(core._depth, 0)
+        self.assertIs(core.active_operation, _OperationKind.NONE)
+        self.assertIs(core.state, _NativeRobotState.IDLE)
+        self.assertEqual(core.end_calls, [1])
+
+    def test_disabled_state_is_never_promoted_from_cached_motor_mode(self):
+        active = types.SimpleNamespace(mode=controller.MODE_POSITION)
+        arm = _make_arm(
+            state=controller.RobotState.DISABLED,
+            responses={1: active, 2: active},
+        )
+
+        with self.assertRaisesRegex(
+            controller.RobotStateError, "Call enable"
+        ):
+            arm._require_ready("move")
+
+        self.assertIs(arm.state, controller.RobotState.DISABLED)
+        self.assertIs(arm._core.state, _NativeRobotState.DISABLED)
+        self.assertIs(arm.sync_state(), controller.RobotState.DISABLED)
+
+    def test_sync_state_only_downgrades_idle_from_fresh_reads(self):
+        active = types.SimpleNamespace(mode=controller.MODE_POSITION)
+        stopped = types.SimpleNamespace(mode=controller.MODE_STOP)
+        driver = _FakeDriver(responses={1: active, 2: active})
+        driver.get_cached_state = mock.Mock(return_value=active)
+        driver.read_motor_state = mock.Mock(return_value=stopped)
+        arm = _make_arm(driver=driver)
+
+        self.assertIs(arm.sync_state(), controller.RobotState.DISABLED)
+        self.assertEqual(driver.read_motor_state.call_count, 1)
+        driver.get_cached_state.assert_not_called()
+
+    def test_sync_state_latches_dead_on_missing_feedback(self):
+        core = _FakeRobotCore(
+            alive=False,
+            dead_reason="motor 1 did not respond",
+        )
+        arm = _make_arm(
+            core=core,
+            responses={1: None, 2: object()},
+        )
+
+        self.assertIs(arm.sync_state(), controller.RobotState.DEAD)
+        self.assertIs(core.state, _NativeRobotState.DEAD)
+
+    def test_gravity_brake_keeps_root_writer_until_braked(self):
+        arm = _make_arm()
+        core = arm._core
+        token = core.begin_operation(_OperationKind.GRAVITY_COMP)
+
+        arm._brake_joints()
+
+        self.assertEqual(core._depth, 1)
+        self.assertIs(core.active_operation, _OperationKind.GRAVITY_COMP)
+        self.assertIs(core.state, _NativeRobotState.BRAKED)
+        self.assertEqual(
+            arm._ht.mode_calls,
+            [(1, controller.MODE_BRAKE), (2, controller.MODE_BRAKE)],
+        )
+        core.end_operation(token)
+        self.assertEqual(core._depth, 0)
+        self.assertIs(core.active_operation, _OperationKind.NONE)
+        self.assertIs(core.state, _NativeRobotState.BRAKED)
+
+    def test_cross_thread_close_owns_gravity_cleanup(self):
+        arm = _make_arm()
+        core = arm._core
+        token = core.begin_operation(_OperationKind.GRAVITY_COMP)
+        errors = []
+
+        def close_arm():
+            try:
+                arm.close_connection()
+            except Exception as exc:
+                errors.append(exc)
+
+        closer = threading.Thread(target=close_arm)
+        closer.start()
+        deadline = time.monotonic() + 1.0
+        while not core.closing and time.monotonic() < deadline:
+            time.sleep(0.001)
+        self.assertTrue(core.closing)
+
+        # Native shutdown has cancellation and final release ownership. The
+        # gravity owner must not emit a competing brake command.
+        arm._brake_joints()
+        self.assertEqual(arm._ht.mode_calls, [])
+        core.end_operation(token)
+
+        closer.join(timeout=2.0)
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+        self.assertIs(core.state, _NativeRobotState.DISCONNECTED)
+        self.assertFalse(arm._ht.is_open())
+
+    def test_same_thread_close_rejection_does_not_poison_core(self):
+        arm = _make_arm()
+        core = arm._core
+        token = core.begin_operation(_OperationKind.GRAVITY_COMP)
+
+        with self.assertRaisesRegex(
+            controller.RobotStateError, "active operation owner"
+        ):
+            arm.close_connection()
+
+        self.assertFalse(core.closing)
+        self.assertFalse(core.cancel_requested)
+        self.assertIs(core.state, _NativeRobotState.GRAVITY_COMP)
+        self.assertTrue(arm._ht.is_open())
+        core.end_operation(token)
+        with mock.patch("builtins.print"):
+            arm.close_connection()
+        self.assertIs(core.state, _NativeRobotState.DISCONNECTED)
+
     def test_partial_feedback_loss_latches_dead(self):
-        arm = _make_arm(ages={1: 10.0, 2: 750.0})
+        core = _FakeRobotCore(
+            link_ok=False,
+            dead_reason="stale motor feedback: M2=750ms",
+        )
+        arm = _make_arm(core=core)
 
         self.assertFalse(arm._stream_link_ok())
         self.assertIs(arm.state, controller.RobotState.DEAD)
         self.assertIn("M2=750ms", arm.dead_reason)
 
     def test_check_alive_requires_every_joint(self):
-        arm = _make_arm(responses={1: object(), 2: None})
+        core = _FakeRobotCore(
+            alive=False,
+            dead_reason="motors [2] did not respond",
+        )
+        arm = _make_arm(core=core)
 
         self.assertFalse(arm.check_alive())
         self.assertIs(arm.state, controller.RobotState.DEAD)
@@ -320,6 +831,16 @@ class ControllerSafetyTests(unittest.TestCase):
             )
         self.assertEqual(arm._ht.mit_calls, [])
 
+    def test_move_mit_rejects_invalid_timeout_without_sending(self):
+        arm = _make_arm()
+
+        for bad in (np.nan, np.inf, -0.01):
+            with self.subTest(timeout=bad):
+                with self.assertRaisesRegex(ValueError, "timeout"):
+                    arm.move_MIT(
+                        [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], timeout=bad)
+        self.assertEqual(arm._ht.mit_calls, [])
+
     def test_same_thread_composite_operation_may_stream_mit(self):
         arm = _make_arm()
         owns = arm._enter_operation("composite", controller.RobotState.MOVING)
@@ -333,18 +854,59 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertEqual(result, {})
         self.assertEqual(len(arm._ht.mit_calls), 1)
 
-    def test_move_j_rejects_unknown_style_without_sending(self):
+    def test_move_j_delegates_radians_and_options_to_native_core(self):
         arm = _make_arm()
 
-        with self.assertRaisesRegex(ValueError, "style must be one of"):
-            arm.move_j([0.0, 0.0], style="typo")
+        arm.move_j(
+            [np.pi, -np.pi / 2.0],
+            speed=25,
+            block=False,
+            tolerance=0.02,
+            settle_timeout=0.4,
+        )
 
+        self.assertEqual(len(arm._core.move_j_calls), 1)
+        angles, options = arm._core.move_j_calls[0]
+        np.testing.assert_allclose(angles, [np.pi, -np.pi / 2.0])
+        self.assertFalse(options.block)
+        self.assertAlmostEqual(
+            options.max_velocity_rad_s, 0.25 * 0.5 * 2.0 * np.pi
+        )
+        self.assertEqual(options.control_rate_hz, 100.0)
+        self.assertEqual(options.min_duration_s, 0.3)
+        self.assertEqual(options.tolerance_rad, 0.02)
+        self.assertEqual(options.settle_timeout_s, 0.4)
         self.assertEqual(arm._ht.mit_calls, [])
+        self.assertEqual(arm._ht.pos_vel_tqe_calls, [])
+        self.assertEqual(arm._ht.pos_vel_acc_calls, [])
+        self.assertEqual(arm._core._depth, 0)
+        self.assertIs(arm.state, controller.RobotState.IDLE)
+
+    def test_move_j_rejects_non_radians_before_native_send(self):
+        arm = _make_arm()
+
+        with self.assertRaisesRegex(ValueError, "radians-only"):
+            arm.move_j([0.0, 0.0], is_radians=False)
+
+        self.assertEqual(arm._core.move_j_calls, [])
+        self.assertEqual(arm._ht.pos_vel_tqe_calls, [])
+
+    def test_blocking_move_j_requires_native_feedback_confirmation(self):
+        arm = _make_arm()
+        arm._core.move_j = mock.Mock(
+            return_value=types.SimpleNamespace(sent=True, reached=False)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "confirmed target feedback"):
+            arm.move_j([0.0, 0.0], block=True)
+
+        arm._core.move_j.assert_called_once()
+        self.assertIs(arm.state, controller.RobotState.IDLE)
 
     def test_servo_start_always_delegates_ownership_to_native_core(self):
         arm = _make_arm()
         core = mock.Mock()
-        core.is_servoing = True
+        core.is_servoing = False
         arm._core = core
         arm._sync_state_from_core = mock.Mock()
 
@@ -356,11 +918,36 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertIsInstance(native, _ServoOptions)
         self.assertAlmostEqual(native.position_error_deadband_rad, 0.0123)
 
+    def test_repeated_servo_start_keeps_native_session_options(self):
+        arm = _make_arm()
+        first = controller.ServoOpts(is_radians=True)
+        second = controller.ServoOpts(max_vel=0.25)
+
+        arm.servo_start(first)
+        arm.servo_start(second)
+
+        self.assertEqual(len(arm._core.servo_start_calls), 1)
+        self.assertTrue(arm._servo_opts.is_radians)
+        self.assertEqual(arm._servo_opts.max_vel, first.max_vel)
+        self.assertEqual(arm._core._depth, 1)
+        arm.servo_end()
+        self.assertEqual(arm._core._depth, 0)
+
+    def test_servo_start_rejects_non_radians_even_when_already_active(self):
+        arm = _make_arm()
+        arm.servo_start()
+
+        with self.assertRaisesRegex(ValueError, "radians-only"):
+            arm.servo_start(controller.ServoOpts(is_radians=False))
+
+        self.assertEqual(len(arm._core.servo_start_calls), 1)
+        arm.servo_end()
     def test_servo_owner_may_send_nonblocking_gripper(self):
-        arm = _make_arm(state=controller.RobotState.SERVOING)
-        core = _FakeServoCore()
-        arm._core = core
-        arm._servo_active = True
+        core = _FakeRobotCore(state=_NativeRobotState.SERVOING)
+        arm = _make_arm(
+            state=controller.RobotState.SERVOING,
+            core=core,
+        )
 
         result = arm.gripper_control(0.0, block=False)
 
@@ -372,16 +959,17 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertIs(core.active_operation, _OperationKind.SERVO)
         self.assertIs(core.state, _NativeRobotState.SERVOING)
         self.assertIs(arm.state, controller.RobotState.SERVOING)
-        self.assertEqual(arm._op_depth, 0)
 
         self.assertTrue(arm.servo_j([0.0, 0.0]))
         self.assertEqual(len(core.servo_tick_calls), 1)
         self.assertIs(core.active_operation, _OperationKind.SERVO)
 
     def test_other_thread_cannot_borrow_servo_for_gripper(self):
-        arm = _make_arm(state=controller.RobotState.SERVOING)
-        core = _FakeServoCore()
-        arm._core = core
+        core = _FakeRobotCore(state=_NativeRobotState.SERVOING)
+        arm = _make_arm(
+            state=controller.RobotState.SERVOING,
+            core=core,
+        )
         errors = []
 
         def command_gripper():
@@ -402,9 +990,11 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertIs(core.state, _NativeRobotState.SERVOING)
 
     def test_servo_rejects_blocking_gripper_and_grasp(self):
-        arm = _make_arm(state=controller.RobotState.SERVOING)
-        core = _FakeServoCore()
-        arm._core = core
+        core = _FakeRobotCore(state=_NativeRobotState.SERVOING)
+        arm = _make_arm(
+            state=controller.RobotState.SERVOING,
+            core=core,
+        )
 
         with self.assertRaises(controller.RobotStateError):
             arm.gripper_control(0.0, effort=123, block=True)
@@ -416,9 +1006,11 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertIs(core.state, _NativeRobotState.SERVOING)
 
     def test_servo_rejects_new_joint_motion(self):
-        arm = _make_arm(state=controller.RobotState.SERVOING)
-        core = _FakeServoCore()
-        arm._core = core
+        core = _FakeRobotCore(state=_NativeRobotState.SERVOING)
+        arm = _make_arm(
+            state=controller.RobotState.SERVOING,
+            core=core,
+        )
 
         with self.assertRaises(controller.RobotStateError):
             arm.move_j([0.0, 0.0], block=False)
@@ -463,32 +1055,170 @@ class ControllerSafetyTests(unittest.TestCase):
 
         self.assertEqual(arm._ht.pos_vel_tqe_calls, [])
 
+    def test_mit_command_boundary_forwards_radians_unchanged(self):
+        arm = _make_arm()
+        pos = [np.pi, -np.pi / 2.0]
+        vel = [2.0 * np.pi, -np.pi]
+
+        arm.move_MIT(pos, vel, [0.0, 0.0], kp=0.0, kd=0.0)
+
+        self.assertEqual(len(arm._ht.mit_calls), 1)
+        args = arm._ht.mit_calls[0]
+        np.testing.assert_allclose(args[1], pos)
+        np.testing.assert_allclose(args[2], vel)
+        self.assertEqual(args[6], 2)
+        self.assertEqual(args[7], 0.0)
+
+    def test_mit_and_joint_paths_reject_non_radians_before_work(self):
+        arm = _make_arm()
+
+        with self.assertRaisesRegex(ValueError, "radians-only"):
+            arm.move_MIT(
+                [0.0, 0.0], [0.0, 0.0], [0.0, 0.0],
+                is_radians=False,
+            )
+        with self.assertRaisesRegex(ValueError, "radians-only"):
+            arm.move_jntspace_path([[0.0, 0.0]], is_radians=False)
+        with self.assertRaisesRegex(ValueError, "radians-only"):
+            arm.move_jntspace_path_mit(
+                [[0.0, 0.0]], is_radians=False
+            )
+
+        self.assertEqual(arm._ht.mit_calls, [])
+        self.assertEqual(arm._core.move_j_calls, [])
+
+    def test_high_level_controller_does_not_expose_raw_driver_or_turns_reader(self):
+        arm = _make_arm()
+
+        self.assertFalse(hasattr(arm, "driver"))
+        self.assertFalse(hasattr(arm, "get_joint_values_raw"))
+    def test_gripper_command_boundary_forwards_radians_unchanged(self):
+        arm = _make_arm()
+
+        arm.gripper_control(
+            np.pi,
+            vel=2.0 * np.pi,
+            acc=3.0 * np.pi,
+            block=False,
+        )
+
+        self.assertEqual(len(arm._ht.pos_vel_acc_calls), 1)
+        args = arm._ht.pos_vel_acc_calls[0]
+        self.assertEqual(args[0], 7)
+        self.assertAlmostEqual(args[1], np.pi)
+        self.assertAlmostEqual(args[2], 2.0 * np.pi)
+        self.assertAlmostEqual(args[3], 3.0 * np.pi)
+
+    def test_all_gripper_entry_points_reject_non_radians_without_sending(self):
+        arm = _make_arm()
+        calls = (
+            lambda: arm.gripper_control(0.0, is_radians=False, block=False),
+            lambda: arm.grasp(is_radians=False),
+            lambda: arm.open_gripper(is_radians=False, block=False),
+            lambda: arm.close_gripper(is_radians=False, block=False),
+            lambda: arm.release(is_radians=False, block=False),
+        )
+
+        for call in calls:
+            with self.subTest(call=call):
+                with self.assertRaisesRegex(ValueError, "radians-only"):
+                    call()
+
+        self.assertEqual(arm._ht.pos_vel_acc_calls, [])
+        self.assertEqual(arm._ht.pos_vel_tqe_calls, [])
+
+    def test_soft_limit_boundary_is_radians_only_and_validates_before_write(self):
+        arm = _make_arm()
+
+        arm.set_limit(1, -np.pi, np.pi)
+        self.assertEqual(
+            arm._ht.position_limit_calls,
+            [(1, -np.pi, np.pi, _PosUnit.Radians)],
+        )
+        np.testing.assert_allclose(arm.get_limit(1), [-np.pi, np.pi])
+        np.testing.assert_allclose(
+            arm._cfg.limits[1], [-0.5, 0.5]
+        )
+
+        with self.assertRaisesRegex(ValueError, "radians-only"):
+            arm.set_limit(1, -180.0, 180.0, is_radians=False)
+        with self.assertRaisesRegex(ValueError, "radians-only"):
+            arm.get_limit(1, is_radians=False)
+        with self.assertRaisesRegex(ValueError, "finite"):
+            arm.set_limit(1, np.nan, np.pi)
+
+        self.assertEqual(len(arm._ht.position_limit_calls), 1)
+
+        arm.disable_limit(1)
+        self.assertEqual(arm._ht.disable_limit_calls, [1])
+        self.assertNotIn(1, arm._cfg.limits)
+        self.assertIsNone(arm.get_limit(1))
+
+        arm.set_limit(1, -np.pi, np.pi)
+        arm.clear_limits()
+        self.assertEqual(arm._ht.clear_limit_calls, 1)
+        self.assertEqual(arm._cfg.limits, {})
+        self.assertIsNone(arm.get_limit(1))
+
+    def test_soft_limit_mutations_validate_id_and_reject_busy(self):
+        arm = _make_arm()
+
+        for call in (
+            lambda: arm.set_limit(99, -1.0, 1.0),
+            lambda: arm.get_limit(99),
+            lambda: arm.disable_limit(99),
+        ):
+            with self.subTest(call=call):
+                with self.assertRaisesRegex(ValueError, "cfg.motor_ids"):
+                    call()
+
+        arm._core.state = _NativeRobotState.MOVING
+        busy_calls = (
+            lambda: arm.set_limit(1, -1.0, 1.0),
+            lambda: arm.disable_limit(1),
+            arm.clear_limits,
+        )
+        for call in busy_calls:
+            with self.subTest(call=call):
+                with self.assertRaises(controller.RobotStateError):
+                    call()
+
+        self.assertEqual(arm._ht.position_limit_calls, [])
+        self.assertEqual(arm._ht.disable_limit_calls, [])
+        self.assertEqual(arm._ht.clear_limit_calls, 0)
+
     def test_fault_recovery_waits_for_inflight_operation_exit(self):
         arm = _make_arm()
+        core = arm._core
         owns = arm._enter_operation("move", controller.RobotState.MOVING)
-        arm._enable_impl = mock.Mock()
 
         try:
-            arm._set_state(controller.RobotState.ESTOP)
-            with self.assertRaisesRegex(controller.RobotStateError, "in-flight"):
+            core.state = _NativeRobotState.ESTOP
+            core.cancel_requested = True
+            with self.assertRaisesRegex(
+                controller.RobotStateError,
+                "enable rejected",
+            ):
                 arm.enable()
-            arm._enable_impl.assert_not_called()
 
-            arm._set_state(controller.RobotState.DEAD)
-            with self.assertRaisesRegex(controller.RobotStateError, "in-flight"):
+            core.state = _NativeRobotState.DEAD
+            core.dead_reason = "feedback lost"
+            with self.assertRaisesRegex(
+                controller.RobotStateError,
+                "recover rejected",
+            ):
                 arm.recover(confirm=True)
         finally:
             arm._exit_operation(owns)
 
-        self.assertEqual(arm._op_depth, 0)
-        self.assertIsNone(arm._op_owner_thread_id)
+        self.assertIs(core.active_operation, _OperationKind.NONE)
+        self.assertFalse(core.operation_owned_by_current_thread())
         self.assertIs(arm.state, controller.RobotState.DEAD)
 
     def test_invalid_close_policy_has_no_side_effects(self):
         arm = _make_arm()
         driver = mock.Mock()
         arm._ht = driver
-        arm._servo_active = True
         arm.servo_end = mock.Mock()
 
         with self.assertRaises(ValueError):
@@ -539,77 +1269,18 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertEqual(driver.close_attempts, 2)
         self.assertFalse(driver.is_open())
 
-    def test_scurve_generic_abort_uses_native_brake_cleanup(self):
-        for result, message in ((1, "abort_check"), (2, "send error")):
-            with self.subTest(result=result):
-                state = types.SimpleNamespace(position=0.0)
-                arm = _make_arm(responses={1: state, 2: state})
-                arm._cfg = types.SimpleNamespace(
-                    control_rate_hz=100.0,
-                    trajectory_dt_s=1.0,
-                    motor_ids=[1, 2],
-                    max_torque_raw=100,
-                )
-                arm._last_cmd_turns = {1: 0.0, 2: 0.0}
-                arm._core = types.SimpleNamespace(
-                    brake_active_operation=mock.Mock()
-                )
-                arm._ht.control_loop_result = result
-
-                with self.assertRaisesRegex(RuntimeError, message):
-                    arm._move_scurve({1: 0.1}, speed_pct=10)
-
-                arm._core.brake_active_operation.assert_called_once_with()
-                self.assertIsNone(arm._last_cmd_turns)
-                self.assertEqual(len(arm._ht.control_loop_calls), 1)
-                _, kwargs = arm._ht.control_loop_calls[0]
-                self.assertFalse(kwargs["stop_on_abort"])
-
-    def test_nonblocking_move_send_failure_brakes(self):
+    def test_move_j_native_state_error_is_translated_without_driver_send(self):
         arm = _make_arm()
-        arm._cfg = types.SimpleNamespace(motor_ids=[1, 2])
-        arm._core = types.SimpleNamespace(
-            brake_active_operation=mock.Mock()
-        )
-        arm._validate_joint_angles = mock.Mock(return_value=[0.0, 0.0])
-        arm._clamp_speed = mock.Mock(return_value=10)
-        arm._build_many_cmds_holding_others = mock.Mock(
-            return_value=[object()]
-        )
-        arm._command_guard = mock.Mock(return_value=nullcontext())
-        arm._ht.set_many_pos_vel_tqe = mock.Mock(
-            side_effect=OSError("write failed")
-        )
+        arm._core.move_j = mock.Mock(side_effect=_StateError("link lost"))
 
-        with self.assertRaisesRegex(OSError, "write failed"):
-            controller.FafuRobotController.move_j.__wrapped__(
-                arm, [0.0, 0.0], block=False
-            )
+        with self.assertRaisesRegex(controller.RobotStateError, "link lost"):
+            arm.move_j([0.0, 0.0])
 
-        arm._core.brake_active_operation.assert_called_once_with()
-        self.assertIsNone(arm._last_cmd_turns)
-
-    def test_acc_partial_send_failure_brakes(self):
-        arm = _make_arm()
-        arm._cfg = types.SimpleNamespace(motor_ids=[1, 2])
-        arm._core = types.SimpleNamespace(
-            brake_active_operation=mock.Mock()
-        )
-        arm._command_guard = mock.Mock(return_value=nullcontext())
-        arm._ht.set_pos_vel_acc = mock.Mock(
-            side_effect=[None, OSError("second motor write failed")]
-        )
-
-        with self.assertRaisesRegex(OSError, "second motor write failed"):
-            arm._move_acc_sync(
-                {1: 0.1, 2: 0.2},
-                speed_pct=10,
-                block=False,
-            )
-
-        self.assertEqual(arm._ht.set_pos_vel_acc.call_count, 2)
-        arm._core.brake_active_operation.assert_called_once_with()
-        self.assertIsNone(arm._last_cmd_turns)
+        arm._core.move_j.assert_called_once()
+        self.assertEqual(arm._ht.mit_calls, [])
+        self.assertEqual(arm._ht.pos_vel_tqe_calls, [])
+        self.assertEqual(arm._ht.pos_vel_acc_calls, [])
+        self.assertIs(arm.state, controller.RobotState.IDLE)
 
     def test_mit_path_does_not_nest_enable_inside_moving(self):
         arm = _make_arm()
@@ -646,28 +1317,41 @@ class ControllerSafetyTests(unittest.TestCase):
         self.assertIs(arm.state, controller.RobotState.IDLE)
 
 
-    def test_gravity_begin_failure_does_not_leave_active_flags(self):
+    def test_gravity_start_enables_from_native_disabled_state(self):
+        active = types.SimpleNamespace(mode=controller.MODE_POSITION)
+        arm = _make_arm(
+            state=controller.RobotState.DISABLED,
+            responses={1: active, 2: active},
+        )
+        arm._dynamics = object()
+        arm._ht.get_cached_state = mock.Mock(return_value=active)
+
+        with mock.patch.object(
+            arm, "enable", wraps=arm.enable
+        ) as enable, mock.patch("builtins.print"):
+            arm.start_gravity_compensation(duration=0.0)
+
+        enable.assert_called_once_with()
+        arm._ht.get_cached_state.assert_not_called()
+        self.assertIs(arm.state, controller.RobotState.BRAKED)
+
+    def test_gravity_begin_failure_does_not_leave_native_operation(self):
         arm = _make_arm()
         arm._dynamics = object()
-        begin = mock.Mock(side_effect=RuntimeError("native busy"))
-        arm._core = types.SimpleNamespace(
-            state=_NativeRobotState.IDLE,
-            dead_reason="",
-            stream_link_ok=lambda: True,
-            begin_operation=begin,
+        arm._core.begin_operation = mock.Mock(
+            side_effect=_BusyError("native busy")
         )
 
         with mock.patch.object(
-            controller.FafuRobotController,
-            "is_enabled",
-            new_callable=mock.PropertyMock,
-            return_value=True,
-        ), self.assertRaisesRegex(RuntimeError, "native busy"):
+            arm, "_motors_in_position_mode", return_value=True
+        ), self.assertRaisesRegex(controller.RobotStateError, "native busy"):
             arm.start_gravity_compensation(duration=0.0)
 
-        self.assertFalse(arm._gravity_comp_active)
-        self.assertIsNone(arm._gravity_comp_owner_thread_id)
-        self.assertIsNone(getattr(arm, "_gravity_core_token", None))
+        self.assertFalse(arm.is_gravity_compensating)
+        self.assertIs(
+            arm._core.active_operation,
+            _OperationKind.NONE,
+        )
 
 
 class ModuleLayoutTests(unittest.TestCase):
@@ -875,6 +1559,7 @@ class ModuleLayoutTests(unittest.TestCase):
 
     def test_setup_dynamics_rechecks_busy_state_before_commit(self):
         arm = _make_arm()
+        core = arm._core
         old_dynamics = object()
         arm._dynamics = old_dynamics
         loaded = types.SimpleNamespace(
@@ -882,19 +1567,26 @@ class ModuleLayoutTests(unittest.TestCase):
             eef_frame_name="tool_link",
             gravity_vector=np.array([0.0, 0.0, -9.81]),
         )
+        operation_tokens = []
 
         def load_and_start_operation(*_args, **_kwargs):
-            arm._state = controller.RobotState.MOVING
+            operation_tokens.append(
+                core.begin_operation(_OperationKind.JOINT_MOTION)
+            )
             return loaded
 
-        with mock.patch.object(
-            controller, "resolve_urdf_path", return_value="robot.urdf"
-        ), mock.patch.object(
-            controller.DynamicsModel,
-            "load",
-            side_effect=load_and_start_operation,
-        ), self.assertRaises(controller.RobotStateError):
-            arm.setup_dynamics()
+        try:
+            with mock.patch.object(
+                controller, "resolve_urdf_path", return_value="robot.urdf"
+            ), mock.patch.object(
+                controller.DynamicsModel,
+                "load",
+                side_effect=load_and_start_operation,
+            ), self.assertRaises(controller.RobotStateError):
+                arm.setup_dynamics()
+        finally:
+            if operation_tokens:
+                core.end_operation(operation_tokens[0])
 
         self.assertIs(arm._dynamics, old_dynamics)
 

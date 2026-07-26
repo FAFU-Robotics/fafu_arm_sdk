@@ -30,6 +30,7 @@ diag_torque_ramp.py
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -52,7 +53,7 @@ def main() -> int:
     parser.add_argument("--path", choices=["torque", "mit", "mit-many"],
                         default="torque",
                         help=("torque=set_torque(0x0a); "
-                              "mit=single set_pos_vel_tqe_kp_kd(0x15); "
+                              "mit=single set_pos_vel_tqe_kp_kd_rad(0x15); "
                               "mit-many=broadcast ID 0x8093"))
     parser.add_argument("--sign", type=float, default=1.0,
                         help="+1 or -1: torque direction")
@@ -61,14 +62,13 @@ def main() -> int:
     parser.add_argument("--step", type=float, default=5.0,
                         help="raw increment per tick")
     parser.add_argument("--step-dt", type=float, default=0.2)
-    parser.add_argument("--vel-abort", type=float, default=0.15,
-                        help="abort when |vel| (rps) exceeds this")
+    parser.add_argument("--vel-abort", type=float, default=0.15 * math.tau,
+                        help="abort when |vel| (rad/s) exceeds this")
     parser.add_argument("--max-dpos-deg", type=float, default=20.0,
                         help="abort when |pos - start| exceeds this (deg)")
     args = parser.parse_args()
 
     from fafu_robot_controller import FafuRobotController  # noqa: E402
-    import fafu_motor as pm  # noqa: E402
 
     arm = FafuRobotController(
         cfg_path=args.cfg,
@@ -81,26 +81,28 @@ def main() -> int:
         arm.close_connection()
         return 1
     mid = joint_ids[args.joint - 1]
-    drv = arm.driver
+    drv = arm._ht  # private: low-level diagnostic only
 
     def read_state():
         return arm.get_motor_states(prefer_cache=False).get(mid)
 
     def send_torque(raw: float):
         r = float(raw) * args.sign
+        # Empty model uses coeff=1, so one raw count equals 0.01 Nm.
         if args.path == "torque":
-            drv.set_torque(mid, r, "")
+            drv.set_torque(mid, r * 0.01, "")
         elif args.path == "mit":
             st = read_state()
-            pos_t = st.position if st is not None else 0.0
-            drv.set_pos_vel_tqe_kp_kd(mid, pos_t, 0.0, r, 0.0, 0.0, "", pm.PosUnit.Turns)
+            pos_rad = st.position * math.tau if st is not None else 0.0
+            drv.set_pos_vel_tqe_kp_kd_rad(
+                mid, pos_rad, 0.0, r * 0.01, 0.0, 0.0, "")
         else:
             st = read_state()
-            pos_t = st.position if st is not None else 0.0
-            if not hasattr(drv, "set_many_pos_vel_tqe_kp_kd_one"):
+            pos_rad = st.position * math.tau if st is not None else 0.0
+            if not hasattr(drv, "set_many_mit_rad"):
                 raise RuntimeError(
                     "当前 fafu_motor.pyd 还没有 "
-                    "set_many_pos_vel_tqe_kp_kd_one; 请先重新编译 C++ 扩展")
+                    "set_many_mit_rad; 请先重新编译 C++ 扩展")
             # 一拖多 MIT/PD (ID=0x8093): 帧内每电机 10 字节, CAN-FD 单帧最大
             # 64 字节 => 一帧最多 6 个电机. 诊断只测单关节, 槽位数只需覆盖到
             # 被测电机 (mid) 即可, 前面的槽位自动填 0x8000 no-op.
@@ -108,10 +110,10 @@ def main() -> int:
             max_mid = mid
             if raw <= 1e-9:
                 print(f"  [mit-many] mid={mid}, max_mid={max_mid}, "
-                      f"pos_t={pos_t:+.5f} turns")
-            drv.set_many_pos_vel_tqe_kp_kd_one(
-                mid, pos_t, 0.0, int(round(r)), 0, 0,
-                pm.PosUnit.Turns, max_mid, 0.05)
+                      f"pos_rad={pos_rad:+.5f} rad")
+            drv.set_many_mit_rad(
+                [mid], [pos_rad], [0.0], [int(round(r))],
+                [0], [0], max_mid, 0.05)
 
     def rehold():
         """把关节切回位置保持(按当前角), 避免松开下垂."""
@@ -123,7 +125,9 @@ def main() -> int:
                 pass
             return
         try:
-            drv.set_pos_vel_acc(mid, st.position, 0.3, 2.0, pm.PosUnit.Turns)
+            drv.set_pos_vel_acc_rad(
+                mid, st.position * math.tau,
+                0.3 * math.tau, 2.0 * math.tau)
         except Exception:
             try:
                 drv.stop(mid)
@@ -155,7 +159,7 @@ def main() -> int:
     st0 = read_state()
     pos0 = (st0.position * 360.0) if st0 else 0.0
     print(f"  起始 J{args.joint} = {pos0:+.1f}°")
-    print("  raw  | pos°    | vel(rps) | dpos°")
+    print("  raw  | pos°    | vel(rad/s) | dpos°")
     print("  -----+---------+----------+--------")
 
     raw = 0.0
@@ -171,7 +175,7 @@ def main() -> int:
                 raw += args.step
                 continue
             pos_deg = st.position * 360.0
-            vel = st.velocity
+            vel = st.velocity * math.tau
             dpos = pos_deg - pos0
             print(f"  {raw:4.0f} | {pos_deg:+7.1f} | {vel:+8.3f} | {dpos:+6.1f}")
 

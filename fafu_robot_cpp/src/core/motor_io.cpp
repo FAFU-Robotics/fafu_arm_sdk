@@ -23,6 +23,16 @@ double HightorqueMotorIO::state_age_ms(int motor_id) const {
     return serial_.get_state_age_ms(motor_id);
 }
 
+std::optional<std::pair<double, double>>
+HightorqueMotorIO::position_limit_turns(int motor_id) const {
+    double lo = 0.0;
+    double hi = 0.0;
+    if (!serial_.get_position_limit_turns(motor_id, lo, hi)) {
+        return std::nullopt;
+    }
+    return std::make_pair(lo, hi);
+}
+
 std::optional<hightorque::MotorState> HightorqueMotorIO::set_mode(
         int motor_id, int mode) {
     if (mode < 0 || mode > 0xFF) {

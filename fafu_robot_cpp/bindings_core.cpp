@@ -97,6 +97,27 @@ void bind_core(py::module_& module) {
         .def_readonly("diagnostics", &EnableResult::diagnostics)
         .def_readonly("message", &EnableResult::message);
 
+    py::class_<MoveJOptions>(module, "MoveJOptions")
+        .def(py::init<>())
+        .def_readwrite("block", &MoveJOptions::block)
+        .def_readwrite("max_velocity_rad_s",
+                       &MoveJOptions::max_velocity_rad_s)
+        .def_readwrite("control_rate_hz",
+                       &MoveJOptions::control_rate_hz)
+        .def_readwrite("min_duration_s",
+                       &MoveJOptions::min_duration_s)
+        .def_readwrite("tolerance_rad",
+                       &MoveJOptions::tolerance_rad)
+        .def_readwrite("settle_timeout_s",
+                       &MoveJOptions::settle_timeout_s);
+
+    py::class_<MoveJResult>(module, "MoveJResult")
+        .def_readonly("sent", &MoveJResult::sent)
+        .def_readonly("reached", &MoveJResult::reached)
+        .def_readonly("elapsed_s", &MoveJResult::elapsed_s)
+        .def_readonly("max_error_rad",
+                      &MoveJResult::max_error_rad);
+
     py::class_<ServoOptions>(module, "ServoOptions")
         .def(py::init<>())
         .def_readwrite("watchdog_ms", &ServoOptions::watchdog_ms)
@@ -204,6 +225,16 @@ void bind_core(py::module_& module) {
              py::arg("polling_rate_hz") = 0.0,
              py::call_guard<py::gil_scoped_release>())
         .def("stop_transport", &RobotCore::stop_transport,
+             py::call_guard<py::gil_scoped_release>())
+        .def("move_j",
+             py::overload_cast<const std::vector<double>&>(
+                 &RobotCore::move_j),
+             py::arg("joint_angles_rad"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("move_j",
+             py::overload_cast<const std::vector<double>&,
+                               const MoveJOptions&>(&RobotCore::move_j),
+             py::arg("joint_angles_rad"), py::arg("options"),
              py::call_guard<py::gil_scoped_release>())
         .def("enable",
              py::overload_cast<const EnableOptions&>(&RobotCore::enable),

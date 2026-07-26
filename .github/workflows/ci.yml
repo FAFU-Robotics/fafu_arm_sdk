@@ -44,8 +44,14 @@ jobs:
         working-directory: fafu_robot_python
         run: >-
           python -c "import fafu_motor;
-          assert fafu_motor.CORE_ABI_VERSION == 3;
+          assert fafu_motor.CORE_ABI_VERSION == 4;
           assert hasattr(fafu_motor, 'RobotCore');
+          assert hasattr(fafu_motor, 'MoveJOptions');
+          assert hasattr(fafu_motor, 'MoveJResult');
+          assert hasattr(fafu_motor.HightorqueSerial, 'set_pos_vel_tqe_rad');
+          assert hasattr(fafu_motor.HightorqueSerial, 'set_pos_vel_tqe_kp_kd_rad');
+          assert hasattr(fafu_motor.HightorqueSerial, 'set_pos_vel_acc_rad');
+          assert hasattr(fafu_motor.HightorqueSerial, 'set_many_mit_rad');
           print(fafu_motor.__file__)"
 
       - name: Verify high-level Python import compatibility

@@ -1021,7 +1021,11 @@ class App:
                     mid = int(tokens[1])
                     lo = float(tokens[2])
                     hi = float(tokens[3])
-                    self.arm.set_limit(mid, lo=lo, hi=hi, is_radians=False)
+                    self.arm.set_limit(
+                        mid,
+                        lo=math.radians(lo),
+                        hi=math.radians(hi),
+                    )
                     print(f"  已设 M{mid}: [{lo:+.2f}, {hi:+.2f}] deg")
                 except Exception as e:
                     print(f"  失败: {e}")
@@ -1200,11 +1204,11 @@ class App:
         grip_open_rad = grip_close_rad = grip_cmd_rad = None
         grip_is_open = False
         if self.arm.has_gripper:
-            lo_t, hi_t = self.arm._gripper_limit_turns()
-            grip_open_rad = (self.arm._turns_to_rad(hi_t)
-                             if hi_t is not None else math.radians(90.0))
-            grip_close_rad = (self.arm._turns_to_rad(lo_t)
-                              if lo_t is not None else math.radians(-90.0))
+            lo_rad, hi_rad = self.arm._gripper_limit_rad()
+            grip_open_rad = (hi_rad if hi_rad is not None
+                             else math.radians(90.0))
+            grip_close_rad = (lo_rad if lo_rad is not None
+                              else math.radians(-90.0))
             # 初始指令 = 当前实际位置 (第一次按空格前忠实记录当前开口)
             try:
                 gs = self.arm.get_gripper_state()

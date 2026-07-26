@@ -171,6 +171,13 @@ inline int16_t finite_to_i16(double value, const char* field) {
     return static_cast<int16_t>(value);
 }
 
+inline int16_t nonnegative_position_limit_i16(int16_t value) {
+    if (value == NAN_INT16 || value >= 0) {
+        return value;
+    }
+    return static_cast<int16_t>(-static_cast<int32_t>(value));
+}
+
 inline int hex_digit(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -269,6 +276,12 @@ int16_t turns_to_int16(double turns)  { return finite_to_i16(turns / 0.0001, "po
 double  int16_to_turns(int16_t val)   { return val * 0.0001; }
 int16_t rps_to_int16(double rps)      { return finite_to_i16(rps / 0.00025, "velocity"); }
 double  int16_to_rps(int16_t val)     { return val * 0.00025; }
+int16_t position_speed_limit_to_int16(double rps) {
+    return finite_to_i16(std::abs(rps) / 0.00025, "position speed limit");
+}
+int16_t position_acceleration_limit_to_int16(double rpss) {
+    return finite_to_i16(std::abs(rpss) / 0.001, "position acceleration limit");
+}
 int16_t rad_to_int16(double rad)      { return turns_to_int16(rad / (2.0 * kPi)); }
 double  int16_to_rad(int16_t val)     { return int16_to_turns(val) * 2.0 * kPi; }
 int16_t rad_s_to_int16(double rad_s)  { return rps_to_int16(rad_s / (2.0 * kPi)); }
@@ -345,7 +358,7 @@ std::vector<uint8_t> build_vel_int16(int16_t vel) {
 std::vector<uint8_t> build_pos_vel_tqe_int16(int16_t pos, int16_t vel, int16_t tqe) {
     std::vector<uint8_t> p = {0x01, 0x00, 0x0a, 0x06, 0x20};
     push_le_i16(p, NAN_INT16);   // 位置先占位
-    push_le_i16(p, vel);
+    push_le_i16(p, nonnegative_position_limit_i16(vel));
     p.push_back(0x06);
     p.push_back(0x25);
     push_le_i16(p, tqe);
@@ -439,17 +452,20 @@ std::vector<uint8_t> build_many_pos_vel_tqe_int16(const std::vector<int16_t>& po
     data.reserve(n * 6 + 16);
     for (std::size_t i = 0; i < n; ++i) {
         push_le_i16(data, pos_arr[i]);
-        push_le_i16(data, vel_arr[i]);
+        push_le_i16(data, nonnegative_position_limit_i16(vel_arr[i]));
         push_le_i16(data, tqe_arr[i]);
     }
 
     // 末尾 2 字节 = 查询状态码; pad 插中间, 让总长度落到 DLC 表上一档
     const std::size_t need = data.size() + 2;
+    if (need > 64) {
+        throw std::invalid_argument(
+            "build_many_pos_vel_tqe_int16: frame exceeds 64 bytes");
+    }
     std::size_t target = 64;
     for (std::size_t s : CANFD_DLC_SIZES) {
         if (s >= need) { target = s; break; }
     }
-    if (target < need) target = 64;     // 兜底, 实际不会走到
     const std::size_t pad = target - need;
     data.insert(data.end(), pad, PADDING);
     data.push_back(0x17);
@@ -1013,7 +1029,7 @@ std::optional<MotorState> HightorqueSerial::set_pos_vel_tqe(int motor_id, double
         [&](int can_id, double t) {
             return send_can_and_recv_(can_id,
                 build_pos_vel_tqe_int16(turns_to_int16(pos_t),
-                                        rps_to_int16(vel_rps),
+                                        position_speed_limit_to_int16(vel_rps),
                                         tqe_i), t);
         },
         motor_id);
@@ -1021,21 +1037,37 @@ std::optional<MotorState> HightorqueSerial::set_pos_vel_tqe(int motor_id, double
     return st;
 }
 
+std::optional<MotorState> HightorqueSerial::set_pos_vel_tqe_rad(
+        int motor_id, double pos_rad, double vel_rad_s, int tqe_raw) {
+    return set_pos_vel_tqe(
+        motor_id, pos_rad, vel_rad_s / (2.0 * kPi_), tqe_raw,
+        PosUnit::Radians);
+}
+
 std::optional<MotorState> HightorqueSerial::set_pos_vel_acc(int motor_id, double pos,
                                                             double vel_max_rps, double acc_rpss,
                                                             PosUnit unit) {
     const auto [pos_t, flag] = apply_position_limit_(motor_id, to_turns(pos, unit));
-    const int16_t acc_int = finite_to_i16(acc_rpss / 0.001, "acceleration");
+    const int16_t vel_int = position_speed_limit_to_int16(vel_max_rps);
+    const int16_t acc_int = position_acceleration_limit_to_int16(acc_rpss);
     auto st = control_call(
         [&](int can_id, double t) {
             return send_can_and_recv_(can_id,
                 build_pos_velmax_acc_int16(turns_to_int16(pos_t),
-                                           rps_to_int16(vel_max_rps),
+                                           vel_int,
                                            acc_int), t);
         },
         motor_id);
     if (st) st->pos_limit_flag = flag;
     return st;
+}
+
+std::optional<MotorState> HightorqueSerial::set_pos_vel_acc_rad(
+        int motor_id, double pos_rad, double vel_max_rad_s,
+        double acc_rad_s2) {
+    return set_pos_vel_acc(
+        motor_id, pos_rad, vel_max_rad_s / (2.0 * kPi_),
+        acc_rad_s2 / (2.0 * kPi_), PosUnit::Radians);
 }
 
 std::optional<MotorState> HightorqueSerial::set_vel_acc(int motor_id, double vel_rps,
@@ -1091,7 +1123,7 @@ std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_tqe(
 
         const std::size_t idx = static_cast<std::size_t>(c.motor_id - 1);
         pos_arr[idx] = turns_to_int16(pos_t);
-        vel_arr[idx] = rps_to_int16(c.vel_rps);
+        vel_arr[idx] = position_speed_limit_to_int16(c.vel_rps);
         // tqe_raw == 0 视为 "用电机默认最大力矩" → NAN_INT16 (协议: 0x8000 = 无效/无操作).
         // 直接发 0 会让电机理解为 "最大输出力矩=0" → 完全没力气, 不动, 还可能触发保护
         // 把 mode 切回 0. 想真正限制力矩请填非 0 值 (或负数, 内部已 saturate).
@@ -1166,7 +1198,7 @@ std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_tqe_partial(
 
         const std::size_t idx = static_cast<std::size_t>(mid - 1);
         pos_arr[idx] = turns_to_int16(pos_t);
-        vel_arr[idx] = rps_to_int16(active_vel[k]);
+        vel_arr[idx] = position_speed_limit_to_int16(active_vel[k]);
         tqe_arr[idx] = tqe_slot;
         ++expected;
     }
@@ -1356,6 +1388,24 @@ std::map<int, MotorState> HightorqueSerial::set_many_mit(
     return out;
 }
 
+std::map<int, MotorState> HightorqueSerial::set_many_mit_rad(
+        const std::vector<int>& motor_ids,
+        const std::vector<double>& pos_rad,
+        const std::vector<double>& vel_rad_s,
+        const std::vector<int>& tqe_raw,
+        const std::vector<int>& kp_raw,
+        const std::vector<int>& kd_raw,
+        int max_motor_id, double timeout_s) {
+    std::vector<double> vel_rps;
+    vel_rps.reserve(vel_rad_s.size());
+    for (double value : vel_rad_s) {
+        vel_rps.push_back(value / (2.0 * kPi_));
+    }
+    return set_many_mit(
+        motor_ids, pos_rad, vel_rps, tqe_raw, kp_raw, kd_raw,
+        PosUnit::Radians, max_motor_id, timeout_s);
+}
+
 std::optional<MotorState> HightorqueSerial::set_torque(int motor_id, double tqe_nm,
                                                        const std::string& motor_model) {
     double coeff = 1.0;
@@ -1408,6 +1458,15 @@ std::optional<MotorState> HightorqueSerial::set_pos_vel_tqe_kp_kd(
         motor_id);
     if (st) st->pos_limit_flag = flag;
     return st;
+}
+
+std::optional<MotorState> HightorqueSerial::set_pos_vel_tqe_kp_kd_rad(
+        int motor_id, double pos_rad, double vel_rad_s,
+        double tqe_nm, double kp, double kd,
+        const std::string& motor_model) {
+    return set_pos_vel_tqe_kp_kd(
+        motor_id, pos_rad, vel_rad_s / (2.0 * kPi_),
+        tqe_nm, kp, kd, motor_model, PosUnit::Radians);
 }
 
 std::string HightorqueSerial::reset_zero(int motor_id) {

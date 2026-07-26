@@ -25,6 +25,7 @@ using fafu::core::MODE_BRAKE;
 using fafu::core::MODE_ACTIVE;
 using fafu::core::MODE_MIT;
 using fafu::core::ModeStage;
+using fafu::core::MoveJOptions;
 using fafu::core::OperationKind;
 using fafu::core::RobotCore;
 using fafu::core::RobotState;
@@ -196,6 +197,356 @@ void test_position_servo_velocity_policy() {
     require(std::abs(frames.back().velocities[0] - cap_turns_s) < 1e-12,
             "disabled Position feed-forward must keep the fixed positive cap");
     core.servo_end(FinishMode::Hold);
+}
+
+void test_move_j_uses_radians_and_holds_auxiliary_motors() {
+    constexpr double kPi = 3.14159265358979323846;
+    FakeMotorIO io({1, 2, 7});
+    RobotCore core(io, config({1, 2, 7}, {1, 2}));
+    for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+    io.set_position(1, 0.1);
+    io.set_position(2, -0.2);
+    io.set_position(7, 0.33);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+
+    MoveJOptions options;
+    options.block = false;
+    options.max_velocity_rad_s = 1.0;
+    const auto result = core.move_j({kPi, -kPi / 2.0}, options);
+
+    require(result.sent && !result.reached,
+            "non-blocking move_j must report one unconfirmed send");
+    require(core.state() == RobotState::Idle,
+            "move_j must release its JointMotion lease");
+    const auto frames = io.frames();
+    require(frames.size() == 1 && !frames.front().mit,
+            "non-blocking move_j must send exactly one Position frame");
+    require(frames.front().motor_ids == std::vector<int>({1, 2, 7}),
+            "move_j frame must cover every motor in instance order");
+    require(std::abs(frames.front().positions[0] - 0.5) < 1e-12 &&
+            std::abs(frames.front().positions[1] + 0.25) < 1e-12,
+            "radian targets must be converted to turns exactly once");
+    require(std::abs(frames.front().positions[2] - 0.33) < 1e-12 &&
+            frames.front().velocities[2] == 0.0,
+            "auxiliary motors must hold their fresh measured position");
+    require(frames.front().velocities[0] > 0.0 &&
+            frames.front().velocities[1] > 0.0,
+            "Position velocity is a non-negative speed cap");
+}
+
+void test_move_j_validates_before_state_or_hardware_side_effects() {
+    FakeMotorIO io({1, 2});
+    RobotCore core(io, config({1, 2}, {1, 2}));
+
+    MoveJOptions invalid;
+    invalid.max_velocity_rad_s =
+        std::numeric_limits<double>::quiet_NaN();
+    bool invalid_rejected = false;
+    try {
+        (void)core.move_j({0.0, 0.0}, invalid);
+    } catch (const std::invalid_argument&) {
+        invalid_rejected = true;
+    }
+    require(invalid_rejected, "non-finite move options must be rejected");
+    require(core.state() == RobotState::Disabled && io.frames().empty(),
+            "invalid move options must not acquire a lease or write");
+
+    MoveJOptions valid;
+    valid.block = false;
+    bool disabled_rejected = false;
+    try {
+        (void)core.move_j({0.0, 0.0}, valid);
+    } catch (const StateError&) {
+        disabled_rejected = true;
+    }
+    require(disabled_rejected,
+            "move_j must not implicitly enable a disabled controller");
+    require(core.state() == RobotState::Disabled && io.frames().empty(),
+            "rejected disabled move_j must leave hardware untouched");
+    for (int id : {1, 2}) {
+        const auto motor = io.read_state(id, 0.0);
+        require(motor && motor->mode == fafu::core::MODE_STOP,
+                "validation/state rejection must not energize motors");
+    }
+}
+
+void test_blocking_move_j_confirms_feedback_and_keeps_velocity_unsigned() {
+    FakeMotorIO io({1, 2, 7});
+    RobotCore core(io, config({1, 2, 7}, {1, 2}));
+    for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+    io.set_position(7, 0.4);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+
+    MoveJOptions options;
+    options.block = true;
+    options.max_velocity_rad_s = 100.0;
+    options.control_rate_hz = 1000.0;
+    options.min_duration_s = 0.0;
+    options.tolerance_rad = 1e-4;
+    options.settle_timeout_s = 0.0;
+    const auto result = core.move_j({0.02, -0.02}, options);
+
+    require(result.sent && result.reached,
+            "blocking move_j must confirm all joint feedback");
+    require(result.max_error_rad <= options.tolerance_rad,
+            "blocking move_j returned outside its tolerance");
+    const auto frames = io.frames();
+    require(!frames.empty(), "blocking move_j sent no frames");
+    require(std::abs(frames.back().positions[0] - 0.0031) < 1e-12 &&
+            std::abs(frames.back().positions[1] + 0.0031) < 1e-12,
+            "move_j must send the protocol-quantized target");
+    require(frames.back().velocities[0] > 0.0 &&
+            frames.back().velocities[1] > 0.0,
+            "terminal Position frame must retain a positive speed cap");
+    for (const auto& frame : frames) {
+        require(std::all_of(
+                    frame.velocities.begin(), frame.velocities.end(),
+                    [](double value) { return value >= 0.0; }),
+                "Position trajectory must never encode signed velocity");
+        require(std::abs(frame.positions[2] - 0.4) < 1e-12,
+                "blocking move_j must hold the auxiliary motor");
+    }
+}
+
+void test_move_j_timeout_brakes_and_uses_positive_catchup_cap() {
+    FakeMotorIO io({1, 2, 7});
+    RobotCore core(io, config({1, 2, 7}, {1, 2}));
+    for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+    io.set_follow_position_commands(false);
+
+    MoveJOptions options;
+    options.max_velocity_rad_s = 100.0;
+    options.control_rate_hz = 1000.0;
+    options.min_duration_s = 0.0;
+    options.tolerance_rad = 1e-4;
+    options.settle_timeout_s = 0.005;
+
+    bool timed_out = false;
+    try {
+        (void)core.move_j({0.02, -0.02}, options);
+    } catch (const std::runtime_error& error) {
+        timed_out = std::string(error.what()).find("timed out") !=
+            std::string::npos;
+    }
+    require(timed_out, "unreached blocking move_j must time out");
+    require(core.state() == RobotState::Braked,
+            "generic move_j failure must brake the instance");
+    const auto frames = io.frames();
+    require(std::any_of(
+                frames.begin(), frames.end(),
+                [](const auto& frame) {
+                    return frame.velocities[0] > 1e-6 &&
+                           frame.velocities[1] > 1e-6;
+                }),
+            "settle phase must keep a positive catch-up velocity cap");
+    for (int id : {1, 2, 7}) {
+        const auto motor = io.read_state(id, 0.0);
+        require(motor && motor->mode == MODE_BRAKE,
+                "move_j timeout must brake joints and auxiliaries");
+    }
+}
+
+void test_invalid_servo_options_do_not_enable() {
+    FakeMotorIO io({1, 2});
+    RobotCore core(io, config({1, 2}, {1, 2}));
+
+    ServoOptions options;
+    options.channel = ServoChannel::Position;
+    options.watchdog_ms = -1;
+    bool rejected = false;
+    try {
+        core.servo_start(options);
+    } catch (const std::invalid_argument&) {
+        rejected = true;
+    }
+    require(rejected, "invalid Servo options must be rejected");
+    require(core.state() == RobotState::Disabled,
+            "invalid Servo options must not enable a disabled controller");
+    require(!io.is_async_rx() && io.frames().empty(),
+            "invalid Servo options must not start transport or write");
+    for (int id : {1, 2}) {
+        const auto motor = io.read_state(id, 0.0);
+        require(motor && motor->mode == fafu::core::MODE_STOP,
+                "invalid Servo options must leave motors stopped");
+    }
+}
+
+void test_motion_targets_respect_protocol_and_soft_limits() {
+    FakeMotorIO io({1, 2});
+    io.set_position_limit(1, -0.1, 0.1);
+    RobotCore core(io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) io.set_mode_direct(id, MODE_ACTIVE);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+    bool limit_read_under_lease = false;
+    io.set_position_limit_observer([&] {
+        limit_read_under_lease =
+            core.active_operation() == OperationKind::JointMotion &&
+            core.operation_owned_by_current_thread();
+    });
+
+    bool soft_limit_rejected = false;
+    try {
+        (void)core.move_j({1.0, 0.0});
+    } catch (const std::invalid_argument&) {
+        soft_limit_rejected = true;
+    }
+    require(soft_limit_rejected && io.frames().empty() &&
+            limit_read_under_lease &&
+            core.state() == RobotState::Idle,
+            "move_j must validate soft limits under its motion lease");
+
+    bool range_rejected = false;
+    try {
+        (void)core.move_j({25.0, 0.0});
+    } catch (const std::invalid_argument&) {
+        range_rejected = true;
+    }
+    require(range_rejected && io.frames().empty() &&
+            core.state() == RobotState::Idle,
+            "move_j must reject an unencodable Position target");
+
+    io.set_position_limit(1, -0.00016, -0.00014);
+    limit_read_under_lease = false;
+    bool quantized_limit_rejected = false;
+    try {
+        MoveJOptions move;
+        move.block = false;
+        (void)core.move_j(
+            {-0.00015 * 6.28318530717958647692, 0.0}, move);
+    } catch (const std::invalid_argument&) {
+        quantized_limit_rejected = true;
+    }
+    require(quantized_limit_rejected && io.frames().empty() &&
+            limit_read_under_lease && core.state() == RobotState::Idle,
+            "protocol quantization must not cross a soft limit");
+
+    bool slot_rejected = false;
+    try {
+        FakeMotorIO high_id_io({1, 11});
+        RobotCore high_id(
+            high_id_io, config({1, 11}, {1}));
+    } catch (const std::invalid_argument&) {
+        slot_rejected = true;
+    }
+    require(slot_rejected,
+            "CoreConfig must reject Position broadcast slots above 10");
+
+    FakeMotorIO closed_io({1, 2});
+    RobotCore closed(closed_io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) {
+        closed_io.set_mode_direct(id, MODE_ACTIVE);
+    }
+    require(closed.enable(fast_enable_options()).success, "enable failed");
+    closed_io.set_open(false);
+    bool closed_rejected = false;
+    try {
+        MoveJOptions move;
+        move.block = false;
+        (void)closed.move_j({0.0, 0.0}, move);
+    } catch (const StateError& error) {
+        closed_rejected =
+            std::string(error.what()).find("transport is closed") !=
+            std::string::npos;
+    }
+    require(closed_rejected && closed.state() == RobotState::Dead,
+            "move_j closed transport must latch the transport reason");
+
+    FakeMotorIO throwing_io({1, 2});
+    RobotCore throwing(throwing_io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) throwing_io.set_mode_direct(id, MODE_ACTIVE);
+    require(throwing.enable(fast_enable_options()).success, "enable failed");
+    throwing_io.set_throw_on_is_open(true);
+    bool throwing_rejected = false;
+    try {
+        MoveJOptions move;
+        move.block = false;
+        (void)throwing.move_j({0.0, 0.0}, move);
+    } catch (const StateError& error) {
+        throwing_rejected =
+            std::string(error.what()).find("transport is closed") !=
+            std::string::npos;
+    }
+    require(throwing_rejected && throwing.state() == RobotState::Dead,
+            "is_open failure must latch DEAD instead of escaping");
+}
+
+void test_servo_start_uses_fresh_feedback_and_fails_braked() {
+    FakeMotorIO io({1, 2});
+    RobotCore core(io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) io.set_mode_direct(id, MODE_ACTIVE);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+    io.clear_read_counts();
+
+    ServoOptions options;
+    options.channel = ServoChannel::Position;
+    core.servo_start(options);
+    require(io.read_count(1) > 0 && io.read_count(2) > 0,
+            "servo_start must fresh-read every joint");
+    core.servo_end(FinishMode::Brake);
+    require(core.state() == RobotState::Braked,
+            "Servo Brake finish must leave BRAKED state");
+
+    require(core.enable(fast_enable_options()).success, "re-enable failed");
+    core.servo_start(options);
+    core.servo_end(FinishMode::Stop);
+    require(core.state() == RobotState::Disabled,
+            "Servo Stop finish must leave DISABLED state");
+
+    FakeMotorIO failing_io({1, 2});
+    RobotCore failing(failing_io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) failing_io.set_mode_direct(id, MODE_ACTIVE);
+    require(failing.enable(fast_enable_options()).success, "enable failed");
+    failing_io.fail_next_read(1);
+    bool start_failed = false;
+    try {
+        failing.servo_start(options);
+    } catch (const StateError&) {
+        start_failed = true;
+    }
+    require(start_failed && failing.state() == RobotState::Braked &&
+            !failing.is_servoing(),
+            "failed servo_start must brake and release its operation");
+}
+
+void test_servo_invalid_target_and_send_failure_abort_safely() {
+    ServoOptions options;
+    options.channel = ServoChannel::Position;
+
+    FakeMotorIO limited_io({1, 2});
+    limited_io.set_position_limit(1, -0.1, 0.1);
+    RobotCore limited(limited_io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) limited_io.set_mode_direct(id, MODE_ACTIVE);
+    require(limited.enable(fast_enable_options()).success, "enable failed");
+    limited.servo_start(options);
+    const auto invalid = limited.servo_tick({1.0, 0.0});
+    require(invalid.aborted && !invalid.sent &&
+            limited.state() == RobotState::Braked &&
+            limited_io.watchdog(1) == 0,
+            "invalid Servo target must abort, clear watchdog, and brake");
+
+    FakeMotorIO send_io({1, 2});
+    RobotCore send_core(send_io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) send_io.set_mode_direct(id, MODE_ACTIVE);
+    require(send_core.enable(fast_enable_options()).success, "enable failed");
+    send_core.servo_start(options);
+    send_io.fail_next_send();
+    const auto failed_send = send_core.servo_tick({0.01, 0.0});
+    require(failed_send.aborted && !failed_send.sent &&
+            send_core.state() == RobotState::Braked &&
+            send_io.watchdog(1) == 0,
+            "Servo send failure must abort, clear watchdog, and brake");
+
+    FakeMotorIO closed_io({1, 2});
+    RobotCore closed(closed_io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) closed_io.set_mode_direct(id, MODE_ACTIVE);
+    require(closed.enable(fast_enable_options()).success, "enable failed");
+    closed.servo_start(options);
+    closed_io.set_open(false);
+    const auto closed_tick = closed.servo_tick({0.0, 0.0});
+    require(closed_tick.aborted && closed.state() == RobotState::Dead &&
+            !closed.is_servoing(),
+            "closed Servo transport must latch DEAD and release its token");
 }
 
 void test_dead_is_per_instance() {
@@ -481,6 +832,38 @@ void test_shutdown_waits_for_writer() {
             "shutdown must wait and mark DISCONNECTED");
 }
 
+void test_shutdown_from_writer_does_not_poison_core() {
+    FakeMotorIO io({1, 2});
+    RobotCore core(io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) io.set_mode_direct(id, MODE_ACTIVE);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+
+    const auto token =
+        core.begin_operation(OperationKind::JointMotion);
+    bool rejected = false;
+    try {
+        core.shutdown(FinishMode::Brake, FinishMode::Brake, 0.0);
+    } catch (const BusyError&) {
+        rejected = true;
+    }
+    require(rejected,
+            "shutdown by writer owner must fail before closing starts");
+
+    const auto snapshot = core.health();
+    require(!snapshot.closing, "rejected shutdown must not poison closing");
+    require(!snapshot.cancel_requested,
+            "rejected shutdown must not request cancellation");
+    require(core.state() == RobotState::Moving,
+            "rejected shutdown must preserve the active operation");
+
+    core.end_operation(token);
+    require(core.state() == RobotState::Idle,
+            "writer must unwind normally after rejected shutdown");
+    core.shutdown();
+    require(core.state() == RobotState::Disconnected,
+            "a later shutdown must still succeed");
+}
+
 
 void test_enable_failure_leaves_disabled() {
     FakeMotorIO io({1, 2});
@@ -751,6 +1134,22 @@ int main() {
         {"servo safety", test_servo_safety},
         {"Position servo velocity policy",
          test_position_servo_velocity_policy},
+        {"move_j radians and auxiliary hold",
+         test_move_j_uses_radians_and_holds_auxiliary_motors},
+        {"move_j validates before side effects",
+         test_move_j_validates_before_state_or_hardware_side_effects},
+        {"blocking move_j feedback confirmation",
+         test_blocking_move_j_confirms_feedback_and_keeps_velocity_unsigned},
+        {"move_j timeout safety cleanup",
+         test_move_j_timeout_brakes_and_uses_positive_catchup_cap},
+        {"Servo validation before enable",
+         test_invalid_servo_options_do_not_enable},
+        {"motion target bounds",
+         test_motion_targets_respect_protocol_and_soft_limits},
+        {"Servo fresh start and failure cleanup",
+         test_servo_start_uses_fresh_feedback_and_fails_braked},
+        {"Servo invalid/send cleanup",
+         test_servo_invalid_target_and_send_failure_abort_safely},
         {"per-instance DEAD isolation", test_dead_is_per_instance},
         {"Servo feedback timeout stays braked",
          test_servo_feedback_timeout_stays_braked},
@@ -770,6 +1169,8 @@ int main() {
         {"unknown motor model rejection",
          test_unknown_motor_model_is_rejected_for_nonzero_output},
         {"shutdown waits for writer", test_shutdown_waits_for_writer},
+        {"same-thread shutdown rejection stays recoverable",
+         test_shutdown_from_writer_does_not_poison_core},
         {"shutdown preserves safety STOP",
          test_shutdown_cannot_override_latched_stop},
         {"shutdown is idempotent", test_shutdown_is_idempotent},

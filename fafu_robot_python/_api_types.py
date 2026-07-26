@@ -163,8 +163,7 @@ class ServoOpts:
         (~11.5 deg).  Set to ``0`` / negative to disable the
         counter entirely.
     is_radians : bool, optional
-        Interpret arguments to :meth:`servo_j` in radians (default) or
-        degrees.  Matches :meth:`move_j`.
+        Compatibility guard; only ``True`` is accepted.
     rate_hz : float, optional
         Nominal upper-layer call rate **only used to compute dt for
         feedforward and lookahead**.  Default ``100.0``.  The actual

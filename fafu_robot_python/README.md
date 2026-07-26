@@ -7,7 +7,7 @@
 你的脚本  ──Python──▶  FafuRobotController  ──pybind11──▶  RobotCore / HightorqueSerial (C++)  ──USB串口──▶  调试板
 ```
 
-Python 控制器要求统一扩展提供 `CORE_ABI_VERSION == 3`。状态机、单写者仲裁、
+Python 控制器要求统一扩展提供 `CORE_ABI_VERSION == 4`。状态机、单写者仲裁、
 Servo 安全、使能恢复和标定换算只在 C++ 核心维护一份。线程与多机械臂约定见
 [P0_THREADING_AND_MULTI_ARM.md](../fafu_robot_cpp/docs/P0_THREADING_AND_MULTI_ARM.md)。
 
@@ -77,7 +77,7 @@ pip install -r requirements.txt
 # 2. 确认 fafu_motor.cpXX-win_amd64.pyd 的 ABI 与你的 Python 匹配
 python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
 # 输出 cp310 → 用 fafu_motor.cp310-win_amd64.pyd
-# 输出 cp38  → 进 fafu_robot_cpp/ 用 cp38 环境重 build 一份
+# 输出 cp312 → 用 fafu_motor.cp312-win_amd64.pyd
 
 # 3. 跑烟雾测试 (不需要连机器人)
 python tests/smoke_test.py
@@ -134,6 +134,10 @@ arm.close_connection(joint_release="stop",
 ```
 
 ### 关节运动
+
+所有会向硬件下发角度或角速度的高层 Python API 都只接受 rad / rad/s；
+``is_radians=False`` 会立即报错。轨迹执行、协议单位转换、线程互斥和失败制动
+由原生 C++ core 统一负责，Python 不再维护第二套 ``move_j`` 实现。
 
 ```python
 arm.move_j([j1, j2, ..., jn], is_radians=True,
@@ -196,7 +200,7 @@ arm.close_gripper(effort=None)                    # 关到下软限位
 arm.gripper_control(angle=math.radians(-90),      # Piper 风格: 任意角度
                     effort=500)
 arm.grasp(force_threshold=500,                    # 力控抓取
-          effort=None, vel=0.15, timeout=5.0)     # → GraspResult
+          effort=None, vel=0.15, timeout=5.0)     # vel 为 rad/s → GraspResult
 ```
 
 `grasp` 默认同时把 `force_threshold` 作为固件力矩上限；显式 `effort`
@@ -277,7 +281,7 @@ arm.emergency_stop() / arm.resume()
 | 现象 | 处理 |
 |---|---|
 | `ImportError: DLL load failed`（导入 `fafu_motor` 时） | 确认 Python ABI 与扩展文件名匹配，并安装 VC++ 2015-2022 Redistributable |
-| `ModuleNotFoundError: fafu_motor` | `.pyd` 不在本目录，或 ABI tag (cp310 / cp38) 与当前 Python 不匹配；去 `../fafu_robot_cpp/` 重 build |
+| `ModuleNotFoundError: fafu_motor` | `.pyd` 不在本目录，或 ABI tag (cp310 / cp312) 与当前 Python 不匹配；去 `../fafu_robot_cpp/` 重 build |
 | 连接失败 / 串口打开失败 | `robot.cfg` 里 `port = auto`，或显式写 `COMxx`；端口被其它程序占着也会失败 |
 | 所有电机 `mode 0 / fault ≠ 0` | 调试板→电机的 CAN 没通：检查 24V / 终端电阻 / `motor_ids` 是否对得上 |
 | 夹爪不响应 | 确认构造时传了 `has_gripper=True, gripper_motor_id=N`，且 N 在 `cfg.motor_ids` 列表里 |

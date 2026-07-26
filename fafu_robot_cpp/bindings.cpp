@@ -293,9 +293,17 @@ PYBIND11_MODULE(fafu_motor, m) {
              py::arg("motor_id"), py::arg("pos"), py::arg("vel_rps"), py::arg("tqe_raw"),
              py::arg("unit") = PosUnit::Turns,
              py::call_guard<py::gil_scoped_release>())
+        .def("set_pos_vel_tqe_rad", &HightorqueSerial::set_pos_vel_tqe_rad,
+             py::arg("motor_id"), py::arg("pos_rad"),
+             py::arg("vel_rad_s"), py::arg("tqe_raw"),
+             py::call_guard<py::gil_scoped_release>())
         .def("set_pos_vel_acc",  &HightorqueSerial::set_pos_vel_acc,
              py::arg("motor_id"), py::arg("pos"), py::arg("vel_max_rps"), py::arg("acc_rpss"),
              py::arg("unit") = PosUnit::Turns,
+             py::call_guard<py::gil_scoped_release>())
+        .def("set_pos_vel_acc_rad", &HightorqueSerial::set_pos_vel_acc_rad,
+             py::arg("motor_id"), py::arg("pos_rad"),
+             py::arg("vel_max_rad_s"), py::arg("acc_rad_s2"),
              py::call_guard<py::gil_scoped_release>())
         .def("set_vel_acc",      &HightorqueSerial::set_vel_acc,
              py::arg("motor_id"), py::arg("vel_rps"), py::arg("acc_rpss"),
@@ -451,6 +459,12 @@ PYBIND11_MODULE(fafu_motor, m) {
              py::arg("pos_unit") = PosUnit::Turns,
              py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.05,
              py::call_guard<py::gil_scoped_release>())
+        .def("set_many_mit_rad", &HightorqueSerial::set_many_mit_rad,
+             py::arg("motor_ids"), py::arg("pos_rad"),
+             py::arg("vel_rad_s"), py::arg("tqe_raw"),
+             py::arg("kp_raw"), py::arg("kd_raw"),
+             py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.05,
+             py::call_guard<py::gil_scoped_release>())
 
         .def("set_torque",  &HightorqueSerial::set_torque,
              py::arg("motor_id"), py::arg("tqe_nm"), py::arg("motor_model") = "",
@@ -466,6 +480,12 @@ PYBIND11_MODULE(fafu_motor, m) {
              py::arg("motor_id"), py::arg("pos"), py::arg("vel_rps"),
              py::arg("tqe_nm"), py::arg("kp"), py::arg("kd"),
              py::arg("motor_model") = "", py::arg("unit") = PosUnit::Turns,
+             py::call_guard<py::gil_scoped_release>())
+        .def("set_pos_vel_tqe_kp_kd_rad",
+             &HightorqueSerial::set_pos_vel_tqe_kp_kd_rad,
+             py::arg("motor_id"), py::arg("pos_rad"),
+             py::arg("vel_rad_s"), py::arg("tqe_nm"),
+             py::arg("kp"), py::arg("kd"), py::arg("motor_model") = "",
              py::call_guard<py::gil_scoped_release>())
 
         // -- 配置/版本 --
