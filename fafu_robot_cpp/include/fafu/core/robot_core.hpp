@@ -54,6 +54,10 @@ public:
     EnableResult enable(const EnableOptions& options);
     void disable();
     void brake();
+    // Owner-only abort cleanup for an in-flight joint/raw motion. It brakes
+    // every motor without ending the operation token; the caller's lease
+    // remains responsible for unwinding. Safety latches are preserved.
+    void brake_active_operation();
     void emergency_stop();
     bool resume();
     bool resume(const EnableOptions& options);
@@ -74,7 +78,7 @@ public:
     bool is_servoing() const;
     ServoSummary servo_summary() const;
 
-    void shutdown(FinishMode joint_release = FinishMode::Stop,
+    void shutdown(FinishMode joint_release = FinishMode::Brake,
                   FinishMode auxiliary_release = FinishMode::Brake,
                   double wait_timeout_s = 5.0);
 
@@ -118,8 +122,8 @@ private:
     ControllerState controller_state_;
 
     // Serializes all writes for this controller instance. Safety paths latch
-    // state first, then acquire this mutex and send STOP, making STOP the last
-    // motion command even when an emergency races a normal writer.
+    // state first, then acquire this mutex and send the state-specific release:
+    // ESTOP uses STOP; DEAD/feedback timeout uses BRAKE.
     mutable std::mutex command_mutex_;
     mutable std::mutex safety_mutex_;
     std::atomic<std::uint64_t> safety_generation_{0};

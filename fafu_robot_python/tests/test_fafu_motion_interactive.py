@@ -628,9 +628,8 @@ class App:
             max_lag_rad=math.radians(30.0),
             is_radians=True,
             use_mit=False,                          # 与 move_j 同通道 (0x8090)
-            # ★ 关键: 关掉速度前馈 (见 _move_servo_hold_to 说明). feedforward_vel=True
-            #   在 commanded 目标追上终点后会把 vel 归零, 本固件 0x8090 里 vel=0 = "别动",
-            #   导致电机冻在物理滞后处到不了位. =False -> 每拍恒定 max_vel 持续驱动到位.
+            # 该交互恢复路径选择固定 max_vel. 默认 True 现在也会依据实测
+            # 误差持续追赶, 只在 position deadband 内把速度上限归零.
             feedforward_vel=False,
         )
         dt = 1.0 / rate
@@ -717,10 +716,8 @@ class App:
             max_lag_rad=math.radians(30.0),
             is_radians=True,
             use_mit=False,                          # 与 move_j 同通道 (0x8090)
-            # ★ 关键: 关掉速度前馈. feedforward_vel=True 时, 一旦 commanded 目标
-            #   追上终点, vel=(target-filtered)/dt -> 0; 而本固件 0x8090 里 vel 是
-            #   驱动/限速项, vel=0 = "别动", 电机会冻在物理滞后处(到不了位).
-            #   =False -> 每拍发恒定 max_vel, 像 move_j 一样持续驱动到位.
+            # 固定 max_vel 便于这个交互路径预测到位时间; 默认 True 已保留
+            # Position 正速度上限、实测误差追赶和 deadband.
             feedforward_vel=False,
         )
         dt = 1.0 / rate

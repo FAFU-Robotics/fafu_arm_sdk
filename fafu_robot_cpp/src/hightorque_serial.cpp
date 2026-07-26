@@ -671,8 +671,8 @@ HightorqueSerial::HightorqueSerial(const std::string& port, uint32_t baudrate) {
 HightorqueSerial::~HightorqueSerial() {
     try {
         // 顺序很关键: 先停后台线程, 再关串口, 否则线程可能访问已销毁的 ser_
-        disable_async_rx();
         stop_state_polling();
+        disable_async_rx();
         close();
     } catch (...) {
         // 析构里吞掉异常, 避免 std::terminate
@@ -681,8 +681,8 @@ HightorqueSerial::~HightorqueSerial() {
 
 void HightorqueSerial::close() {
     std::lock_guard<std::mutex> lifecycle(lifecycle_mtx_);
-    disable_async_rx_unlocked_();
     stop_state_polling_unlocked_();
+    disable_async_rx_unlocked_();
 
     std::lock_guard<std::mutex> tx(tx_mtx_);
     if (ser_ && ser_->isOpen()) {
@@ -700,8 +700,19 @@ bool HightorqueSerial::is_open() const {
 void HightorqueSerial::serial_write_(const std::vector<uint8_t>& data, int retries) {
     for (int attempt = 0; attempt < retries; ++attempt) {
         try {
-            ser_->write(data.data(), data.size());
-            ser_->flushOutput();
+            std::size_t offset = 0;
+            while (offset < data.size()) {
+                const std::size_t written = ser_->write(
+                    data.data() + offset, data.size() - offset);
+                if (written == 0) {
+                    throw std::runtime_error(
+                        "serial write made no progress after " +
+                        std::to_string(offset) + " of " +
+                        std::to_string(data.size()) + " bytes");
+                }
+                offset += written;
+            }
+            // Do not flushOutput(): serial_cmake implements it as TX purge.
             return;
         } catch (const serial::SerialException&) {
             if (attempt == retries - 1) throw;
@@ -880,7 +891,7 @@ std::optional<MotorState> HightorqueSerial::read_motor_state(int motor_id, doubl
             if (it != update_seq_.end()) seen_seq = it->second;
         }
         // 触发查询 (async 路径立即返回, 实际收包靠 RX 线程)
-        send_can_and_recv_(0x8000 | motor_id, build_read_state_int16(), timeout_s);
+        request_motor_state_(motor_id);
 
         std::unique_lock<std::mutex> lk(cache_mtx_);
         const auto deadline = std::chrono::steady_clock::now()
@@ -904,6 +915,15 @@ std::optional<MotorState> HightorqueSerial::read_motor_state(int motor_id, doubl
     return control_call(
         [&](int can_id, double t) { return send_can_and_recv_(can_id, build_read_state_int16(), t); },
         motor_id, timeout_s);
+}
+
+void HightorqueSerial::request_motor_state_(int motor_id) {
+    if (!async_rx_enabled_.load()) {
+        throw std::logic_error(
+            "fire-and-forget state requests require asynchronous receive");
+    }
+    (void)send_can_and_recv_(
+        0x8000 | motor_id, build_read_state_int16(), 0.0);
 }
 
 std::optional<MotorState> HightorqueSerial::stop(int motor_id) {
@@ -1657,6 +1677,11 @@ void HightorqueSerial::start_state_polling(
         throw std::runtime_error("cannot start polling on a closed serial port");
     }
 
+    if (!async_rx_enabled_.load()) {
+        enable_async_rx_unlocked_();
+        poll_owns_async_rx_ = true;
+    }
+
     poll_running_.store(true);
     const auto period = std::chrono::microseconds(std::max<long long>(
         1, static_cast<long long>(1'000'000.0 / rate_hz)));
@@ -1667,39 +1692,61 @@ void HightorqueSerial::start_state_polling(
         poll_thread_ = std::thread(
             [this, ids = std::move(ids), period,
              callback = std::move(callback)]() mutable {
-            while (poll_running_.load()) {
-                const auto started = std::chrono::steady_clock::now();
-                std::vector<int> updated;
-                updated.reserve(ids.size());
+            std::map<int, uint64_t> reported_seq;
+            {
+                std::lock_guard<std::mutex> cache_lock(cache_mtx_);
+                for (int motor_id : ids) {
+                    reported_seq[motor_id] = update_seq_[motor_id];
+                }
+            }
+            auto next_deadline =
+                std::chrono::steady_clock::now() + period;
 
+            while (poll_running_.load()) {
                 for (int motor_id : ids) {
                     if (!poll_running_.load()) return;
                     try {
-                        auto state = read_motor_state(motor_id);
-                        if (state) {
-                            std::lock_guard<std::mutex> cache_lock(cache_mtx_);
-                            state_cache_[motor_id] = *state;
-                            state_update_time_[motor_id] = now_seconds();
-                            updated.push_back(motor_id);
-                        }
+                        request_motor_state_(motor_id);
                     } catch (...) {
                         // A disconnect becomes stale feedback for RobotCore;
                         // never let an exception escape a background thread.
+                    }
+                }
+
+                std::this_thread::sleep_until(next_deadline);
+                if (!poll_running_.load()) return;
+
+                std::vector<int> updated;
+                updated.reserve(ids.size());
+                {
+                    std::lock_guard<std::mutex> cache_lock(cache_mtx_);
+                    for (int motor_id : ids) {
+                        const uint64_t current = update_seq_[motor_id];
+                        if (current > reported_seq[motor_id]) {
+                            reported_seq[motor_id] = current;
+                            updated.push_back(motor_id);
+                        }
                     }
                 }
                 if (callback && !updated.empty()) {
                     try { callback(updated); } catch (...) {}
                 }
 
-                const auto elapsed =
-                    std::chrono::steady_clock::now() - started;
-                if (elapsed < period) {
-                    std::this_thread::sleep_for(period - elapsed);
+                next_deadline += period;
+                const auto now = std::chrono::steady_clock::now();
+                if (next_deadline <= now) {
+                    const auto missed =
+                        (now - next_deadline) / period + 1;
+                    next_deadline += period * missed;
                 }
             }
             });
     } catch (...) {
         poll_running_.store(false);
+        if (poll_owns_async_rx_) {
+            poll_owns_async_rx_ = false;
+            disable_async_rx_unlocked_();
+        }
         throw;
     }
 }
@@ -1708,6 +1755,10 @@ void HightorqueSerial::stop_state_polling_unlocked_() {
     poll_running_.store(false);
     if (poll_thread_.joinable()) {
         poll_thread_.join();
+    }
+    if (poll_owns_async_rx_) {
+        poll_owns_async_rx_ = false;
+        disable_async_rx_unlocked_();
     }
 }
 
@@ -1860,18 +1911,13 @@ void HightorqueSerial::dispatch_rcv_line_(const std::string& line) {
     }
     cache_cv_.notify_all();
 }
-
-void HightorqueSerial::enable_async_rx() {
-    std::lock_guard<std::mutex> lock(lifecycle_mtx_);
+void HightorqueSerial::enable_async_rx_unlocked_() {
     if (async_rx_enabled_.load()) return;
     if (!ser_ || !ser_->isOpen()) {
         throw std::runtime_error(
             "cannot enable asynchronous receive on a closed serial port");
     }
 
-    // A legacy synchronous poller cannot be active while the RX thread is
-    // being installed. RobotCore starts async RX first, then its cache poller.
-    stop_state_polling_unlocked_();
     rx_running_.store(true);
     async_rx_enabled_.store(true);
     try {
@@ -1881,6 +1927,16 @@ void HightorqueSerial::enable_async_rx() {
         rx_running_.store(false);
         throw;
     }
+}
+
+void HightorqueSerial::enable_async_rx() {
+    std::lock_guard<std::mutex> lock(lifecycle_mtx_);
+    if (async_rx_enabled_.load()) {
+        // An explicit caller takes ownership from an auto-started poller.
+        poll_owns_async_rx_ = false;
+        return;
+    }
+    enable_async_rx_unlocked_();
 }
 
 void HightorqueSerial::disable_async_rx_unlocked_() {
@@ -1894,6 +1950,7 @@ void HightorqueSerial::disable_async_rx_unlocked_() {
 
 void HightorqueSerial::disable_async_rx() {
     std::lock_guard<std::mutex> lock(lifecycle_mtx_);
+    stop_state_polling_unlocked_();
     disable_async_rx_unlocked_();
 }
 

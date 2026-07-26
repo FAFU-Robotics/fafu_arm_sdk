@@ -22,12 +22,16 @@ fafu_robot_sdk/
 └── fafu_robot_python/      ← Python SDK (用户日常使用)
     ├── README.md
     ├── __init__.py
-    ├── fafu_robot_controller.py   高层封装 FafuRobotController
+    ├── fafu_robot_controller.py   高层 API、安全状态与硬件编排
+    ├── _api_types.py              公开枚举、异常与配置/结果类型
+    ├── _dynamics.py               Pinocchio 动力学与运动学实现
     ├── robot.cfg                  默认配置
     ├── fafu_motor.cpXY-win_amd64.pyd   ← 由 fafu_robot_cpp 构建出来
     ├── serial_cmake.dll                    ← 由 fafu_robot_cpp 构建出来
     ├── requirements.txt
     ├── examples/
+    │   ├── 01_read_state.py ... 06_emergency_stop.py
+    │   ├── 07_full_demo.py
     │   └── visible_motion.py
     └── tests/
         ├── smoke_test.py
@@ -96,7 +100,8 @@ cd fafu_robot_sdk\fafu_robot_cpp
 | C++ 子项目 | `fafu_robot_cpp` | 协议层 + pybind11 绑定 + 原生 C++ SDK |
 | Python 子项目 / 包 | `fafu_robot_python` | 高层封装 + 预编译 .pyd |
 | 高层 Python 类 | `FafuRobotController` | 用户的主入口 |
-| Python 主模块文件 | `fafu_robot_controller.py` | 在 `fafu_robot_python/` 下 |
+| Python 高层入口 | `fafu_robot_controller.py` | 控制器、安全状态与硬件编排 |
+| Python 支撑模块 | `_api_types.py`, `_dynamics.py` | 必须随 SDK 一起分发，不应只复制入口文件 |
 | 底层 pybind11 模块 | `fafu_motor` (`.pyd`) | C++ 编译产物, 改名要重编 bindings.cpp |
 | 日志前缀 | `[FafuRobot]` | 控制器内部打印 |
 

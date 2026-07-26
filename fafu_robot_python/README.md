@@ -7,7 +7,7 @@
 你的脚本  ──Python──▶  FafuRobotController  ──pybind11──▶  RobotCore / HightorqueSerial (C++)  ──USB串口──▶  调试板
 ```
 
-Python 控制器要求统一扩展提供 `CORE_ABI_VERSION == 2`。状态机、单写者仲裁、
+Python 控制器要求统一扩展提供 `CORE_ABI_VERSION == 3`。状态机、单写者仲裁、
 Servo 安全、使能恢复和标定换算只在 C++ 核心维护一份。线程与多机械臂约定见
 [P0_THREADING_AND_MULTI_ARM.md](../fafu_robot_cpp/docs/P0_THREADING_AND_MULTI_ARM.md)。
 
@@ -22,7 +22,9 @@ Servo 安全、使能恢复和标定换算只在 C++ 核心维护一份。线程
 fafu_robot_python/
 ├── README.md                           ← 你正在看的文件
 ├── __init__.py                         包入口, 暴露 FafuRobotController / GraspResult
-├── fafu_robot_controller.py            Python 高层 API 与规划/动力学
+├── fafu_robot_controller.py            高层 API、安全状态与硬件编排
+├── _api_types.py                       公开枚举、异常与配置/结果数据类
+├── _dynamics.py                        纯 Pinocchio 动力学、运动学与 SE(3) 插值
 ├── robot.cfg                           默认配置 (端口/波特率/电机ID/软限位/控制率)
 ├── fafu_motor.cpXY-win_amd64.pyd   底层 C++ 绑定 (由 ../fafu_robot_cpp/ 构建)
 ├── requirements.txt
@@ -36,6 +38,7 @@ fafu_robot_python/
 │   ├── 04_enable_disable.py             使能 / 制动 / 释放
 │   ├── 05_servo_joint.py                Servo 流式控制
 │   ├── 06_emergency_stop.py             急停与恢复
+│   ├── 07_full_demo.py                  完整命令行演示
 │   └── visible_motion.py                视觉可见的综合运动 demo
 └── tests/
     ├── smoke_test.py                   无硬件环境检查
@@ -125,8 +128,9 @@ arm = FafuRobotController(cfg_path="robot.cfg",
                           has_gripper=True, gripper_motor_id=7)
 arm.is_enabled                                    # → bool
 arm.enable() / arm.disable() / arm.brake()
+# 如需 PWM off / 手动摆动，先支撑机械臂再显式选择 stop。
 arm.close_connection(joint_release="stop",
-                     gripper_release="brake")     # 退出时电机模式
+                     gripper_release="brake")
 ```
 
 ### 关节运动
@@ -154,6 +158,10 @@ while running:
 arm.servo_end(finish_mode="brake")                # 清看门狗 + 收尾
 arm.servo_lag_count()                             # 跟踪误差超限计数
 ```
+
+Position 通道的 `vel` 始终是非负速度上限：默认取目标路径速度与实测误差追赶速度的
+较大值并受 `max_vel` 限制；目标停止后仍会追赶，只有误差进入
+`position_error_deadband_rad`（默认 0.001 rad）后才归零。MIT 通道仍使用有符号速度。
 
 ### 笛卡尔运动 / FK·IK（需要 pinocchio）
 
@@ -255,8 +263,9 @@ arm.emergency_stop() / arm.resume()
 
 - 第一次跑先把 `robot.cfg` 里的 `motor_ids` 改成单关节，确认 OK 再加。
 - `limits.*` 是保守初值，**必须按你机器臂实际行程修改 `robot.cfg`**。
-- `close_connection()` 默认对手臂关节是 `stop`（PWM off），**重力下会下坠** —
-  肩 / 肘等承重关节先用手或外力托住。
+- `close_connection()` 默认对手臂关节使用 `brake`（短路制动），可降低突然自由下坠风险；
+  但它不是位置保持，重载关节仍可能缓慢下垂，仍需支撑。需要手动摆动时可在支撑后
+  显式传入 `joint_release="stop"`（PWM off）。
 - 夹爪默认 `gripper_release="brake"`，断开后能短路阻尼挂住物体，但**不会**保持驱动力矩，
   没有自锁机构的物体仍可能滑落。
 - 调试时手边备好"拔 USB"的能力。

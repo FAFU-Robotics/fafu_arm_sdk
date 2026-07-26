@@ -10,8 +10,13 @@ Python SDK 和原生 C++ SDK 共享 `fafu::core::RobotCore`，避免两套状态
   `move_j`、Servo、抓取或重力补偿帧。
 - 同线程的组合动作可以嵌套，例如 `go_home -> move_j`。
 - Servo 会话归启动它的线程所有；`servo_j` 和正常 `servo_end` 必须由该线程调用。
+- 唯一的窄例外是：Servo owner 线程可发送非阻塞夹爪位置命令；该命令复用
+  Servo writer lease，仍经命令门禁串行化，active operation 保持 `Servo`。
+  其他线程、阻塞夹爪、`grasp()` 和新的关节运动仍立即报忙。
 - `emergency_stop` 可以从其他线程调用；它先锁存取消，再通过实例内命令门禁
   发送 STOP，保证竞态中的普通控制帧先完成、STOP 最后发送。
+- 反馈超时进入 `DEAD` 时使用 BRAKE，恢复后保持 `BRAKED`；普通关闭也默认
+  `{joints=Brake, auxiliary=Brake}`，避免承重关节突然自由下坠。显式 STOP 仍可用。
 - `close_connection` 会请求取消并等待正在执行的写操作退出；超时会报错，不会
   一边关闭串口一边继续发送。
 - `close_connection` 和底层 `close` 都是幂等的。

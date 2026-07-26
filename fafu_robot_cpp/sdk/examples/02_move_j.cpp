@@ -80,8 +80,8 @@ int main(int argc, char* argv[]) {
         arm.go_home(15, true);
         print_joints(arm.get_joint_values(false), "       after =");
 
-        std::cout << "\nclosing connection (joints will free-spin, gripper braked) ...\n";
-        // 显式选保留方式; 也可以直接靠析构默认 = {Stop, Brake}
+        std::cout << "\nclosing connection (explicit joint free-spin, gripper braked) ...\n";
+        // 显式选择 Stop; 析构默认是更防掉落的 {Brake, Brake}.
         arm.close_connection(ReleaseMode::Stop, ReleaseMode::Brake);
 
     } catch (const std::exception& e) {

@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
 
         std::cout << "\n[CAN] " << arm.get_can_status().to_string() << "\n";
 
-        // 析构会自动 close_connection(joints=stop, gripper=brake)
+        // 析构会自动 close_connection(joints=brake, gripper=brake)
     } catch (const std::exception& e) {
         std::cerr << "\n[ERROR] " << e.what() << std::endl;
         return 1;

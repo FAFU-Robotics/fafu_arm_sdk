@@ -142,7 +142,7 @@ int main() {
     else           std::cout << "miss: "   << r.reason     << "\n";
 
     arm.release();
-    // 析构里自动 close_connection(joints=Stop, gripper=Brake)
+    // 析构里自动 close_connection(joints=Brake, gripper=Brake)
     return 0;
 }
 ```

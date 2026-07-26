@@ -44,9 +44,14 @@ jobs:
         working-directory: fafu_robot_python
         run: >-
           python -c "import fafu_motor;
-          assert fafu_motor.CORE_ABI_VERSION == 2;
+          assert fafu_motor.CORE_ABI_VERSION == 3;
           assert hasattr(fafu_motor, 'RobotCore');
           print(fafu_motor.__file__)"
+
+      - name: Verify high-level Python import compatibility
+        run: |
+          python -c "import sys; sys.path.insert(0, 'fafu_robot_python'); import fafu_robot_controller as sdk; assert sdk.FafuRobotController"
+          python -c "import fafu_robot_python as sdk; assert sdk.FafuRobotController"
 
       - name: Run hardware-free Python policy tests
         run: >-

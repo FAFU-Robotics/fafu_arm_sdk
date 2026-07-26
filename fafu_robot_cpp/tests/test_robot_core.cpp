@@ -21,6 +21,7 @@ using fafu::core::BusyError;
 using fafu::core::CoreConfig;
 using fafu::core::EnableOptions;
 using fafu::core::FinishMode;
+using fafu::core::MODE_BRAKE;
 using fafu::core::MODE_ACTIVE;
 using fafu::core::MODE_MIT;
 using fafu::core::ModeStage;
@@ -146,6 +147,57 @@ void test_servo_safety() {
     require(summary.lag_count == 1, "servo lag count mismatch");
 }
 
+void test_position_servo_velocity_policy() {
+    constexpr double kTwoPi = 6.28318530717958647692;
+    FakeMotorIO io({1});
+    RobotCore core(io, config({1}, {1}));
+    io.set_mode_direct(1, MODE_ACTIVE);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+    core.start_transport(true, false);
+
+    ServoOptions options;
+    options.channel = ServoChannel::Position;
+    options.max_velocity_rad_s = 0.5;
+    options.max_step_rad = 1.0;
+    options.max_lag_rad = 0.0;
+    options.nominal_rate_hz = 100.0;
+    options.feedforward_velocity = true;
+    options.position_error_deadband_rad = 0.001;
+    core.servo_start(options);
+
+    require(core.servo_tick({-0.01}).sent, "negative Position tick failed");
+    auto frames = io.frames();
+    const double cap_turns_s = options.max_velocity_rad_s / kTwoPi;
+    require(frames.size() == 1 && !frames.back().mit,
+            "expected one Position frame");
+    require(frames.back().velocities[0] > 0.0 &&
+            frames.back().velocities[0] <= cap_turns_s + 1e-12,
+            "Position velocity must be a positive capped limit");
+
+    // The target no longer changes, but measured position still lags it.
+    io.set_position(1, -0.005 / kTwoPi);
+    require(core.servo_tick({-0.01}).sent, "Position catch-up tick failed");
+    frames = io.frames();
+    require(frames.back().velocities[0] > 0.0,
+            "residual Position error must retain catch-up velocity");
+
+    // Once measured error is inside the deadband, a stationary target settles.
+    io.set_position(1, -0.0095 / kTwoPi);
+    require(core.servo_tick({-0.01}).sent, "Position settle tick failed");
+    frames = io.frames();
+    require(std::abs(frames.back().velocities[0]) < 1e-12,
+            "Position velocity must settle to zero inside the deadband");
+    core.servo_end(FinishMode::Hold);
+
+    options.feedforward_velocity = false;
+    core.servo_start(options);
+    require(core.servo_tick({-0.01}).sent, "fixed-limit Position tick failed");
+    frames = io.frames();
+    require(std::abs(frames.back().velocities[0] - cap_turns_s) < 1e-12,
+            "disabled Position feed-forward must keep the fixed positive cap");
+    core.servo_end(FinishMode::Hold);
+}
+
 void test_dead_is_per_instance() {
     FakeMotorIO left_io({1, 2});
     FakeMotorIO right_io({1, 2});
@@ -166,9 +218,164 @@ void test_dead_is_per_instance() {
     require(!left.stream_link_ok(), "left stale motor must latch DEAD");
     require(left.state() == RobotState::Dead,
             "left controller did not enter DEAD");
+    for (int id : {1, 2}) {
+        const auto motor = left_io.read_state(id, 0.0);
+        require(motor && motor->mode == MODE_BRAKE,
+                "DEAD must brake every motor in the affected instance");
+    }
     require(right.stream_link_ok(), "right controller must remain healthy");
     require(right.state() == RobotState::Idle,
             "right state leaked from left controller");
+}
+
+void test_servo_feedback_timeout_stays_braked() {
+    FakeMotorIO io({1, 2, 7});
+    RobotCore core(io, config({1, 2, 7}, {1, 2}));
+    for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+    core.start_transport(true, false);
+
+    ServoOptions options;
+    options.channel = ServoChannel::Position;
+    options.max_lag_rad = 0.0;
+    core.servo_start(options);
+    io.set_age_ms(2, 1000.0);
+
+    const auto tick = core.servo_tick({0.0, 0.0});
+    require(tick.aborted && !tick.sent,
+            "stale feedback must abort before another Servo frame");
+    require(core.state() == RobotState::Dead,
+            "Servo feedback timeout must latch DEAD");
+    for (int id : {1, 2, 7}) {
+        const auto motor = io.read_state(id, 0.0);
+        require(motor && motor->mode == MODE_BRAKE,
+                "Servo DEAD cleanup must not overwrite BRAKE with STOP");
+    }
+}
+
+void test_dead_and_default_shutdown_use_brake() {
+    {
+        FakeMotorIO io({1, 2, 7});
+        RobotCore core(io, config({1, 2, 7}, {1, 2}));
+        for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+        require(core.enable(fast_enable_options()).success, "enable failed");
+        core.start_transport(true, false);
+        io.set_age_ms(1, 1000.0);
+        require(!core.stream_link_ok(), "fixture must enter DEAD");
+
+        core.shutdown(FinishMode::Hold, FinishMode::Stop, 1.0);
+        for (int id : {1, 2, 7}) {
+            const auto motor = io.read_state(id, 0.0);
+            require(motor && motor->mode == MODE_BRAKE,
+                    "DEAD shutdown must preserve BRAKE for joints and auxiliary motors");
+        }
+    }
+
+    {
+        FakeMotorIO io({1, 2, 7});
+        RobotCore core(io, config({1, 2, 7}, {1, 2}));
+        for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+        require(core.enable(fast_enable_options()).success, "enable failed");
+        core.start_transport(true, false);
+        io.set_age_ms(2, 1000.0);
+        require(!core.stream_link_ok(), "fixture must enter DEAD");
+
+        require(core.recover(true, 0.0), "DEAD recovery failed");
+        require(core.state() == RobotState::Braked,
+                "DEAD recovery must leave the controller BRAKED");
+        for (int id : {1, 2, 7}) {
+            const auto motor = io.read_state(id, 0.0);
+            require(motor && motor->mode == MODE_BRAKE,
+                    "DEAD recovery must leave every motor braked");
+        }
+    }
+
+    {
+        FakeMotorIO io({1, 2, 7});
+        RobotCore core(io, config({1, 2, 7}, {1, 2}));
+        for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+        require(core.enable(fast_enable_options()).success, "enable failed");
+
+        core.shutdown();
+        for (int id : {1, 2, 7}) {
+            const auto motor = io.read_state(id, 0.0);
+            require(motor && motor->mode == MODE_BRAKE,
+                    "default shutdown must brake joints and auxiliary motors");
+        }
+    }
+}
+
+void test_generic_abort_brakes_and_estop_dominates_dead() {
+    {
+        FakeMotorIO io({1, 2, 7});
+        RobotCore core(io, config({1, 2, 7}, {1, 2}));
+        for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+        require(core.enable(fast_enable_options()).success, "enable failed");
+
+        const auto token =
+            core.begin_operation(OperationKind::JointMotion);
+        core.brake_active_operation();
+        require(core.state() == RobotState::Braked,
+                "generic active-operation abort must transition to BRAKED");
+        require(core.active_operation() == OperationKind::JointMotion,
+                "abort cleanup must leave token unwinding to its owner");
+        for (int id : {1, 2, 7}) {
+            const auto motor = io.read_state(id, 0.0);
+            require(motor && motor->mode == MODE_BRAKE,
+                    "generic active-operation abort must brake every motor");
+        }
+        core.end_operation(token);
+        require(core.state() == RobotState::Braked,
+                "operation unwind must preserve BRAKED after abort");
+    }
+
+    {
+        FakeMotorIO io({1, 2});
+        RobotCore core(io, config({1, 2}, {1, 2}));
+        for (int id : {1, 2}) io.set_mode_direct(id, MODE_ACTIVE);
+        require(core.enable(fast_enable_options()).success, "enable failed");
+        core.start_transport(true, false);
+
+        ServoOptions options;
+        core.servo_start(options);
+        bool rejected = false;
+        try {
+            core.brake_active_operation();
+        } catch (const StateError&) {
+            rejected = true;
+        }
+        require(rejected,
+                "active-operation brake must reject a Servo session");
+        require(core.state() == RobotState::Servoing && core.is_servoing(),
+                "rejected abort cleanup must leave Servo state consistent");
+        core.servo_end(FinishMode::Brake);
+    }
+
+    {
+        FakeMotorIO io({1, 2, 7});
+        RobotCore core(io, config({1, 2, 7}, {1, 2}));
+        for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+        require(core.enable(fast_enable_options()).success, "enable failed");
+        core.start_transport(true, false);
+        io.set_age_ms(1, 1000.0);
+        require(!core.stream_link_ok(), "fixture must enter DEAD");
+
+        core.emergency_stop();
+        require(core.state() == RobotState::Estop,
+                "explicit ESTOP must dominate an earlier DEAD latch");
+        for (int id : {1, 2, 7}) {
+            const auto motor = io.read_state(id, 0.0);
+            require(motor && motor->mode == fafu::core::MODE_STOP,
+                    "DEAD -> ESTOP must stop every motor");
+        }
+
+        core.shutdown(FinishMode::Hold, FinishMode::Brake, 1.0);
+        for (int id : {1, 2, 7}) {
+            const auto motor = io.read_state(id, 0.0);
+            require(motor && motor->mode == fafu::core::MODE_STOP,
+                    "shutdown must preserve STOP after DEAD -> ESTOP");
+        }
+    }
 }
 
 void test_concurrent_readers() {
@@ -346,6 +553,30 @@ void test_mit_without_velocity_feedforward_sends_zero_velocity() {
     core.servo_end(FinishMode::Stop);
 }
 
+void test_mit_velocity_feedforward_remains_signed() {
+    FakeMotorIO io({1, 2});
+    RobotCore core(io, config({1, 2}, {1, 2}));
+    for (int id : {1, 2}) io.set_mode_direct(id, MODE_ACTIVE);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+    core.start_transport(true, false);
+
+    ServoOptions options;
+    options.channel = ServoChannel::Mit;
+    options.feedforward_velocity = true;
+    options.max_step_rad = 1.0;
+    options.max_lag_rad = 0.0;
+    core.servo_start(options);
+    const auto tick = core.servo_tick({-0.01, 0.01});
+    require(tick.sent, "MIT signed-velocity tick was not sent");
+    const auto frames = io.frames();
+    require(frames.size() == 1 && frames.front().mit,
+            "expected one MIT frame");
+    require(frames.front().velocities[0] < 0.0 &&
+            frames.front().velocities[1] > 0.0,
+            "MIT feed-forward velocity must retain its sign");
+    core.servo_end(FinishMode::Stop);
+}
+
 void test_unknown_motor_model_is_rejected_for_nonzero_output() {
     bool torque_rejected = false;
     try {
@@ -400,10 +631,26 @@ void test_shutdown_cannot_override_latched_stop() {
 
     core.emergency_stop();
     core.shutdown(FinishMode::Hold, FinishMode::Brake, 1.0);
+    core.shutdown(FinishMode::Hold, FinishMode::Hold, 1.0);
     for (int id : {1, 2, 7}) {
         const auto motor = io.read_state(id, 0.0);
         require(motor && motor->mode == fafu::core::MODE_STOP,
-                "shutdown must not emit HOLD/BRAKE after a safety STOP");
+                "repeated shutdown must not override a safety STOP");
+    }
+}
+
+void test_shutdown_is_idempotent() {
+    FakeMotorIO io({1, 2, 7});
+    RobotCore core(io, config({1, 2, 7}, {1, 2}));
+    for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+
+    core.shutdown(FinishMode::Brake, FinishMode::Brake, 1.0);
+    core.shutdown(FinishMode::Hold, FinishMode::Hold, 1.0);
+    for (int id : {1, 2, 7}) {
+        const auto motor = io.read_state(id, 0.0);
+        require(motor && motor->mode == MODE_BRAKE,
+                "repeated shutdown must preserve the first release policy");
     }
 }
 
@@ -440,6 +687,60 @@ void test_servo_has_an_owner_thread() {
     core.servo_end(FinishMode::Hold);
 }
 
+void test_servo_keeps_generic_arbitration_strict() {
+    FakeMotorIO io({1, 2, 7});
+    RobotCore core(io, config({1, 2, 7}, {1, 2}));
+    for (int id : {1, 2, 7}) io.set_mode_direct(id, MODE_ACTIVE);
+    require(core.enable(fast_enable_options()).success, "enable failed");
+    core.start_transport(true, false);
+
+    ServoOptions options;
+    options.channel = ServoChannel::Position;
+    core.servo_start(options);
+
+    const auto require_same_thread_busy =
+        [&](OperationKind kind, const std::string& message) {
+            bool got_busy = false;
+            try {
+                (void)core.begin_operation(kind);
+            } catch (const BusyError&) {
+                got_busy = true;
+            }
+            require(got_busy, message);
+        };
+    require_same_thread_busy(
+        OperationKind::GripperMotion,
+        "generic Servo -> GripperMotion nesting must remain rejected");
+    require_same_thread_busy(
+        OperationKind::Grasp,
+        "Servo -> Grasp nesting must remain rejected");
+    require_same_thread_busy(
+        OperationKind::JointMotion,
+        "Servo -> JointMotion nesting must remain rejected");
+
+    std::atomic<bool> other_thread_busy{false};
+    std::thread other([&] {
+        try {
+            (void)core.begin_operation(OperationKind::GripperMotion);
+        } catch (const BusyError&) {
+            other_thread_busy.store(true);
+        }
+    });
+    other.join();
+
+    require(other_thread_busy.load(),
+            "another thread must not borrow the Servo writer");
+    require(core.active_operation() == OperationKind::Servo,
+            "rejected operations must leave Servo active");
+    require(core.state() == RobotState::Servoing,
+            "rejected operations must leave the controller SERVOING");
+
+    const auto tick = core.servo_tick({0.0, 0.0});
+    require(tick.sent, "Servo must remain usable after rejected operations");
+    core.servo_end(FinishMode::Hold);
+}
+
+
 }  // namespace
 
 int main() {
@@ -448,7 +749,15 @@ int main() {
         {"operation arbitration", test_operation_arbitration},
         {"enable recovery", test_enable_recovery},
         {"servo safety", test_servo_safety},
+        {"Position servo velocity policy",
+         test_position_servo_velocity_policy},
         {"per-instance DEAD isolation", test_dead_is_per_instance},
+        {"Servo feedback timeout stays braked",
+         test_servo_feedback_timeout_stays_braked},
+        {"DEAD/default shutdown use brake",
+         test_dead_and_default_shutdown_use_brake},
+        {"generic abort brake and ESTOP priority",
+         test_generic_abort_brakes_and_estop_dominates_dead},
         {"concurrent readers", test_concurrent_readers},
         {"independent SDK instances", test_instances_are_independent},
         {"cross-thread ESTOP", test_estop_from_another_thread},
@@ -456,12 +765,17 @@ int main() {
         {"ESTOP command ordering", test_estop_orders_after_inflight_command},
         {"MIT zero desired velocity",
          test_mit_without_velocity_feedforward_sends_zero_velocity},
+        {"MIT signed desired velocity",
+         test_mit_velocity_feedforward_remains_signed},
         {"unknown motor model rejection",
          test_unknown_motor_model_is_rejected_for_nonzero_output},
         {"shutdown waits for writer", test_shutdown_waits_for_writer},
         {"shutdown preserves safety STOP",
          test_shutdown_cannot_override_latched_stop},
+        {"shutdown is idempotent", test_shutdown_is_idempotent},
         {"servo owner thread", test_servo_has_an_owner_thread},
+        {"Servo wrapper exception remains narrow",
+         test_servo_keeps_generic_arbitration_strict},
     };
 
     int failures = 0;
