@@ -7,6 +7,17 @@ target_include_directories(fafu_robot_core_tests PRIVATE
 )
 add_test(NAME fafu_robot_core_tests COMMAND fafu_robot_core_tests)
 
+add_executable(fafu_hightorque_position_encoding_tests
+    test_hightorque_position_encoding.cpp
+)
+target_link_libraries(fafu_hightorque_position_encoding_tests
+    PRIVATE hightorque_serial_debug
+)
+add_test(
+    NAME fafu_hightorque_position_encoding_tests
+    COMMAND fafu_hightorque_position_encoding_tests
+)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(fafu_linux_serial_exclusive_tests
         test_linux_serial_exclusive.cpp

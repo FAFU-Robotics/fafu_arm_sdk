@@ -4,6 +4,7 @@
 
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fafu::core {
@@ -18,6 +19,8 @@ public:
     virtual std::optional<hightorque::MotorState> cached_state(
         int motor_id) const = 0;
     virtual double state_age_ms(int motor_id) const = 0;
+    virtual std::optional<std::pair<double, double>> position_limit_turns(
+        int motor_id) const = 0;
 
     virtual std::optional<hightorque::MotorState> set_mode(
         int motor_id, int mode) = 0;
@@ -60,6 +63,8 @@ public:
     std::optional<hightorque::MotorState> cached_state(
         int motor_id) const override;
     double state_age_ms(int motor_id) const override;
+    std::optional<std::pair<double, double>> position_limit_turns(
+        int motor_id) const override;
 
     std::optional<hightorque::MotorState> set_mode(
         int motor_id, int mode) override;

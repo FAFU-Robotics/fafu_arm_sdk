@@ -116,14 +116,14 @@ def main() -> int:
                         help="每关节积分力矩上限 Nm (防积分饱和). 默认 3. "
                              "太小会让模型/摩擦缺口大的关节积分提前饱和、持续缓慢下沉")
     parser.add_argument("--vel-abort", type=float, default=4.0,
-                        help="失速保护: 任一关节 |速度| 超过此值(rev/s)立即停环复位. "
+                        help="失速保护: 任一关节 |速度| 超过此值(rad/s)立即停环复位. "
                              "0=关闭. 默认 4")
     parser.add_argument("--vel-lpf", type=float, default=0.3,
                         help="阻尼项 B 用的速度低通系数 (0~1, 越小越平滑). 默认 0.3")
     parser.add_argument("--no-hold", action="store_true",
                         help="关闭'拖到哪停哪'示教模式, 改回固定 q_des(推开会弹回起始姿态)")
     parser.add_argument("--move-vel", type=float, default=0.15,
-                        help="判定'正在被拖动'的速度阈值 rev/s (拖动示教用). 默认 0.15. "
+                        help="判定'正在被拖动'的速度阈值 rad/s (拖动示教用). 默认 0.15. "
                              "无人碰时若缓慢漂移就调大")
     parser.add_argument("--home-on-exit", action="store_true",
                         help="退出时(正常/Ctrl+C)先停力矩再慢速回零位再退出")
@@ -199,7 +199,7 @@ def main() -> int:
             finally:
                 for mid in arm.joint_motor_ids:
                     try:
-                        arm.driver.stop(mid)
+                        arm._ht.stop(mid)  # diagnostic emergency fallback
                     except Exception:
                         pass
             return 0
@@ -235,10 +235,10 @@ def main() -> int:
             b_soft=b_soft,
             i_soft=i_soft,
             i_clamp=args.i_clamp,
-            vel_abort_rps=args.vel_abort,
+            vel_abort_rad_s=args.vel_abort,
             vel_lpf_alpha=args.vel_lpf,
             hold_on_release=not args.no_hold,
-            move_vel_thresh=args.move_vel,
+            move_vel_thresh_rad_s=args.move_vel,
             tau_lpf_alpha=args.tau_lpf,
             tau_slew_per_s=(args.tau_slew if args.tau_slew > 0 else None),
             home_on_exit=args.home_on_exit,

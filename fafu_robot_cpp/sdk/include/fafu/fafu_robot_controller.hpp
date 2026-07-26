@@ -443,7 +443,6 @@ private:
     // ---- helpers ----
     static double rad_to_turns_(double rad);
     static double turns_to_rad_(double turns);
-    static int    clamp_speed_(int speed);
     static std::string release_mode_name_(ReleaseMode m);
 
     // 从 cfg.port 解析实际端口 (auto / 显式 / 缺省).
@@ -451,10 +450,6 @@ private:
 
     // 给每个电机 read_motor_state 一次, 失败抛异常.
     void precheck_communication_();
-
-    // 入参做长度 / NaN 校验, 返回归一到 turns 的 joint_angles (用于内部 set_many_*).
-    std::vector<double> validate_joint_angles_(const std::vector<double>& angles,
-                                               bool is_radians);
 
     // 读取一组 motor_id 的 MotorState; prefer_cache=true 优先 cache.
     std::map<int, hightorque::MotorState> read_states_(const std::vector<int>& ids,
@@ -470,14 +465,6 @@ private:
     GraspResult make_grasp_result_(const std::string& reason, bool grasped,
                                    double last_pos_turns, double start_pos_turns,
                                    int peak_torque, double duration_s);
-
-    // 构造 set_many_pos_vel_tqe 用的 cmd 列表 — targets 里没指定的 motor 用 hold pos.
-    std::vector<hightorque::HightorqueSerial::ManyMotorCmd>
-        build_many_cmds_holding_others_(const std::map<int, double>& targets_turns,
-                                        double vel_rps);
-
-    // 阻塞 S-curve 关节运动. (mirror of Python _move_scurve.)
-    void move_scurve_(const std::map<int, double>& targets_turns, int speed_pct);
 
     // 软限位读取 (gripper 用). 返回 (lo, hi) 圈 / nullopt.
     std::optional<std::pair<double, double>> gripper_limit_turns_() const;
@@ -495,10 +482,9 @@ private:
     int                                           gripper_motor_id_ = 0;
     std::vector<int>                              joint_motor_ids_; // = motor_ids - {gripper}
 
-    // S-curve 调参 (与 Python 同步)
+    // Native move_j option mapping.
     static constexpr double VEL_AVG_MAX_TPS_ = 0.5;
     static constexpr double DT_MIN_S_        = 0.3;
-    static constexpr int    SETTLE_MS_       = 300;
 
     // 夹爪闭环阈值 (与 Python 同步)
     static constexpr double GRIPPER_TOLERANCE_TURNS_   = 0.005;   // ~1.8 deg

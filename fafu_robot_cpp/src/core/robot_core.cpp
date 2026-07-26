@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <set>
 #include <sstream>
@@ -15,7 +16,9 @@ namespace fafu::core {
 
 namespace {
 
+constexpr double kPi = 3.14159265358979323846;
 constexpr double kTwoPi = 6.28318530717958647692;
+constexpr double kPositionStepTurns = 0.0001;
 
 bool is_latched_or_disconnected(RobotState state) {
     return state == RobotState::Estop ||
@@ -32,6 +35,36 @@ std::string stale_message(const std::vector<int>& motor_ids,
     }
     oss << " (limit=" << timeout_ms << "ms)";
     return oss.str();
+}
+
+void validate_move_j_options(const MoveJOptions& options) {
+    if (!std::isfinite(options.max_velocity_rad_s) ||
+        options.max_velocity_rad_s < 1e-6 ||
+        options.max_velocity_rad_s > 100.0) {
+        throw std::invalid_argument(
+            "max_velocity_rad_s must be finite and in [1e-6, 100]");
+    }
+    if (!std::isfinite(options.control_rate_hz) ||
+        options.control_rate_hz < 10.0 || options.control_rate_hz > 1000.0) {
+        throw std::invalid_argument(
+            "control_rate_hz must be finite and in [10, 1000]");
+    }
+    if (!std::isfinite(options.min_duration_s) ||
+        options.min_duration_s < 0.0 || options.min_duration_s > 60.0) {
+        throw std::invalid_argument(
+            "min_duration_s must be finite and in [0, 60]");
+    }
+    if (!std::isfinite(options.tolerance_rad) ||
+        options.tolerance_rad <= 0.0 || options.tolerance_rad > kPi) {
+        throw std::invalid_argument(
+            "tolerance_rad must be finite and in (0, pi]");
+    }
+    if (!std::isfinite(options.settle_timeout_s) ||
+        options.settle_timeout_s < 0.0 ||
+        options.settle_timeout_s > 60.0) {
+        throw std::invalid_argument(
+            "settle_timeout_s must be finite and in [0, 60]");
+    }
 }
 
 }  // namespace
@@ -82,6 +115,10 @@ void RobotCore::validate_config(const CoreConfig& config) {
 
     const std::set<int> all(config.all_motor_ids.begin(),
                             config.all_motor_ids.end());
+    if (*all.rbegin() > 10) {
+        throw std::invalid_argument(
+            "Position broadcast supports motor IDs in [1, 10]");
+    }
     if (all.size() != config.all_motor_ids.size() || *all.begin() <= 0) {
         throw std::invalid_argument(
             "all_motor_ids must contain unique positive IDs");
@@ -612,23 +649,68 @@ std::vector<int> RobotCore::stale_joint_ids() const {
 }
 
 void RobotCore::latch_dead(const std::vector<int>& stale) {
+    latch_dead(stale_message(
+        stale, stale_feedback_timeout_ms_.load(std::memory_order_acquire)));
+}
+
+void RobotCore::latch_dead(std::string reason) {
     std::lock_guard<std::mutex> safety(safety_mutex_);
     if (state() == RobotState::Disconnected ||
         state() == RobotState::Estop) {
         return;
     }
     safety_generation_.fetch_add(1, std::memory_order_acq_rel);
-    controller_state_.latch_dead(
-        stale_message(stale, stale_feedback_timeout_ms_.load(
-            std::memory_order_acquire)));
+    controller_state_.latch_dead(std::move(reason));
     std::lock_guard<std::mutex> command(command_mutex_);
     release_motors_unlocked(config_.all_motor_ids, FinishMode::Brake);
+}
+
+double RobotCore::validated_position_target_turns(
+        int motor_id, double position_turns) const {
+    if (!std::isfinite(position_turns)) {
+        throw std::invalid_argument("position target must be finite");
+    }
+    const double raw = position_turns / kPositionStepTurns;
+    if (raw <= -32768.0 || raw >= 32768.0) {
+        throw std::invalid_argument(
+            "position target is outside the protocol int16 range");
+    }
+    const auto count = static_cast<std::int16_t>(raw);
+    const double quantized =
+        static_cast<double>(count) * kPositionStepTurns;
+
+    const auto limit = io_.position_limit_turns(motor_id);
+    if (limit) {
+        if (!std::isfinite(limit->first) ||
+            !std::isfinite(limit->second) ||
+            limit->first > limit->second) {
+            throw std::runtime_error("invalid motor position limit");
+        }
+        if (position_turns < limit->first ||
+            position_turns > limit->second ||
+            quantized < limit->first ||
+            quantized > limit->second) {
+            throw std::invalid_argument(
+                "position target exceeds the motor soft limit");
+        }
+    }
+
+    return quantized;
 }
 
 bool RobotCore::stream_link_ok() {
     if (state() == RobotState::Estop ||
         state() == RobotState::Dead ||
         state() == RobotState::Disconnected) {
+        return false;
+    }
+    bool transport_open = false;
+    try {
+        transport_open = io_.is_open();
+    } catch (...) {
+    }
+    if (!transport_open) {
+        latch_dead("transport is closed");
         return false;
     }
     const std::vector<int> stale = stale_joint_ids();
@@ -704,6 +786,274 @@ bool RobotCore::recover(bool confirm, double timeout_s) {
     return true;
 }
 
+MoveJResult RobotCore::move_j(
+        const std::vector<double>& joint_angles_rad) {
+    return move_j(joint_angles_rad, MoveJOptions{});
+}
+
+MoveJResult RobotCore::move_j(
+        const std::vector<double>& joint_angles_rad,
+        const MoveJOptions& options) {
+    if (joint_angles_rad.size() != config_.joint_motor_ids.size()) {
+        throw std::invalid_argument(
+            "joint angle count must match joint motor count");
+    }
+    for (double angle_rad : joint_angles_rad) {
+        if (!std::isfinite(angle_rad)) {
+            throw std::invalid_argument(
+                "joint angles must contain only finite radians");
+        }
+    }
+    validate_move_j_options(options);
+
+    std::vector<double> requested_joint_turns;
+    requested_joint_turns.reserve(joint_angles_rad.size());
+    for (double angle_rad : joint_angles_rad) {
+        const double turns = angle_rad / kTwoPi;
+        const double raw = turns / kPositionStepTurns;
+        if (raw <= -32768.0 || raw >= 32768.0) {
+            throw std::invalid_argument(
+                "position target is outside the protocol int16 range");
+        }
+        requested_joint_turns.push_back(turns);
+    }
+
+    OperationLease operation(controller_state_, OperationKind::JointMotion);
+
+    std::vector<double> joint_targets_turns;
+    joint_targets_turns.reserve(requested_joint_turns.size());
+    for (std::size_t joint = 0; joint < requested_joint_turns.size(); ++joint) {
+        joint_targets_turns.push_back(validated_position_target_turns(
+            config_.joint_motor_ids[joint], requested_joint_turns[joint]));
+    }
+    const auto started_at = std::chrono::steady_clock::now();
+    MoveJResult result;
+
+    const auto set_elapsed = [&] {
+        result.elapsed_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started_at).count();
+    };
+    const auto brake_on_failure = [&] {
+        if (!is_latched_or_disconnected(state()) &&
+            controller_state_.operation_owned_by_current_thread()) {
+            try {
+                brake_active_operation();
+            } catch (...) {
+            }
+        }
+    };
+    const auto ensure_motion_can_continue = [&] {
+        if (cancel_requested()) {
+            if (state() == RobotState::Dead) {
+                throw StateError("move_j aborted: " + dead_reason());
+            }
+            if (state() == RobotState::Estop) {
+                throw StateError("move_j aborted by ESTOP");
+            }
+            throw StateError("move_j was cancelled");
+        }
+        if (!stream_link_ok()) {
+            throw StateError("move_j aborted: " + dead_reason());
+        }
+    };
+
+    try {
+        ensure_motion_can_continue();
+
+        std::vector<double> start_turns;
+        start_turns.reserve(config_.all_motor_ids.size());
+        for (int motor_id : config_.all_motor_ids) {
+            std::optional<hightorque::MotorState> motor;
+            try {
+                motor = io_.read_state(motor_id, 0.1);
+            } catch (...) {
+            }
+            if (!motor || !std::isfinite(motor->position)) {
+                if (std::find(config_.joint_motor_ids.begin(),
+                              config_.joint_motor_ids.end(),
+                              motor_id) != config_.joint_motor_ids.end()) {
+                    latch_dead(std::vector<int>{motor_id});
+                }
+                throw StateError(
+                    "move_j cannot read valid feedback from motor " +
+                    std::to_string(motor_id));
+            }
+            start_turns.push_back(motor->position);
+        }
+
+        std::vector<double> target_turns = start_turns;
+        std::vector<std::size_t> joint_slots;
+        joint_slots.reserve(config_.joint_motor_ids.size());
+        for (std::size_t joint = 0;
+             joint < config_.joint_motor_ids.size(); ++joint) {
+            const auto slot = std::find(
+                config_.all_motor_ids.begin(), config_.all_motor_ids.end(),
+                config_.joint_motor_ids[joint]);
+            if (slot == config_.all_motor_ids.end()) {
+                throw std::logic_error(
+                    "joint motor is absent from all_motor_ids");
+            }
+            const std::size_t index = static_cast<std::size_t>(
+                std::distance(config_.all_motor_ids.begin(), slot));
+            joint_slots.push_back(index);
+            target_turns[index] = joint_targets_turns[joint];
+        }
+
+        double max_delta_rad = 0.0;
+        for (std::size_t joint = 0; joint < joint_slots.size(); ++joint) {
+            const std::size_t slot = joint_slots[joint];
+            max_delta_rad = std::max(
+                max_delta_rad,
+                std::abs(target_turns[slot] - start_turns[slot]) * kTwoPi);
+        }
+        result.max_error_rad = max_delta_rad;
+
+        const int max_motor_id = *std::max_element(
+            config_.all_motor_ids.begin(), config_.all_motor_ids.end());
+        const double velocity_cap_turns_s =
+            options.max_velocity_rad_s / kTwoPi;
+        std::vector<double> moving_velocity_caps(
+            config_.all_motor_ids.size(), 0.0);
+        for (std::size_t joint = 0; joint < joint_slots.size(); ++joint) {
+            const std::size_t slot = joint_slots[joint];
+            if (target_turns[slot] != start_turns[slot]) {
+                moving_velocity_caps[slot] = velocity_cap_turns_s;
+            }
+        }
+        const auto send_frame =
+            [&](const std::vector<double>& positions,
+                const std::vector<double>& velocities) {
+                ensure_motion_can_continue();
+                auto command = command_guard();
+                io_.send_position(
+                    config_.all_motor_ids, positions, velocities,
+                    config_.max_torque_raw, max_motor_id);
+                result.sent = true;
+            };
+
+        if (!options.block) {
+            send_frame(target_turns, moving_velocity_caps);
+            set_elapsed();
+            return result;
+        }
+
+        const double trajectory_duration_s = std::max(
+            options.min_duration_s,
+            max_delta_rad * kPi /
+                (2.0 * options.max_velocity_rad_s));
+        const double tick_count = std::ceil(
+            trajectory_duration_s * options.control_rate_hz);
+        if (!std::isfinite(trajectory_duration_s) ||
+            !std::isfinite(tick_count) ||
+            tick_count > static_cast<double>(
+                std::numeric_limits<std::uint64_t>::max())) {
+            throw std::overflow_error(
+                "move_j trajectory duration exceeds supported range");
+        }
+        const std::uint64_t total_ticks = std::max<std::uint64_t>(
+            1, static_cast<std::uint64_t>(tick_count));
+        const auto period = std::chrono::duration_cast<
+            std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(
+                    1.0 / options.control_rate_hz));
+        auto next_tick = std::chrono::steady_clock::now();
+
+        for (std::uint64_t tick = 1; tick <= total_ticks; ++tick) {
+            const double alpha =
+                static_cast<double>(tick) /
+                static_cast<double>(total_ticks);
+            const double smooth =
+                0.5 * (1.0 - std::cos(kPi * alpha));
+
+            std::vector<double> positions = start_turns;
+            for (std::size_t joint = 0;
+                 joint < joint_slots.size(); ++joint) {
+                const std::size_t slot = joint_slots[joint];
+                const double delta_turns =
+                    target_turns[slot] - start_turns[slot];
+                positions[slot] =
+                    start_turns[slot] + smooth * delta_turns;
+            }
+            send_frame(positions, moving_velocity_caps);
+            next_tick += period;
+            std::this_thread::sleep_until(next_tick);
+        }
+
+        const auto settle_deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::duration_cast<
+                std::chrono::steady_clock::duration>(
+                    std::chrono::duration<double>(
+                        options.settle_timeout_s));
+
+        const auto measure_joint_errors = [&] {
+            double max_error_rad = 0.0;
+            bool streaming = false;
+            try {
+                streaming = io_.is_async_rx() || io_.is_polling();
+            } catch (...) {
+            }
+
+            for (std::size_t joint = 0;
+                 joint < joint_slots.size(); ++joint) {
+                const int motor_id = config_.joint_motor_ids[joint];
+                std::optional<hightorque::MotorState> motor;
+                try {
+                    motor = io_.read_state(motor_id, 0.05);
+                } catch (...) {
+                }
+                if (!motor && streaming) {
+                    try {
+                        const double age_ms = io_.state_age_ms(motor_id);
+                        if (std::isfinite(age_ms) &&
+                            age_ms <= stale_feedback_timeout_ms_.load(
+                                std::memory_order_acquire)) {
+                            motor = io_.cached_state(motor_id);
+                        }
+                    } catch (...) {
+                    }
+                }
+                if (!motor || !std::isfinite(motor->position)) {
+                    latch_dead(std::vector<int>{motor_id});
+                    throw StateError(
+                        "move_j lost feedback from motor " +
+                        std::to_string(motor_id));
+                }
+
+                const double error_rad = std::abs(
+                    motor->position -
+                    target_turns[joint_slots[joint]]) * kTwoPi;
+                max_error_rad = std::max(max_error_rad, error_rad);
+            }
+            return max_error_rad;
+        };
+
+        for (;;) {
+            ensure_motion_can_continue();
+            result.max_error_rad = measure_joint_errors();
+            if (result.max_error_rad <= options.tolerance_rad) {
+                result.reached = true;
+                set_elapsed();
+                return result;
+            }
+            if (std::chrono::steady_clock::now() >= settle_deadline) {
+                throw std::runtime_error(
+                    "move_j timed out before all joints reached tolerance");
+            }
+
+            send_frame(target_turns, moving_velocity_caps);
+            const auto wake_at = std::min(
+                settle_deadline,
+                std::chrono::steady_clock::now() + period);
+            std::this_thread::sleep_until(wake_at);
+        }
+    } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        brake_on_failure();
+        std::rethrow_exception(failure);
+    }
+}
+
 void RobotCore::set_joint_motor_models(
         std::vector<std::string> motor_models) {
     if (motor_models.size() != config_.joint_motor_ids.size()) {
@@ -731,20 +1081,22 @@ void RobotCore::set_stale_feedback_timeout_ms(double timeout_ms) {
 }
 
 ServoOptions RobotCore::normalize_servo_options(ServoOptions options) {
-    if (options.watchdog_ms < 0) {
-        throw std::invalid_argument("watchdog_ms cannot be negative");
+    if (options.watchdog_ms < 0 || options.watchdog_ms > 32767) {
+        throw std::invalid_argument("watchdog_ms must be in [0, 32767]");
     }
-    options.watchdog_ms = std::min(options.watchdog_ms, 32767);
     if (!std::isfinite(options.max_velocity_rad_s) ||
         options.max_velocity_rad_s <= 0.0) {
-        options.max_velocity_rad_s = 1.0;
+        throw std::invalid_argument(
+            "max_velocity_rad_s must be positive and finite");
     }
     if (!std::isfinite(options.max_step_rad) ||
         options.max_step_rad <= 0.0) {
-        options.max_step_rad = 0.05;
+        throw std::invalid_argument(
+            "max_step_rad must be positive and finite");
     }
-    if (!std::isfinite(options.max_lag_rad)) {
-        throw std::invalid_argument("max_lag_rad must be finite");
+    if (!std::isfinite(options.max_lag_rad) || options.max_lag_rad < 0.0) {
+        throw std::invalid_argument(
+            "max_lag_rad must be finite and non-negative");
     }
     if (!std::isfinite(options.position_error_deadband_rad) ||
         options.position_error_deadband_rad < 0.0) {
@@ -753,14 +1105,18 @@ ServoOptions RobotCore::normalize_servo_options(ServoOptions options) {
     }
     if (!std::isfinite(options.nominal_rate_hz) ||
         options.nominal_rate_hz <= 0.0) {
-        options.nominal_rate_hz = 100.0;
+        throw std::invalid_argument(
+            "nominal_rate_hz must be positive and finite");
     }
     if (!std::isfinite(options.lookahead_time_s) ||
         options.lookahead_time_s < 0.0) {
-        options.lookahead_time_s = 0.0;
+        throw std::invalid_argument(
+            "lookahead_time_s must be finite and non-negative");
     }
-    options.lag_abort_consecutive =
-        std::max(0, options.lag_abort_consecutive);
+    if (options.lag_abort_consecutive < 0) {
+        throw std::invalid_argument(
+            "lag_abort_consecutive must be non-negative");
+    }
     return options;
 }
 
@@ -789,14 +1145,6 @@ void RobotCore::servo_start() {
 }
 
 void RobotCore::servo_start(const ServoOptions& options) {
-    if (state() == RobotState::Disabled || state() == RobotState::Braked) {
-        const EnableResult enabled = enable();
-        if (!enabled.success) {
-            throw StateError("servo_start could not enable all motors: " +
-                             enabled.message);
-        }
-    }
-
     std::lock_guard<std::mutex> lock(servo_mutex_);
     if (servo_.active) {
         if (controller_state_.operation_owned_by_current_thread()) {
@@ -814,6 +1162,31 @@ void RobotCore::servo_start(const ServoOptions& options) {
             "MIT broadcast supports at most six joint slots");
     }
 
+    std::vector<int> kp_raw;
+    std::vector<int> kd_raw;
+    if (normalized.channel == ServoChannel::Mit) {
+        const std::vector<double> kp = expand_gains(
+            normalized.mit_kp, config_.joint_motor_ids.size(), true);
+        const std::vector<double> kd = expand_gains(
+            normalized.mit_kd, config_.joint_motor_ids.size(), false);
+        kp_raw.reserve(kp.size());
+        kd_raw.reserve(kd.size());
+        for (std::size_t i = 0; i < kp.size(); ++i) {
+            kp_raw.push_back(gain_to_raw(
+                kp[i], config_.joint_motor_models[i]));
+            kd_raw.push_back(gain_to_raw(
+                kd[i], config_.joint_motor_models[i]));
+        }
+    }
+
+    if (state() == RobotState::Disabled || state() == RobotState::Braked) {
+        const EnableResult enabled = enable();
+        if (!enabled.success) {
+            throw StateError("servo_start could not enable all motors: " +
+                             enabled.message);
+        }
+    }
+
     const std::uint64_t token =
         controller_state_.begin(OperationKind::Servo);
     try {
@@ -827,39 +1200,20 @@ void RobotCore::servo_start(const ServoOptions& options) {
         std::vector<double> initial;
         initial.reserve(config_.joint_motor_ids.size());
         for (int motor_id : config_.joint_motor_ids) {
-            auto motor = io_.cached_state(motor_id);
-            if (!motor) {
-                motor = io_.read_state(motor_id, 0.1);
-            }
-            if (!motor) {
+            const auto motor = io_.read_state(motor_id, 0.1);
+            if (!motor || !std::isfinite(motor->position)) {
                 throw StateError(
-                    "servo_start cannot read motor " +
+                    "servo_start cannot read finite feedback from motor " +
                     std::to_string(motor_id));
             }
-            initial.push_back(motor->position);
+            initial.push_back(validated_position_target_turns(
+                motor_id, motor->position));
         }
 
         if (normalized.watchdog_ms > 0) {
             auto command = command_guard();
             for (int motor_id : config_.joint_motor_ids) {
                 io_.set_watchdog(motor_id, normalized.watchdog_ms);
-            }
-        }
-
-        std::vector<int> kp_raw;
-        std::vector<int> kd_raw;
-        if (normalized.channel == ServoChannel::Mit) {
-            const std::vector<double> kp = expand_gains(
-                normalized.mit_kp, config_.joint_motor_ids.size(), true);
-            const std::vector<double> kd = expand_gains(
-                normalized.mit_kd, config_.joint_motor_ids.size(), false);
-            kp_raw.reserve(kp.size());
-            kd_raw.reserve(kd.size());
-            for (std::size_t i = 0; i < kp.size(); ++i) {
-                kp_raw.push_back(gain_to_raw(
-                    kp[i], config_.joint_motor_models[i]));
-                kd_raw.push_back(gain_to_raw(
-                    kd[i], config_.joint_motor_models[i]));
             }
         }
 
@@ -873,15 +1227,29 @@ void RobotCore::servo_start(const ServoOptions& options) {
         servo_.kd_raw = std::move(kd_raw);
         servo_.started_at = std::chrono::steady_clock::now();
     } catch (...) {
-        std::lock_guard<std::mutex> command(command_mutex_);
-        for (int motor_id : config_.joint_motor_ids) {
-            try {
-                io_.set_watchdog(motor_id, 0);
-            } catch (...) {
+        const std::exception_ptr failure = std::current_exception();
+        {
+            std::lock_guard<std::mutex> command(command_mutex_);
+            for (int motor_id : config_.joint_motor_ids) {
+                try {
+                    io_.set_watchdog(motor_id, 0);
+                } catch (...) {
+                }
+            }
+            if (!is_latched_or_disconnected(state())) {
+                release_motors_unlocked(
+                    config_.all_motor_ids, FinishMode::Brake);
+                try {
+                    controller_state_.transition(RobotState::Braked);
+                } catch (...) {
+                }
             }
         }
-        controller_state_.end(token);
-        throw;
+        try {
+            controller_state_.end(token);
+        } catch (...) {
+        }
+        std::rethrow_exception(failure);
     }
 }
 
@@ -915,25 +1283,36 @@ ServoTickResult RobotCore::servo_tick(
         return result;
     }
 
+    const auto abort_with_brake =
+        [&](std::string message, bool transport_dead = false) {
+            result.message = std::move(message);
+            result.aborted = true;
+            servo_.summary.aborted_reason = result.message;
+            if (transport_dead) {
+                latch_dead(result.message);
+            }
+            end_servo_locked(FinishMode::Brake, true);
+            return result;
+        };
+
     const std::size_t count = config_.joint_motor_ids.size();
     if (target_angles.size() != count) {
-        result.message = "target length does not match joint count";
-        return result;
+        return abort_with_brake(
+            "target length does not match joint count");
     }
     if (!torque_ff_nm.empty() && torque_ff_nm.size() != count) {
-        result.message = "torque feed-forward length does not match joint count";
-        return result;
+        return abort_with_brake(
+            "torque feed-forward length does not match joint count");
     }
     for (double value : target_angles) {
         if (!std::isfinite(value)) {
-            result.message = "target contains NaN or infinity";
-            return result;
+            return abort_with_brake("target contains NaN or infinity");
         }
     }
     for (double value : torque_ff_nm) {
         if (!std::isfinite(value)) {
-            result.message = "torque feed-forward contains NaN or infinity";
-            return result;
+            return abort_with_brake(
+                "torque feed-forward contains NaN or infinity");
         }
     }
 
@@ -944,30 +1323,43 @@ ServoTickResult RobotCore::servo_tick(
     const double max_step_turns = options.max_step_rad / kTwoPi;
 
     std::vector<double> target_turns(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        target_turns[i] = options.input_is_radians
-            ? target_angles[i] / kTwoPi
-            : target_angles[i] / 360.0;
-        const double delta =
-            target_turns[i] - servo_.last_target_turns[i];
-        if (std::abs(delta) > max_step_turns) {
-            target_turns[i] = servo_.last_target_turns[i] +
-                std::copysign(max_step_turns, delta);
-            result.clamped = true;
-        }
-    }
-
     std::vector<double> positions(count);
-    if (options.lookahead_time_s > 0.0) {
-        const double alpha =
-            dt_s / (options.lookahead_time_s + dt_s);
+    try {
         for (std::size_t i = 0; i < count; ++i) {
-            positions[i] = servo_.filtered_target_turns[i] +
-                alpha * (target_turns[i] -
-                         servo_.filtered_target_turns[i]);
+            const double requested_turns = options.input_is_radians
+                ? target_angles[i] / kTwoPi
+                : target_angles[i] / 360.0;
+            target_turns[i] = validated_position_target_turns(
+                config_.joint_motor_ids[i], requested_turns);
+            const double delta =
+                target_turns[i] - servo_.last_target_turns[i];
+            if (std::abs(delta) > max_step_turns) {
+                target_turns[i] = servo_.last_target_turns[i] +
+                    std::copysign(max_step_turns, delta);
+                result.clamped = true;
+            }
+            target_turns[i] = validated_position_target_turns(
+                config_.joint_motor_ids[i], target_turns[i]);
         }
-    } else {
-        positions = target_turns;
+
+        if (options.lookahead_time_s > 0.0) {
+            const double alpha =
+                dt_s / (options.lookahead_time_s + dt_s);
+            for (std::size_t i = 0; i < count; ++i) {
+                const double filtered =
+                    servo_.filtered_target_turns[i] +
+                    alpha * (target_turns[i] -
+                             servo_.filtered_target_turns[i]);
+                positions[i] = validated_position_target_turns(
+                    config_.joint_motor_ids[i], filtered);
+            }
+        } else {
+            positions = target_turns;
+        }
+    } catch (const std::exception& error) {
+        return abort_with_brake(error.what());
+    } catch (...) {
+        return abort_with_brake("invalid servo position target");
     }
 
     std::vector<double> velocities(count, 0.0);
@@ -1051,11 +1443,19 @@ ServoTickResult RobotCore::servo_tick(
                 config_.max_torque_raw, max_motor_id);
         }
     } catch (const std::exception& error) {
-        result.message = error.what();
-        return result;
+        bool transport_dead = true;
+        try {
+            transport_dead = !io_.is_open();
+        } catch (...) {
+        }
+        return abort_with_brake(error.what(), transport_dead);
     } catch (...) {
-        result.message = "unknown send error";
-        return result;
+        bool transport_dead = true;
+        try {
+            transport_dead = !io_.is_open();
+        } catch (...) {
+        }
+        return abort_with_brake("unknown send error", transport_dead);
     }
 
     servo_.last_target_turns = std::move(target_turns);
@@ -1171,6 +1571,12 @@ void RobotCore::shutdown(
         FinishMode joint_release,
         FinishMode auxiliary_release,
         double wait_timeout_s) {
+    if (active_operation() != OperationKind::Servo &&
+        operation_owned_by_current_thread()) {
+        throw BusyError(
+            "shutdown cannot be called by the active operation owner");
+    }
+
     {
         std::lock_guard<std::mutex> lock(servo_mutex_);
         controller_state_.begin_closing();

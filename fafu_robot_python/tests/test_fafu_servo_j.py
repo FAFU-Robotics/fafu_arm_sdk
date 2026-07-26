@@ -154,7 +154,7 @@ def _run_servo_loop(
 
         # Sample tracking error AFTER send (1-tick old, fine for stats)
         for j, mid in enumerate(arm.joint_motor_ids):
-            s = arm.driver.get_cached_state(mid)
+            s = arm._ht.get_cached_state(mid)  # diagnostic feedback
             if s is None:
                 continue
             target_turns_j = float(target[j]) / (2.0 * math.pi)

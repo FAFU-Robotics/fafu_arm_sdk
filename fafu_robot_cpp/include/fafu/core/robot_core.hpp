@@ -64,6 +64,10 @@ public:
     bool check_alive(bool fresh = true, double timeout_s = 0.1);
     bool recover(bool confirm, double timeout_s = 0.2);
 
+    MoveJResult move_j(const std::vector<double>& joint_angles_rad);
+    MoveJResult move_j(const std::vector<double>& joint_angles_rad,
+                       const MoveJOptions& options);
+
     void set_joint_motor_models(std::vector<std::string> motor_models);
     void set_stale_feedback_timeout_ms(double timeout_ms);
     bool stream_link_ok();
@@ -110,6 +114,9 @@ private:
     std::vector<MotorDiagnostic> collect_diagnostics(double timeout_s);
     std::vector<int> stale_joint_ids() const;
     void latch_dead(const std::vector<int>& stale);
+    void latch_dead(std::string reason);
+    double validated_position_target_turns(
+        int motor_id, double position_turns) const;
     void ensure_command_allowed() const;
     void release_motors_unlocked(
         const std::vector<int>& motor_ids, FinishMode mode);

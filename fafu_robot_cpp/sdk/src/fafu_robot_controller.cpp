@@ -100,11 +100,6 @@ std::string GraspResult::to_string() const {
 // ============================================================================
 double FafuRobotController::rad_to_turns_(double rad)   { return rad / kTwoPi; }
 double FafuRobotController::turns_to_rad_(double turns) { return turns * kTwoPi; }
-int    FafuRobotController::clamp_speed_(int speed) {
-    if (speed < 1)   return 1;
-    if (speed > 100) return 100;
-    return speed;
-}
 std::string FafuRobotController::release_mode_name_(ReleaseMode m) {
     switch (m) {
         case ReleaseMode::Stop:  return "stop";
@@ -293,46 +288,38 @@ bool FafuRobotController::move_j(const std::vector<double>& joint_angles) {
 bool FafuRobotController::move_j(const std::vector<double>& joint_angles,
                                  const MoveOpts& opts) {
     if (!core_) throw std::runtime_error("controller core is unavailable");
-    CoreLease operation(*core_, fafu::core::OperationKind::JointMotion);
-    if (!core_->stream_link_ok()) {
-        throw fafu::core::StateError(core_->dead_reason());
-    }
-    auto angles_turns = validate_joint_angles_(joint_angles, opts.is_radians);
-    if (angles_turns.empty()) return false;
 
-    std::map<int, double> targets_turns;
-    for (size_t i = 0; i < joint_motor_ids_.size(); ++i) {
-        targets_turns[joint_motor_ids_[i]] = angles_turns[i];
-    }
-    int speed = clamp_speed_(opts.speed);
-
-    if (opts.block) {
-        try {
-            move_scurve_(targets_turns, speed);
-            return true;
-        } catch (const std::exception& e) {
-            std::ostringstream oss;
-            oss << "move_j (block) 失败: " << e.what();
-            log_warn(oss.str());
-            return false;
+    std::vector<double> angles_rad;
+    angles_rad.reserve(joint_angles.size());
+    for (double angle : joint_angles) {
+        if (!std::isfinite(angle)) {
+            throw std::invalid_argument("joint angles must be finite");
         }
+        angles_rad.push_back(
+            opts.is_radians ? angle : angle * kPi / 180.0);
     }
 
-    // 非阻塞: 单帧
-    double v_avg = (speed / 100.0) * VEL_AVG_MAX_TPS_;
-    auto cmds = build_many_cmds_holding_others_(targets_turns, v_avg);
-    int max_mid = 0;
-    for (int mid : cfg_.motor_ids) max_mid = std::max(max_mid, mid);
-    try {
-        auto command = core_->command_guard();
-        ht_->set_many_pos_vel_tqe(
-            cmds, hightorque::PosUnit::Turns, max_mid, 0.05);
-    } catch (const std::exception& e) {
-        core_->brake_active_operation();
-        log_warn(std::string("move_j (no block) 失败: ") + e.what());
-        return false;
-    }
-    return true;
+    const int speed = std::clamp(opts.speed, 1, 100);
+    const double configured_rate =
+        std::isfinite(cfg_.control_rate_hz) && cfg_.control_rate_hz > 0.0
+            ? cfg_.control_rate_hz : 100.0;
+    const double configured_duration =
+        std::isfinite(cfg_.trajectory_dt_s) && cfg_.trajectory_dt_s > 0.0
+            ? cfg_.trajectory_dt_s : DT_MIN_S_;
+
+    fafu::core::MoveJOptions native;
+    native.block = opts.block;
+    native.max_velocity_rad_s =
+        (speed / 100.0) * VEL_AVG_MAX_TPS_ * kTwoPi;
+    native.control_rate_hz = std::clamp(configured_rate, 10.0, 1000.0);
+    native.min_duration_s =
+        std::clamp(configured_duration, DT_MIN_S_, 60.0);
+    native.tolerance_rad =
+        opts.is_radians ? opts.tolerance : opts.tolerance * kPi / 180.0;
+    native.settle_timeout_s = 1.0;
+
+    const auto result = core_->move_j(angles_rad, native);
+    return result.sent && (!native.block || result.reached);
 }
 
 bool FafuRobotController::go_home(int speed, bool block) {
@@ -624,21 +611,49 @@ hightorque::MotorState FafuRobotController::get_gripper_state() {
 // ============================================================================
 void FafuRobotController::set_limit(int motor_id, double lo, double hi,
                                     hightorque::PosUnit unit) {
+    if (std::find(cfg_.motor_ids.begin(), cfg_.motor_ids.end(), motor_id) ==
+        cfg_.motor_ids.end()) {
+        throw std::invalid_argument("set_limit motor is not configured");
+    }
+    if (!std::isfinite(lo) || !std::isfinite(hi)) {
+        throw std::invalid_argument("position limits must be finite");
+    }
+    if (lo > hi) {
+        throw std::invalid_argument(
+            "position limit lower bound must not exceed upper bound");
+    }
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+
+    CoreLease operation(*core_, fafu::core::OperationKind::Lifecycle);
     ht_->enable_position_limit(motor_id, lo, hi, unit);
 }
 
 std::optional<std::pair<double, double>>
 FafuRobotController::get_limit(int motor_id) const {
+    if (std::find(cfg_.motor_ids.begin(), cfg_.motor_ids.end(), motor_id) ==
+        cfg_.motor_ids.end()) {
+        throw std::invalid_argument("get_limit motor is not configured");
+    }
     double lo = 0.0, hi = 0.0;
     if (!ht_->get_position_limit_turns(motor_id, lo, hi)) return std::nullopt;
     return std::make_pair(lo, hi);
 }
 
 void FafuRobotController::disable_limit(int motor_id) {
+    if (std::find(cfg_.motor_ids.begin(), cfg_.motor_ids.end(), motor_id) ==
+        cfg_.motor_ids.end()) {
+        throw std::invalid_argument("disable_limit motor is not configured");
+    }
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+
+    CoreLease operation(*core_, fafu::core::OperationKind::Lifecycle);
     ht_->disable_position_limit(motor_id);
 }
 
 void FafuRobotController::clear_limits() {
+    if (!core_) throw std::runtime_error("controller core is unavailable");
+
+    CoreLease operation(*core_, fafu::core::OperationKind::Lifecycle);
     ht_->clear_all_position_limits();
 }
 
@@ -745,24 +760,6 @@ void FafuRobotController::precheck_communication_() {
     }
 }
 
-std::vector<double>
-FafuRobotController::validate_joint_angles_(const std::vector<double>& angles,
-                                            bool is_radians) {
-    if (angles.size() != joint_motor_ids_.size()) {
-        std::ostringstream oss;
-        oss << "joint_angles 长度必须为 " << joint_motor_ids_.size()
-            << ", 实际 " << angles.size();
-        throw std::runtime_error(oss.str());
-    }
-    std::vector<double> turns;
-    turns.reserve(angles.size());
-    for (double a : angles) {
-        if (std::isnan(a) || std::isinf(a))
-            throw std::runtime_error("joint_angles 含 NaN/Inf");
-        turns.push_back(is_radians ? rad_to_turns_(a) : (a / 360.0));
-    }
-    return turns;
-}
 
 std::map<int, hightorque::MotorState>
 FafuRobotController::read_states_(const std::vector<int>& ids, bool prefer_cache) {
@@ -885,150 +882,6 @@ GraspResult FafuRobotController::make_grasp_result_(
         r.angle_rad  = turns_to_rad_(last_pos_turns);
     }
     return r;
-}
-
-// ============================================================================
-//  build_many_cmds_holding_others_  (mirror of Python)
-// ============================================================================
-std::vector<hightorque::HightorqueSerial::ManyMotorCmd>
-FafuRobotController::build_many_cmds_holding_others_(
-    const std::map<int, double>& targets_turns, double vel_rps)
-{
-    std::vector<hightorque::HightorqueSerial::ManyMotorCmd> cmds;
-    int max_torque = cfg_.max_torque_raw;
-
-    for (int mid : cfg_.motor_ids) {
-        auto it = targets_turns.find(mid);
-        if (it != targets_turns.end()) {
-            cmds.push_back({mid, it->second, vel_rps, max_torque});
-        } else {
-            auto s = ht_->get_state(mid);
-            if (!s) s = ht_->read_motor_state(mid, 0.1);
-            double hold_pos = s ? s->position : 0.0;
-            cmds.push_back({mid, hold_pos, 0.0, max_torque});
-        }
-    }
-    return cmds;
-}
-
-// ============================================================================
-//  move_scurve_  (mirror of Python _move_scurve)
-//
-//  生成 cosine-envelope S 曲线轨迹, 通过 HightorqueSerial::run_control_loop
-//  以 cfg.control_rate_hz 频率发送 set_many_pos_vel_tqe.
-// ============================================================================
-void FafuRobotController::move_scurve_(const std::map<int, double>& targets_turns,
-                                       int speed_pct) {
-    if (!ht_) throw std::runtime_error("ht_ is null");
-
-    double rate_hz = std::max(10.0, cfg_.control_rate_hz > 0 ? cfg_.control_rate_hz : 100.0);
-    double v_avg_target = (speed_pct / 100.0) * VEL_AVG_MAX_TPS_;
-
-    // 1) 抓取所有电机的起始位置 (含 gripper, 否则它会被发空命令导致松开)
-    std::map<int, double> start_pos;
-    for (int mid : cfg_.motor_ids) {
-        auto s = ht_->get_state(mid);
-        if (!s) s = ht_->read_motor_state(mid, 0.1);
-        if (!s) {
-            std::ostringstream oss;
-            oss << "无法读取电机 " << mid << " 起始位置, 拒绝执行 move_j";
-            throw std::runtime_error(oss.str());
-        }
-        start_pos[mid] = s->position;
-    }
-
-    // 2) 自适应段时间 (依赖最大位移)
-    double max_abs_dpos = 0.0;
-    for (const auto& [mid, tgt] : targets_turns) {
-        max_abs_dpos = std::max(max_abs_dpos, std::abs(tgt - start_pos[mid]));
-    }
-
-    double dt_s = std::max(DT_MIN_S_, cfg_.trajectory_dt_s > 0 ? cfg_.trajectory_dt_s : 1.0);
-    if (max_abs_dpos > 1e-5) {
-        double dt_target = max_abs_dpos / std::max(v_avg_target, 1e-3);
-        dt_s = std::max(DT_MIN_S_, dt_target);
-    }
-
-    // 3) per-motor plan: (delta, peak velocity signed)
-    struct Plan { double dpos; double v_peak; };
-    std::map<int, Plan> plans;
-    for (const auto& [mid, tgt] : targets_turns) {
-        double dpos = tgt - start_pos[mid];
-        if (std::abs(dpos) < 1e-5) {
-            plans[mid] = {0.0, 0.0};
-            continue;
-        }
-        double v_avg = std::abs(dpos) / dt_s;
-        double v_peak = std::min(VEL_AVG_MAX_TPS_, v_avg) * (kPi / 2.0);
-        plans[mid] = {dpos, std::copysign(v_peak, dpos)};
-    }
-
-    int total_ticks  = std::max(1, static_cast<int>(dt_s * rate_hz));
-    int settle_ticks = std::max(1, static_cast<int>(SETTLE_MS_ * rate_hz / 1000.0));
-    int last_tick    = total_ticks + settle_ticks;
-
-    int max_mid = 0;
-    for (int mid : cfg_.motor_ids) max_mid = std::max(max_mid, mid);
-
-    int max_torque = cfg_.max_torque_raw;
-    std::vector<int> all_ids = cfg_.motor_ids;
-
-    // 4) on_tick lambda
-    auto on_tick = [&](int tick, double /*period_ms*/) -> bool {
-        if (tick >= last_tick) return false;
-
-        double alpha     = std::min(1.0, static_cast<double>(tick) / total_ticks);
-        double smooth    = 0.5 * (1.0 - std::cos(kPi * alpha));
-        double vel_factor = std::sin(kPi * alpha);
-
-        std::vector<hightorque::HightorqueSerial::ManyMotorCmd> cmds;
-        cmds.reserve(all_ids.size());
-
-        for (int mid : all_ids) {
-            auto plan_it = plans.find(mid);
-            if (plan_it != plans.end() && plan_it->second.v_peak != 0.0) {
-                double dpos    = plan_it->second.dpos;
-                double v_peak  = plan_it->second.v_peak;
-                double desired = start_pos[mid] + smooth * dpos;
-                double v_now   = vel_factor * v_peak;
-                cmds.push_back({mid, desired, v_now, max_torque});
-            } else {
-                // 保持位置
-                cmds.push_back({mid, start_pos[mid], 0.0, max_torque});
-            }
-        }
-
-        auto command = core_->command_guard();
-        ht_->set_many_pos_vel_tqe(
-            cmds, hightorque::PosUnit::Turns, max_mid, 0.0);
-        return true;
-    };
-
-    hightorque::HightorqueSerial::ControlLoopOptions loop_opts;
-    loop_opts.rate_hz             = rate_hz;
-    loop_opts.stop_motor_ids      = cfg_.motor_ids;
-    loop_opts.stop_on_finish      = false;   // 跟 Python 一致: 正常完成保持 mode=10
-    loop_opts.stop_on_abort       = false;  // Core already applies ESTOP=Stop / DEAD=Brake.
-    loop_opts.abort_check = [this] {
-        return !core_ || core_->cancel_requested() ||
-               !core_->stream_link_ok();
-    };
-
-    int result = 0;
-    try {
-        result = ht_->run_control_loop(loop_opts, on_tick);
-    } catch (...) {
-        core_->brake_active_operation();
-        throw;
-    }
-    if (result == 1 || result == 2) {
-        // Generic cancellation/send failure brakes in place. If DEAD/ESTOP
-        // already won, RobotCore preserves its authoritative Brake/Stop.
-        core_->brake_active_operation();
-        throw std::runtime_error(
-            result == 1 ? "control loop was cancelled"
-                        : "control loop exited after a send error");
-    }
 }
 
 } // namespace fafu_robot

@@ -6,7 +6,7 @@
 
 namespace fafu::core {
 
-inline constexpr int CORE_ABI_VERSION = 3;
+inline constexpr int CORE_ABI_VERSION = 4;
 inline constexpr int MODE_STOP = 0x00;
 inline constexpr int MODE_ACTIVE = 0x0A;
 inline constexpr int MODE_MIT = 0x0B;
@@ -83,6 +83,24 @@ struct EnableResult {
     std::vector<int> failed_motor_ids;
     std::vector<MotorDiagnostic> diagnostics;
     std::string message;
+};
+
+// Radians-only joint-motion boundary. Motor turns remain an internal wire
+// detail and are never accepted from callers through this API.
+struct MoveJOptions {
+    bool block = true;
+    double max_velocity_rad_s = 1.5707963267948966;
+    double control_rate_hz = 100.0;
+    double min_duration_s = 0.5;
+    double tolerance_rad = 0.01;
+    double settle_timeout_s = 1.0;
+};
+
+struct MoveJResult {
+    bool sent = false;
+    bool reached = false;
+    double elapsed_s = 0.0;
+    double max_error_rad = 0.0;
 };
 
 struct ServoOptions {
