@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: python -m pip install numpy pybind11
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $pybind11Dir = python -m pybind11 --cmakedir
+          cmake -S fafu_robot_cpp -B fafu_robot_cpp/build-ci `
+            "-Dpybind11_DIR=$pybind11Dir" `
+            -DFAFU_BUILD_PYBIND11_MODULE=ON `
+            -DFAFU_BUILD_NATIVE_SDK=ON `
+            -DFAFU_BUILD_SDK_EXAMPLES=ON `
+            -DFAFU_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build fafu_robot_cpp/build-ci --config Release --parallel 4
+
+      - name: Run native tests
+        run: ctest --test-dir fafu_robot_cpp/build-ci -C Release --output-on-failure
+
+      - name: Import unified Python extension
+        working-directory: fafu_robot_python
+        run: >-
+          python -c "import fafu_motor;
+          assert fafu_motor.CORE_ABI_VERSION == 4;
+          assert hasattr(fafu_motor, 'RobotCore');
+          assert hasattr(fafu_motor, 'MoveJOptions');
+          assert hasattr(fafu_motor, 'MoveJResult');
+          assert hasattr(fafu_motor.HightorqueSerial, 'set_pos_vel_tqe_rad');
+          assert hasattr(fafu_motor.HightorqueSerial, 'set_pos_vel_tqe_kp_kd_rad');
+          assert hasattr(fafu_motor.HightorqueSerial, 'set_pos_vel_acc_rad');
+          assert hasattr(fafu_motor.HightorqueSerial, 'set_many_mit_rad');
+          print(fafu_motor.__file__)"
+
+      - name: Verify high-level Python import compatibility
+        run: |
+          python -c "import sys; sys.path.insert(0, 'fafu_robot_python'); import fafu_robot_controller as sdk; assert sdk.FafuRobotController"
+          python -c "import fafu_robot_python as sdk; assert sdk.FafuRobotController"
+
+      - name: Run hardware-free Python policy tests
+        run: >-
+          python -m unittest discover
+          -s fafu_robot_python/tests
+          -p test_controller_unit.py
+          -v

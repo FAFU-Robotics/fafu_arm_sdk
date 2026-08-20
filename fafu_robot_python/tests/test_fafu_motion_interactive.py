@@ -64,6 +64,8 @@ PARENT = os.path.dirname(HERE)
 if PARENT not in sys.path:
     sys.path.insert(0, PARENT)
 
+_URDF_DIR = os.path.join(PARENT, "fafu_robot_description", "urdf")
+
 
 # ============================================================================
 #  Helpers
@@ -141,6 +143,45 @@ def _origin_replay_speed(speed: int) -> int:
 _CFG_GRIPPER_KEY = "gripper_max_torque_raw"
 
 
+def _list_urdf_files() -> List[str]:
+    """Return sorted ``.urdf`` basenames under ``fafu_robot_description/urdf``."""
+    if not os.path.isdir(_URDF_DIR):
+        return []
+    return sorted(
+        fn for fn in os.listdir(_URDF_DIR)
+        if fn.lower().endswith(".urdf")
+        and os.path.isfile(os.path.join(_URDF_DIR, fn))
+    )
+
+
+def _default_urdf_path() -> Optional[str]:
+    """Pick a sensible default URDF from the vendored description folder."""
+    names = _list_urdf_files()
+    if not names:
+        return None
+    for preferred in ("fafu_baseV1.urdf", "fafu_baseV1_d405.urdf",
+                      "fafu_follower.urdf", "follower.urdf"):
+        if preferred in names:
+            return os.path.join(_URDF_DIR, preferred)
+    return os.path.join(_URDF_DIR, names[0])
+
+
+def _resolve_urdf_selection(name_or_idx: str,
+                            urdf_names: List[str]) -> Optional[str]:
+    """Resolve menu input: index (1-based) or basename -> absolute path."""
+    s = name_or_idx.strip()
+    if not s:
+        return None
+    if s.isdigit():
+        idx = int(s) - 1
+        if 0 <= idx < len(urdf_names):
+            return os.path.join(_URDF_DIR, urdf_names[idx])
+        return None
+    base = s if s.lower().endswith(".urdf") else s + ".urdf"
+    path = os.path.join(_URDF_DIR, base)
+    return path if os.path.isfile(path) else None
+
+
 def _read_cfg_int(cfg_path: Optional[str], key: str,
                   default: int) -> int:
     """从 robot.cfg 文本里读一个 `key = int` (底层 RobotConfig 忽略未知键,
@@ -202,11 +243,11 @@ def _write_cfg_int(cfg_path: Optional[str], key: str, value: int) -> bool:
 #  示教录制 / 复现 (仿照官方 5_record_trajectory.py / 5_replay_trajectory.py)
 # ============================================================================
 # 重力补偿(浮空)所需参数, 与官方 Follower.yaml / 5_record_trajectory.py 对齐,
-# 并按 Fafu 实物电机型号/系数填写 (J4 单独补 1.3 抗下垂).
+# 并按 Fafu 实物电机型号/系数填写.
 _TEACH_MOTOR_MODELS = ["M5036_02", "M6036_02", "M6036_02",
                        "M5036_02", "M4438_30", "M4438_30"]
 _TEACH_TAU_LIMIT = [15.0, 30.0, 30.0, 15.0, 5.0, 5.0]
-_TEACH_TORQUE_SCALE = [1.0, 1.0, 1.0, 1.3, 1.0, 1.0]
+_TEACH_TORQUE_SCALE = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 # 摩擦补偿 (照搬官方 5_record_trajectory.py 的 Fc / Fv / vel_threshold)
 _TEACH_FC = [0.15, 0.12, 0.12, 0.12, 0.04, 0.04]
 _TEACH_FV = [0.05, 0.05, 0.05, 0.03, 0.02, 0.02]
@@ -405,6 +446,9 @@ class App:
             self._cfg_path, _CFG_GRIPPER_KEY, _TEACH_GRIPPER_EFFORT)
         # 自定义书签 name -> (joint_angles_rad, gripper_angle_rad_or_None)
         self.bookmarks: Dict[str, tuple] = {}
+        # URDF / 动力学: 从 fafu_robot_description 选择, 供 setup_dynamics 使用
+        self.selected_urdf_path: Optional[str] = _default_urdf_path()
+        self._loaded_urdf_path: Optional[str] = None
 
     # ----- 状态信息 -----
 
@@ -429,6 +473,17 @@ class App:
 
         print(f"  is_enabled     : {self.arm.is_enabled}")
         print(f"  stats          : {self.arm.get_status().to_string()}")
+        if self.selected_urdf_path:
+            print(f"  URDF (selected): {os.path.basename(self.selected_urdf_path)}")
+        else:
+            print("  URDF (selected): <未找到 fafu_robot_description/urdf/*.urdf>")
+        if self.arm.has_dynamics:
+            loaded = (os.path.basename(self._loaded_urdf_path)
+                      if self._loaded_urdf_path else "?")
+            eef = getattr(self.arm, "_eef_frame_name", None) or "?"
+            print(f"  dynamics       : loaded ({loaded}, eef={eef!r})")
+        else:
+            print("  dynamics       : not loaded ([u] 选择 URDF 并加载)")
 
     def show_limits(self):
         print()
@@ -1031,6 +1086,98 @@ class App:
                 continue
             print(f"  未识别 {cmd!r}")
 
+    # ----- URDF / 动力学模型 -----
+
+    def urdf_menu(self):
+        """从 ``fafu_robot_description/urdf`` 选择 URDF 并加载 setup_dynamics."""
+        while True:
+            urdf_names = _list_urdf_files()
+            print("\n  URDF / 动力学模型")
+            print(f"  目录: {_URDF_DIR}")
+            if not urdf_names:
+                print("  [无可用 URDF] 请确认 fafu_robot_description/urdf/*.urdf 存在")
+                prompt("  按回车返回主菜单 ...")
+                return
+
+            sel_name = (os.path.basename(self.selected_urdf_path)
+                        if self.selected_urdf_path else None)
+            print(f"  当前选择: {sel_name or '<未选>'}")
+            if self.arm.has_dynamics:
+                loaded = (os.path.basename(self._loaded_urdf_path)
+                          if self._loaded_urdf_path else "?")
+                eef = getattr(self.arm, "_eef_frame_name", None) or "?"
+                stale = (self._loaded_urdf_path != self.selected_urdf_path)
+                tag = " (需重载)" if stale else ""
+                print(f"  已加载  : {loaded}, eef={eef!r}{tag}")
+            else:
+                print("  已加载  : 否")
+
+            print("\n  可选 URDF:")
+            for i, name in enumerate(urdf_names, 1):
+                mark = " *" if name == sel_name else ""
+                print(f"    [{i}] {name}{mark}")
+
+            print("\n    输入编号或文件名选择 URDF")
+            print("    [l] 加载/重载 setup_dynamics (用当前选择)")
+            print("    [i] 显示当前 URDF 路径")
+            print("    [b] 返回主菜单")
+            cmd = prompt("  > ").strip()
+            if cmd.lower() in ("b", "back", "q", "exit", ""):
+                return
+            if cmd.lower() in ("l", "load", "reload"):
+                self._setup_dynamics(force=True)
+                continue
+            if cmd.lower() in ("i", "info"):
+                if self.selected_urdf_path:
+                    print(f"  selected: {self.selected_urdf_path}")
+                    if self._loaded_urdf_path:
+                        print(f"  loaded  : {self._loaded_urdf_path}")
+                else:
+                    print("  尚未选择 URDF")
+                continue
+
+            path = _resolve_urdf_selection(cmd, urdf_names)
+            if path is None:
+                print(f"  未识别 {cmd!r}; 请输入 1-{len(urdf_names)} 或文件名")
+                continue
+            self.selected_urdf_path = path
+            print(f"  已选择: {os.path.basename(path)}")
+            if yes(prompt("  立即加载 setup_dynamics? [Y/n]: ")):
+                self._setup_dynamics(force=True)
+
+    def _setup_dynamics(self, *, force: bool = False) -> bool:
+        """用 ``selected_urdf_path`` 调用 setup_dynamics (示教/重力补偿/FK/IK)."""
+        if self.arm.num_joints != 6:
+            print(f"  [失败] 内置动力学参数仅支持 6 关节, 当前 "
+                  f"{self.arm.num_joints}.")
+            if self.arm.num_joints == 7 and not self.arm.has_gripper:
+                print("  >> 多半是启动时漏了 --gripper-id 7: 第 7 号夹爪被当成关节了.")
+                print("     重新启动: python tests/test_fafu_motion_interactive.py "
+                      "--gripper-id 7")
+            else:
+                print("  请确认 URDF 关节数与 num_joints 一致.")
+            return False
+        if not self.selected_urdf_path or not os.path.isfile(self.selected_urdf_path):
+            print("  [失败] 未选择有效 URDF; 请先在 [u] 子菜单中选择")
+            return False
+        if (self.arm.has_dynamics and not force
+                and self._loaded_urdf_path == self.selected_urdf_path):
+            return True
+        try:
+            self.arm.setup_dynamics(
+                urdf_path=self.selected_urdf_path,
+                motor_models=list(self.teach_motor_models),
+                tau_limit=list(_TEACH_TAU_LIMIT),
+                torque_scale=list(self.teach_torque_scale),
+                friction=self._make_friction(),
+            )
+            self._loaded_urdf_path = self.selected_urdf_path
+            return True
+        except Exception as e:
+            print(f"  [失败] setup_dynamics: {e}")
+            print("  (需要 pinocchio: conda install -c conda-forge pinocchio)")
+            return False
+
     # ----- 状态实时监视 (Ctrl+C 退出) -----
 
     def monitor(self, hz: float = 4.0):
@@ -1055,31 +1202,10 @@ class App:
 
     def _ensure_dynamics(self) -> bool:
         """示教浮空需要重力补偿; 确保 setup_dynamics 已就绪."""
-        if self.arm.has_dynamics:
+        if (self.arm.has_dynamics
+                and self._loaded_urdf_path == self.selected_urdf_path):
             return True
-        if self.arm.num_joints != 6:
-            print(f"  [失败] 内置重力补偿参数仅支持 6 关节, 当前 "
-                  f"{self.arm.num_joints}.")
-            if self.arm.num_joints == 7 and not self.arm.has_gripper:
-                print("  >> 多半是启动时漏了 --gripper-id 7: 第 7 号夹爪被当成关节了.")
-                print("     重新启动: python tests/test_fafu_motion_interactive.py "
-                      "--gripper-id 7")
-            else:
-                print("  请先自行 setup_dynamics (6-DoF URDF).")
-            return False
-        try:
-            self.arm.setup_dynamics(
-                motor_models=list(self.teach_motor_models),
-                tau_limit=list(_TEACH_TAU_LIMIT),
-                torque_scale=list(self.teach_torque_scale),
-                friction=self._make_friction(),
-            )
-            return True
-        except Exception as e:
-            print(f"  [失败] setup_dynamics: {e}")
-            print("  (重力补偿示教需要 pinocchio: "
-                  "conda install -c conda-forge pinocchio)")
-            return False
+        return self._setup_dynamics(force=False)
 
     def _make_friction(self):
         """按当前 teach_fc / teach_fv / vel_threshold 构造 FrictionParams."""
@@ -1817,6 +1943,7 @@ MENU = """
   [h]  回零 (go_home)
   [g]  夹爪子菜单
   [l]  软限位子菜单
+  [u]  URDF 子菜单 (fafu_robot_description 选择 + 加载动力学)
   [t]  示教录制 (重力补偿浮空 + ~100Hz 连续记录到 jsonl, Ctrl+C 结束)
   [p]  示教复现 (读 jsonl, servo 按真实时间间隔流式回放)
   [v]  ServoJ (online streaming, 100Hz 跟踪, 含看门狗)
@@ -1912,6 +2039,11 @@ def main() -> int:
               teach_vel_threshold=args.teach_vel_threshold)
     print("\n  当前运行时软限位:")
     app.show_limits()
+    if app.selected_urdf_path:
+        print(f"\n  默认 URDF: {os.path.basename(app.selected_urdf_path)} "
+              f"([u] 可切换 / 加载动力学)")
+    else:
+        print("\n  未找到 fafu_robot_description/urdf/*.urdf ([u] 子菜单查看)")
     rc = 0
     try:
         while True:
@@ -1942,6 +2074,8 @@ def main() -> int:
                     app.gripper_menu()
                 elif cmd == "l":
                     app.limit_menu()
+                elif cmd == "u":
+                    app.urdf_menu()
                 elif cmd == "t":
                     app.teach_record()
                 elif cmd == "p":

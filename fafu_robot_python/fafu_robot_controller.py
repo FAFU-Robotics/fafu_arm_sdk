@@ -91,12 +91,43 @@ if _HERE not in sys.path:
 import fafu_motor as pm  # noqa: E402
 
 # Optional: TOPPRA-based time-optimal interpolation (matches piper.py).
+# Prefer the full ``wrs`` package (as piper.py does); if unavailable, fall
+# back to the vendored thin wrapper ``_toppra_interp`` which only needs the
+# standalone ``toppra`` pip package (``pip install toppra ecos``).
 try:
     import wrs.motion.trajectory.piecewisepoly_toppra as pwp  # type: ignore
 
     _TOPPRA_EXIST = True
 except Exception:  # pragma: no cover - optional dependency
-    _TOPPRA_EXIST = False
+    try:
+        import _toppra_interp as pwp  # type: ignore
+
+        # ★ Windows + numpy>=2 guard ★
+        # toppra's native seidel solver has an int32/int64 buffer-dtype bug on
+        # Windows. Under numpy<2 it raises a catchable ValueError, but under
+        # numpy>=2 it corrupts memory and HARD-ABORTS the whole process
+        # (SEH 0xc06d007f) which Python cannot try/except. To avoid killing
+        # the app, disable TOPPRA in that combination so move_jntspace_path
+        # uses the safe linear fallback. (Real TOPPRA works on numpy<2 + ecos.)
+        _np_major = int(np.__version__.split(".")[0])
+        if sys.platform == "win32" and _np_major >= 2:
+            _TOPPRA_EXIST = False
+        else:
+            _TOPPRA_EXIST = True
+    except Exception:
+        _TOPPRA_EXIST = False
+
+# Optional: TOPPRA via a dedicated numpy<2 subprocess (``.toppra_env``).
+# Used when in-process TOPPRA is unavailable (e.g. Windows + numpy>=2, where
+# it would hard-crash). Gives real time-optimal trajectories without touching
+# the main env; falls through to the linear interpolator when absent.
+try:
+    import _toppra_bridge  # type: ignore
+
+    _TOPPRA_BRIDGE = bool(_toppra_bridge.BRIDGE_AVAILABLE)
+except Exception:  # pragma: no cover - optional dependency
+    _toppra_bridge = None  # type: ignore
+    _TOPPRA_BRIDGE = False
 
 # Optional: wrs robot_math, only needed if move_p / move_l are wired to IK.
 try:
@@ -1472,6 +1503,45 @@ class FafuRobotController:
         )
 
     @_guard_operation("move_jntspace_path", RobotState.MOVING)
+    def _interpolate_path_linear(
+        self,
+        path_arr: np.ndarray,
+        *,
+        is_radians: bool,
+        control_frequency: float,
+        speed: int,
+        max_jntvel: Optional[List[float]] = None,
+    ) -> np.ndarray:
+        """TOPPRA-free fallback: dense linear time-parametrisation of ``path``.
+
+        Each segment between consecutive waypoints is split into
+        ``ceil(seg_time / control_frequency)`` evenly-spaced frames, where
+        ``seg_time`` is set by the slowest joint moving at the nominal
+        per-joint speed. Returns an ``(M, num_joints)`` array in the same
+        unit as ``path_arr`` (radians or degrees per ``is_radians``).
+        """
+        path_arr = np.asarray(path_arr, dtype=float)
+        n_j = path_arr.shape[1]
+        if max_jntvel is not None:
+            vmax = np.asarray(max_jntvel, dtype=float).reshape(-1)
+            if vmax.shape[0] != n_j:
+                vmax = np.full(n_j, float(vmax.flat[0]))
+        else:
+            full_speed = math.radians(90.0) if is_radians else 90.0
+            v = max(1e-3, (speed / 100.0) * full_speed)
+            vmax = np.full(n_j, v, dtype=float)
+        vmax = np.maximum(vmax, 1e-6)
+
+        cf = max(0.005, float(control_frequency))
+        frames = [path_arr[0].copy()]
+        for a, b in zip(path_arr[:-1], path_arr[1:]):
+            delta = b - a
+            seg_t = float(np.max(np.abs(delta) / vmax))
+            n = max(1, int(math.ceil(seg_t / cf)))
+            for k in range(1, n + 1):
+                frames.append(a + delta * (k / n))
+        return np.asarray(frames, dtype=float)
+
     def move_jntspace_path(
         self,
         path,
@@ -1508,17 +1578,12 @@ class FafuRobotController:
             ``ctrl_freq`` passed to TOPPRA (seconds); also the per-frame
             stream period (``sleep`` between ``move_j`` frames).
 
-        Raises
-        ------
-        NotImplementedError
-            When the optional ``wrs`` dependency is not available.
+        Notes
+        -----
+        When the optional ``wrs`` dependency (TOPPRA) is unavailable, the
+        path is time-parametrised with a simpler linear interpolator
+        (:meth:`_interpolate_path_linear`) instead of raising.
         """
-        if not _TOPPRA_EXIST:
-            raise NotImplementedError(
-                "TOPPRA-based interpolation requires "
-                "`wrs.motion.trajectory.piecewisepoly_toppra`; "
-                "install it or use a custom interpolator."
-            )
         if path is None:
             raise ValueError("path must not be None")
 
@@ -1528,14 +1593,40 @@ class FafuRobotController:
                 f"path must have shape (N, {self.num_joints}); got {path_arr.shape}"
             )
 
-        tpply = pwp.PiecewisePolyTOPPRA()
-        interpolated = tpply.interpolate_by_max_spdacc(
-            path=path_arr,
-            ctrl_freq=control_frequency,
-            max_vels=max_jntvel,
-            max_accs=max_jntacc,
-            toggle_debug=False,
-        )
+        interpolated = None
+        if _TOPPRA_EXIST:
+            tpply = pwp.PiecewisePolyTOPPRA()
+            interpolated = tpply.interpolate_by_max_spdacc(
+                path=path_arr,
+                ctrl_freq=control_frequency,
+                max_vels=max_jntvel,
+                max_accs=max_jntacc,
+                toggle_debug=False,
+            )
+        elif _TOPPRA_BRIDGE:
+            # Real TOPPRA via the numpy<2 subprocess (.toppra_env). On any
+            # bridge failure, degrade gracefully to the linear interpolator.
+            try:
+                interpolated = _toppra_bridge.interpolate_by_max_spdacc(
+                    path_arr,
+                    ctrl_freq=control_frequency,
+                    max_vels=max_jntvel,
+                    max_accs=max_jntacc,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[FafuRobot] TOPPRA bridge failed ({exc}); "
+                      f"using linear interpolation.")
+                interpolated = None
+        if interpolated is None:
+            # No TOPPRA -> fall back to a dense linear time-parametrisation
+            # so the feature still works without the `wrs` dependency.
+            interpolated = self._interpolate_path_linear(
+                path_arr,
+                is_radians=is_radians,
+                control_frequency=control_frequency,
+                speed=speed,
+                max_jntvel=max_jntvel,
+            )
         interpolated = interpolated[start_frame_id:]
         for jnt_values in interpolated:
             self.move_j(
@@ -2306,7 +2397,7 @@ class FafuRobotController:
             Path to a URDF with ``<inertial>`` data for every link.  When
             ``None`` the controller searches, in order:
 
-            1. ``<package_dir>/fafu_robot_description/*.urdf``
+            1. ``<package_dir>/fafu_robot_description/urdf/*.urdf``
                (the vendored follower URDF shipped with this package
                for a fully self-contained deployment).
 
@@ -2374,7 +2465,7 @@ class FafuRobotController:
             raise RuntimeError(
                 "setup_dynamics: could not find a URDF. Pass urdf_path "
                 "explicitly, or drop one under "
-                "'<package>/fafu_robot_description/'."
+                "'<package>/fafu_robot_description/urdf/'."
             )
 
         try:
@@ -2522,7 +2613,7 @@ class FafuRobotController:
 
         candidates: List[str] = []
         # vendored URDF, for a self-contained deployment.
-        desc = os.path.join(_HERE, "fafu_robot_description")
+        desc = os.path.join(_HERE, "fafu_robot_description", "urdf")
         if os.path.isdir(desc):
             for fn in sorted(os.listdir(desc)):
                 if fn.endswith(".urdf"):
@@ -4750,6 +4841,7 @@ class FafuRobotController:
         #    fresh: after teach-record enable / hand-drag the cache
         #    can be stale and the first S-curve tick will jerk.
         meas_pos: Dict[int, float] = {}
+        meas_mode: Dict[int, int] = {}
         for mid in self._cfg.motor_ids:
             s = self._ht.read_motor_state(mid, 0.1)
             if s is None:
@@ -4758,6 +4850,7 @@ class FafuRobotController:
                     f"aborting move_j for safety"
                 )
             meas_pos[mid] = s.position
+            meas_mode[mid] = int(s.mode)
 
         # Prefer the *commanded* position from the previous blocking move
         # as the trajectory start, so consecutive moves are continuous and
@@ -4773,6 +4866,27 @@ class FafuRobotController:
                 start_pos[mid] = cmd
             else:
                 start_pos[mid] = meas_pos[mid]
+
+        # --- DIAGNOSTIC (temporary): dump per-joint start-position picks ---
+        _lc = self._last_cmd_turns or {}
+        print("[_move_scurve DIAG] mid | mode | last_cmd | meas | start | "
+              "target | delta | src (deg)")
+        for mid in self._cfg.motor_ids:
+            cmd = _lc.get(mid)
+            cmd_s = f"{cmd * 360.0:+8.2f}" if cmd is not None else "    None"
+            tgt = targets_turns.get(mid)
+            tgt_s = f"{tgt * 360.0:+8.2f}" if tgt is not None else "    None"
+            if tgt is not None:
+                delta_s = f"{(tgt - start_pos[mid]) * 360.0:+8.2f}"
+            else:
+                delta_s = "     n/a"
+            src = ("cmd" if (cmd is not None
+                             and abs(cmd - meas_pos[mid]) <= _CMD_CONTINUITY_TOL_T)
+                   else "meas")
+            print(f"    M{mid}: 0x{meas_mode[mid]:02X} | {cmd_s} | "
+                  f"{meas_pos[mid] * 360.0:+8.2f} | {start_pos[mid] * 360.0:+8.2f}"
+                  f" | {tgt_s} | {delta_s} | {src}")
+        # --- END DIAGNOSTIC ---
 
         # 2) adaptive segment time based on the largest delta.
         max_abs_dpos = 0.0
