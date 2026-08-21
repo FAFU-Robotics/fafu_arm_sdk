@@ -25,7 +25,12 @@ fafu_robot_python/
 ├── requirements.txt
 ├── fafu_robot_description/             vendored follower URDF (FK/IK 用)
 ├── examples/
-│   └── visible_motion.py               视觉可见的最小运动 demo
+│   ├── read_status.py                  只读: 打印关节/电机/CAN 状态
+│   ├── move_j.py                       点到点关节运动 (J2 +20° 再回去)
+│   ├── servo_j.py                      100Hz 在线流式跟踪 (J2 来回 +8°)
+│   ├── go_home.py                      全部关节回零
+│   ├── gripper.py                      夹爪 开 → 关 → 开
+│   └── visible_motion.py               视觉可见的综合运动 demo
 └── tests/
     ├── smoke_test.py                   无硬件环境检查
     ├── test_one_joint.py               单关节 ±5° 安全测试

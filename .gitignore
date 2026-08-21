@@ -35,6 +35,7 @@ build*/
 *.suo
 
 # ---- 运行时生成数据 ----
+fafu_robot_cpp/build/
 fafu_robot_python/tests/recordings/
 
 # ---- 日志 / 临时 / 系统 ----

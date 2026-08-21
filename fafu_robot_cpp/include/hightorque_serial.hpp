@@ -30,120 +30,13 @@
 #include <utility>
 #include <vector>
 
+// 协议层 (单位换算 / build_* / parse_*) 已拆到独立头文件. 这里包含它, 让原有的
+// `#include "hightorque_serial.hpp"` 调用方一行都不用改.
+#include "hightorque_protocol.hpp"
+
 namespace serial { class Serial; }   // 前向声明 (避免在头文件暴露 serial.h)
 
 namespace hightorque {
-
-// ---------------------------------------------------------------------------
-//  位置单位制
-// ---------------------------------------------------------------------------
-
-enum class PosUnit {
-    Turns,    // 圈 (协议原生)
-    Radians,  // 弧度
-    Degrees,  // 角度
-};
-
-// 把任意单位的位置值换算成"圈" (协议原生单位)
-double to_turns(double value, PosUnit unit);
-
-// 反向: "圈" -> 任意单位
-double from_turns(double turns, PosUnit unit);
-
-// ---------------------------------------------------------------------------
-//  常量
-// ---------------------------------------------------------------------------
-
-inline constexpr int16_t  NAN_INT16 = static_cast<int16_t>(0x8000);   // -32768
-inline constexpr uint32_t NAN_INT32 = 0x80000000u;
-inline constexpr uint8_t  PADDING   = 0x50;
-
-// CAN-FD DLC 对应的有效字节数
-extern const std::vector<std::size_t> CANFD_DLC_SIZES;
-
-// 力矩系数表 (文档 2.3): tqe_Nm = raw * coeff
-extern const std::map<std::string, double> TORQUE_COEFF;
-
-// ---------------------------------------------------------------------------
-//  字节工具
-// ---------------------------------------------------------------------------
-
-// 按 CAN-FD DLC 规则补 0x50 填充
-std::vector<uint8_t> canfd_pad(const std::vector<uint8_t>& data);
-
-// bytes <-> ASCII hex (大写, 无空格)
-std::string bytes_to_hex(const std::vector<uint8_t>& data);
-std::vector<uint8_t> hex_to_bytes(const std::string& hex);
-
-// ---------------------------------------------------------------------------
-//  int16 单位转换 (协议文档 2.6 / 2.7)
-// ---------------------------------------------------------------------------
-
-int16_t turns_to_int16(double turns);
-double  int16_to_turns(int16_t val);
-
-int16_t rps_to_int16(double rps);
-double  int16_to_rps(int16_t val);
-
-int16_t rad_to_int16(double rad);
-double  int16_to_rad(int16_t val);
-
-int16_t rad_s_to_int16(double rad_s);
-double  int16_to_rad_s(int16_t val);
-
-// ---------------------------------------------------------------------------
-//  CAN 帧 payload 构建 (基于 livelybot_fdcan.c)
-// ---------------------------------------------------------------------------
-
-std::vector<uint8_t> build_read_state_int16();
-std::vector<uint8_t> build_stop_int16();
-std::vector<uint8_t> build_brake_int16();
-// 只切电机模式 (写 1 字节到 0x00 寄存器). 0x00=停止, 0x0A=位置/速度/力矩, 0x0F=刹车.
-std::vector<uint8_t> build_set_mode_int16(uint8_t mode);
-std::vector<uint8_t> build_pos_int16(int16_t pos);
-std::vector<uint8_t> build_vel_int16(int16_t vel);
-std::vector<uint8_t> build_pos_vel_tqe_int16(int16_t pos, int16_t vel, int16_t tqe);
-std::vector<uint8_t> build_pos_velmax_acc_int16(int16_t pos, int16_t vel_max, int16_t acc);
-// 速度+加速度模式 (协议文档 3.1.9): 等价于 build_pos_velmax_acc_int16(NAN_INT16, vel, acc),
-// 即"位置不限制 + 限速 + 限加速度". 单独导出便于上层直接对应协议章节.
-std::vector<uint8_t> build_vel_acc_int16(int16_t vel, int16_t acc);
-std::vector<uint8_t> build_torque_int16(int16_t tqe);
-std::vector<uint8_t> build_voltage_int16(int16_t volt);
-std::vector<uint8_t> build_current_int16(int16_t cur);
-std::vector<uint8_t> build_pos_vel_tqe_kp_kd_int16(int16_t pos, int16_t vel, int16_t tqe,
-                                                    int16_t kp, int16_t kd);
-
-// 一拖多: pos+vel+tqe 模式 (CAN ID = 0x8090, 协议文档 1.3.1.3)
-//   pos_arr/vel_arr/tqe_arr: 长度 = max_motor_id, 索引 i 对应 motor_id (i+1)
-//   未参与的槽位填 NAN_INT16 (0x8000), 数据末尾固定为 [0x17, 0x01] 查询状态.
-std::vector<uint8_t> build_many_pos_vel_tqe_int16(const std::vector<int16_t>& pos_arr,
-                                                  const std::vector<int16_t>& vel_arr,
-                                                  const std::vector<int16_t>& tqe_arr);
-
-std::vector<uint8_t> build_motor_reset();
-std::vector<uint8_t> build_conf_write();
-std::vector<uint8_t> build_set_zero();
-std::vector<uint8_t> build_read_version();
-std::vector<uint8_t> build_set_timeout_int16(int16_t timeout_ms);
-
-// ---------------------------------------------------------------------------
-//  电机状态结构 + 解析
-// ---------------------------------------------------------------------------
-
-struct MotorState {
-    int     id       = 0;
-    int     mode     = 0;
-    int     fault    = 0;
-    double  position = 0.0;   // 圈
-    double  velocity = 0.0;   // 转/秒
-    double  torque   = 0.0;   // raw int16 (转 Nm 需乘电机系数)
-
-    // 软限位标志: 0=未触发, +1=超出上限, -1=超出下限
-    // 当 enable_position_limit() 启用且最近一次 set_pos* 触发限位时被置位
-    int     pos_limit_flag = 0;
-
-    std::string to_string() const;
-};
 
 // ---------------------------------------------------------------------------
 //  CAN 错误码 (调试板 `can status` 回复解析结果)
@@ -194,9 +87,6 @@ std::vector<PortInfo> list_serial_ports();
 // 如果你的调试板 VID 不在表中, 可以在 known_vids 里补
 std::vector<PortInfo> find_likely_debug_boards(
     const std::vector<std::string>& known_vids = {"0483", "0403", "1A86", "10C4", "067B"});
-
-// 解析电机回复的 int16 状态帧
-std::optional<MotorState> parse_motor_state_int16(const std::vector<uint8_t>& can_data);
 
 // ---------------------------------------------------------------------------
 //  收发统计 (用于上层展示控制环健康度)
@@ -440,6 +330,9 @@ public:
     std::optional<MotorState> set_voltage(int motor_id, double voltage_v);
     std::optional<MotorState> set_current(int motor_id, double current_a);
 
+    // MIT/PD 单电机通道 (寄存器 0x20..0x22 + 0x2b/0x2c).
+    // kp / kd 单位 N*m/rad, 内部按厂商 SDK 公式 raw = (v / coeff) * 10 * 2pi
+    // 换算 (motor.cc kp_float2int, radian_2pi 分支)。
     std::optional<MotorState> set_pos_vel_tqe_kp_kd(int motor_id,
                                                     double pos, double vel_rps,
                                                     double tqe_nm, double kp, double kd,
@@ -466,6 +359,12 @@ public:
 
     // 读取后台线程缓存的最新状态; 没拿到过就返回 std::nullopt.
     std::optional<MotorState> get_cached_state(int motor_id) const;
+
+    // 该电机缓存状态距今多少 ms; 从未收到过该电机的帧则返回 -1.
+    //
+    // 与 Stats::last_rx_age_ms 的区别: 后者是全局的 (任一电机回帧就刷新), 单个
+    // 关节掉线时看不出来. 掉电/掉线判据应该逐关节用这个.
+    double state_age_ms(int motor_id) const;
 
 private:
     using RcvList = std::vector<std::pair<int, std::vector<uint8_t>>>;

@@ -11,6 +11,7 @@
 //    limits.1 = -0.40, 0.30      (浮点对; 圈)
 //    limits.2 = -0.05, 0.48
 //    limits.3 = 0.00, 0.47
+//    motor_type.1 = M5036_02     (电机型号, TORQUE_COEFF 的键; "5036_02" 也认)
 //
 //  使用:
 //    #include "robot_config.hpp"
@@ -44,6 +45,15 @@ struct RobotConfig {
     PosUnit                      pos_unit  = PosUnit::Turns;
     std::map<int, std::pair<double, double>> limits;   // 圈; 不论 pos_unit 如何, 内部归一为圈
 
+    // 每个关节装的电机型号 (TORQUE_COEFF 的键, 如 "M5036_02").
+    //
+    // 为什么型号在配置里而系数在代码里: 型号是**装配信息** (换一颗电机就变,
+    // 每台机器可能不同), 系数是**物理常量** (同型号永远一样). 把系数也写进配置
+    // 等于让每台机器各存一份物理常量, 改一次要改 N 个文件且写错没人发现.
+    // 厂商 SDK 也是这么分的 (robot_param/*.yaml 里写 type, motor.h 里写
+    // motor_tqe_adj).
+    std::map<int, std::string>   motor_types;
+
     // -- 控制环参数 (高频控制相关) --
     double                       control_rate_hz = 100.0;   // run_control_loop 默认频率
     int                          max_torque_raw  = 0;       // 一拖多发送时的 tqe_raw, 0 = 不限
@@ -55,6 +65,20 @@ struct RobotConfig {
         auto it = limits.find(motor_id);
         if (it == limits.end()) return std::nullopt;
         return it->second;
+    }
+
+    // 返回该电机的型号名; 未配置则返回空串 (调用方按 coeff=1.0 处理).
+    std::string find_motor_type(int motor_id) const {
+        auto it = motor_types.find(motor_id);
+        return (it == motor_types.end()) ? std::string{} : it->second;
+    }
+
+    // 按 motor_ids 顺序返回型号列表, 方便直接喂给上层的 motor_models 参数.
+    std::vector<std::string> motor_type_list() const {
+        std::vector<std::string> out;
+        out.reserve(motor_ids.size());
+        for (int mid : motor_ids) out.push_back(find_motor_type(mid));
+        return out;
     }
 
     // -- 调试输出 --
@@ -79,6 +103,11 @@ struct RobotConfig {
             << "  limits           = {\n";
         for (const auto& [mid, lim] : limits) {
             oss << "    " << mid << " : [" << lim.first << ", " << lim.second << "] (圈)\n";
+        }
+        oss << "  }\n"
+            << "  motor_types      = {\n";
+        for (const auto& [mid, type] : motor_types) {
+            oss << "    " << mid << " : " << type << "\n";
         }
         oss << "  }\n}";
         return oss.str();
@@ -148,6 +177,9 @@ struct RobotConfig {
                     const int mid = std::stoi(key_lower.substr(7));
                     auto pair = parse_double_pair_(val);
                     cfg.limits[mid] = pair;
+                } else if (key_lower.rfind("motor_type.", 0) == 0) {
+                    const int mid = std::stoi(key_lower.substr(11));
+                    cfg.motor_types[mid] = normalize_motor_type_(val);
                 } else if (key_lower == "control_rate_hz") {
                     cfg.control_rate_hz = std::stod(val);
                 } else if (key_lower == "max_torque_raw") {
@@ -185,6 +217,20 @@ private:
         while (b != e && std::isspace(static_cast<unsigned char>(*b))) ++b;
         while (e != b && std::isspace(static_cast<unsigned char>(*(e - 1)))) --e;
         return std::string(b, e);
+    }
+
+    // TORQUE_COEFF 的键形如 "M5036_02"; 厂商 SDK 里同一型号写作 "5036_02".
+    // 两种写法都收, 统一成大写带 M 前缀.
+    static std::string normalize_motor_type_(const std::string& s) {
+        std::string v = trim_(s);
+        if (v.empty()) return v;
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c) { return std::toupper(c); });
+        if (std::isdigit(static_cast<unsigned char>(v.front()))) v.insert(v.begin(), 'M');
+        // 兜底档在固件表里写作 MGENERAL / MNONE, 厂商 SDK 里写作 General / None;
+        // 这两个开头不是数字, 上面的加 M 分支盖不到, 单独补.
+        if (v == "GENERAL" || v == "NONE") v.insert(v.begin(), 'M');
+        return v;
     }
 
     static std::vector<int> parse_int_list_(const std::string& s) {

@@ -112,6 +112,9 @@ PYBIND11_MODULE(fafu_motor, m) {
         .def_readwrite("torque",         &MotorState::torque,   "力矩 (raw int16)")
         .def_readwrite("pos_limit_flag", &MotorState::pos_limit_flag,
                        "软限位标志: 0=未触发, +1=超上限, -1=超下限")
+        .def_readwrite("rx_time_s",      &MotorState::rx_time_s,
+                       "本帧解析时刻 (steady_clock 秒); 0 = 未填. "
+                       "新鲜度请用 HightorqueSerial.state_age_ms(id)")
         .def("to_string", &MotorState::to_string)
         .def("__repr__", [](const MotorState& s) {
             return "<MotorState id=" + std::to_string(s.id) +
@@ -172,6 +175,10 @@ PYBIND11_MODULE(fafu_motor, m) {
     m.def("parse_motor_state_int16", &parse_motor_state_int16,
           py::arg("can_data"), "解析电机回复的 int16 状态帧");
 
+    // 力矩系数表 (唯一真源在 src/hightorque_protocol.cpp). Python 侧不要再抄一份字面量,
+    // 直接读这个属性 —— 两份表漂移过一次, 后果是力矩差 100 倍.
+    m.attr("TORQUE_COEFF") = TORQUE_COEFF;
+
     // ----------------------------------------------------------------------
     //  RobotConfig
     // ----------------------------------------------------------------------
@@ -183,11 +190,17 @@ PYBIND11_MODULE(fafu_motor, m) {
         .def_readwrite("pos_unit",        &RobotConfig::pos_unit)
         .def_readwrite("limits",          &RobotConfig::limits,
                        "字典: motor_id -> (lo, hi) (圈)")
+        .def_readwrite("motor_types",     &RobotConfig::motor_types,
+                       "字典: motor_id -> 电机型号 (TORQUE_COEFF 的键)")
         .def_readwrite("control_rate_hz", &RobotConfig::control_rate_hz)
         .def_readwrite("max_torque_raw",  &RobotConfig::max_torque_raw)
         .def_readwrite("use_async_rx",    &RobotConfig::use_async_rx)
         .def_readwrite("trajectory_dt_s", &RobotConfig::trajectory_dt_s)
         .def("find_limit",      &RobotConfig::find_limit,      py::arg("motor_id"))
+        .def("find_motor_type", &RobotConfig::find_motor_type, py::arg("motor_id"),
+             "该电机的型号名; 未配置返回空串")
+        .def("motor_type_list", &RobotConfig::motor_type_list,
+             "按 motor_ids 顺序返回型号列表 (可直接喂给 setup_dynamics 的 motor_models)")
         .def("apply_limits_to", &RobotConfig::apply_limits_to, py::arg("ht"))
         .def("to_string",       &RobotConfig::to_string)
         .def_static("load",     &RobotConfig::load,            py::arg("path"),
@@ -535,5 +548,7 @@ PYBIND11_MODULE(fafu_motor, m) {
         .def("stop_state_polling",  &HightorqueSerial::stop_state_polling,
              py::call_guard<py::gil_scoped_release>())
         .def("is_polling",          &HightorqueSerial::is_polling)
-        .def("get_cached_state",    &HightorqueSerial::get_cached_state, py::arg("motor_id"));
+        .def("get_cached_state",    &HightorqueSerial::get_cached_state, py::arg("motor_id"))
+        .def("state_age_ms",        &HightorqueSerial::state_age_ms, py::arg("motor_id"),
+             "该电机缓存状态距今多少 ms; 从未收到过返回 -1 (逐关节掉线判据)");
 }

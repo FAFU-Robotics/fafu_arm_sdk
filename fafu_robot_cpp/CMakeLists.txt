@@ -70,7 +70,8 @@ add_subdirectory(${_SERIAL_CMAKE_DIR} ${CMAKE_BINARY_DIR}/serial_cmake_build)
 #  Vendored: hightorque_serial (调试板 USB 串口协议 C++ 实现)
 # -----------------------------------------------------------------------------
 add_library(hightorque_serial_debug STATIC
-    src/hightorque_serial.cpp
+    src/hightorque_protocol.cpp   # 单位换算 / build_* / parse_* (纯函数, 无 IO)
+    src/hightorque_serial.cpp     # 串口 IO / 线程 / 状态缓存
 )
 
 target_include_directories(hightorque_serial_debug PUBLIC

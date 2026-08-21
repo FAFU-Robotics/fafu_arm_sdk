@@ -31,37 +31,20 @@ jobs:
             "-Dpybind11_DIR=$pybind11Dir" `
             -DFAFU_BUILD_PYBIND11_MODULE=ON `
             -DFAFU_BUILD_NATIVE_SDK=ON `
-            -DFAFU_BUILD_SDK_EXAMPLES=ON `
-            -DFAFU_BUILD_TESTS=ON
+            -DFAFU_BUILD_SDK_EXAMPLES=ON
 
       - name: Build
         run: cmake --build fafu_robot_cpp/build-ci --config Release --parallel 4
 
-      - name: Run native tests
-        run: ctest --test-dir fafu_robot_cpp/build-ci -C Release --output-on-failure
+      # 目前 CMake 里没有注册任何 ctest 用例, 所以没有 "Run native tests" 步骤。
+      # 等 hightorque_protocol 的 golden test 落地后再加回来。
 
-      - name: Import unified Python extension
-        working-directory: fafu_robot_python
-        run: >-
-          python -c "import fafu_motor;
-          assert fafu_motor.CORE_ABI_VERSION == 4;
-          assert hasattr(fafu_motor, 'RobotCore');
-          assert hasattr(fafu_motor, 'MoveJOptions');
-          assert hasattr(fafu_motor, 'MoveJResult');
-          assert hasattr(fafu_motor.HightorqueSerial, 'set_pos_vel_tqe_rad');
-          assert hasattr(fafu_motor.HightorqueSerial, 'set_pos_vel_tqe_kp_kd_rad');
-          assert hasattr(fafu_motor.HightorqueSerial, 'set_pos_vel_acc_rad');
-          assert hasattr(fafu_motor.HightorqueSerial, 'set_many_mit_rad');
-          print(fafu_motor.__file__)"
+      # 不需要硬件的检查: 导出面是否齐全、力矩系数有没有漂、robot.cfg 能不能解析。
+      # 本地也可以直接跑: python fafu_robot_python/tests/offline_checks.py
+      - name: Hardware-free checks
+        run: python fafu_robot_python/tests/offline_checks.py
 
       - name: Verify high-level Python import compatibility
         run: |
           python -c "import sys; sys.path.insert(0, 'fafu_robot_python'); import fafu_robot_controller as sdk; assert sdk.FafuRobotController"
           python -c "import fafu_robot_python as sdk; assert sdk.FafuRobotController"
-
-      - name: Run hardware-free Python policy tests
-        run: >-
-          python -m unittest discover
-          -s fafu_robot_python/tests
-          -p test_controller_unit.py
-          -v

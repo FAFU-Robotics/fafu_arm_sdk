@@ -79,16 +79,15 @@ def main():
         print(f"        到位: {fmt(arm.get_joint_values())}")
 
         # ----- 4) 夹爪开关循环 -----
-        # 你的硬件: -1.83° = 开 (软限位上限), -114.98° = 关到底 (软限位下限)
-        # 现在 open_gripper() / close_gripper() 默认就走对应的软限位.
+        # open/close 默认走 robot.cfg 的 limits.7 (当前 0° ~ 105°).
         print("\n  [4/4] 夹爪 open -> close -> open")
-        print("        open  (-> upper soft limit ~ -1.83°)")
+        print("        open  (-> upper soft limit)")
         arm.open_gripper()
         time.sleep(2.0)
         gs = arm.get_gripper_state()
         print(f"        gripper pos = {math.degrees(arm._turns_to_rad(gs.position)):+.2f}°")
 
-        print("        close (-> lower soft limit ~ -114.98°)")
+        print("        close (-> lower soft limit)")
         arm.close_gripper()
         time.sleep(3.0)         # 闭合行程长一些, 多等等
         gs = arm.get_gripper_state()

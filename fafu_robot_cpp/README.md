@@ -22,7 +22,7 @@
    fafu_motor.cpXY-win_amd64.pyd          ← 这个 .pyd 由本目录构建
               │  pybind11
               ▼
-   hightorque_serial_debug.lib                ← src/hightorque_serial.cpp (vendored)
+   hightorque_serial_debug.lib                ← src/hightorque_{protocol,serial}.cpp (vendored)
               │  serial_cmake.dll              ← third_part/serial_cmake/  (vendored)
               ▼
               USB 串口  ──▶  调试板  ──▶  电机
@@ -40,11 +40,13 @@ fafu_robot_cpp/
 ├── build.bat                                ← Windows 一键构建脚本 (编 .pyd + .lib + 3 个 .exe)
 │
 ├── include/                                 ← vendored 头文件 (协议层, 双侧共用)
+│   ├── hightorque_protocol.hpp              ← 单位换算 / 帧构建 / 帧解析 (纯函数)
 │   ├── hightorque_serial.hpp                ← HightorqueSerial 类 + 数据结构
 │   └── robot_config.hpp                     ← robot.cfg 解析
 │
 ├── src/                                     ← vendored 实现 (协议层, 双侧共用)
-│   └── hightorque_serial.cpp                ← HightorqueSerial 实现
+│   ├── hightorque_protocol.cpp              ← 协议实现 (无串口 IO, 可脱机测)
+│   └── hightorque_serial.cpp                ← HightorqueSerial 实现 (串口 IO / 线程)
 │
 ├── third_part/
 │   └── serial_cmake/                        ← vendored 跨平台串口库 (双侧共用)
@@ -201,9 +203,11 @@ pip install pybind11
 
 | 本目录路径 | 作用 |
 |---|---|
-| `include/hightorque_serial.hpp` | 调试板 USB 串口协议驱动 (头文件) |
+| `include/hightorque_protocol.hpp` | FDCAN 协议层: 单位换算 / `build_*` / `parse_*` (头文件) |
+| `include/hightorque_serial.hpp` | 调试板 USB 串口协议驱动 (头文件), 自动带上 protocol.hpp |
 | `include/robot_config.hpp` | robot.cfg 解析 / RobotConfig |
-| `src/hightorque_serial.cpp` | 调试板 USB 串口协议驱动 (实现) |
+| `src/hightorque_protocol.cpp` | FDCAN 协议层实现. 纯函数, 不碰串口, 可脱机单测 |
+| `src/hightorque_serial.cpp` | 调试板 USB 串口协议驱动 (实现): 串口 IO / 收发线程 / 状态缓存 |
 | `third_part/serial_cmake/` | 跨平台串口库 (wjwwood/serial fork) |
 
 如果底层协议库有升级, 用新版覆盖对应文件后重新构建即可.
@@ -217,5 +221,6 @@ pip install pybind11
 | `未找到 third_part/serial_cmake/` (cmake configure 失败) | vendor 目录被误删了, 按上一节"vendored 源码来自哪里"补回来 |
 | `pybind11_DIR` 找不到 | 当前环境没装 pybind11; `pip install pybind11` 后重跑 |
 | 链接报 `LNK2019: HightorqueSerial::xxx` 未解析 | `src/hightorque_serial.cpp` 缺失或没被加入 lib; 检查文件树和 CMakeLists |
+| 链接报 `LNK2019: build_xxx_int16` / `parse_motor_state_int16` 未解析 | `src/hightorque_protocol.cpp` 没被加入 `add_library(hightorque_serial_debug ...)` |
 | 构建成功但 `..\fafu_robot_python\` 下没有 .pyd | `FAFU_ROBOT_PYTHON_DIR` 被改到别处了; 看 cmake configure 阶段的 summary 输出 |
 | 旧的 python 进程 (Flask app, Python REPL) 抓着 .dll, 拷贝失败 (MSB3073) | 先 `Stop-Process -Name python -Force` 杀掉所有 python 进程, 再重 build |

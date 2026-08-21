@@ -267,29 +267,24 @@ _CMD_CONTINUITY_TOL_T = 0.05
 # 1 turn = 2*pi rad
 _TWO_PI = 2.0 * math.pi
 
-# Per-motor torque coefficient (Nm per raw-int16 LSB), mirrors the C++
-# TORQUE_COEFF table in hightorque_serial.cpp.  The firmware torque command
-# is a raw int16; the driver converts a desired Nm to raw via
-# ``raw = round(tau_nm / coeff)``.  An unknown / empty model maps to coeff
-# 1.0 (raw == Nm, i.e. essentially unscaled -- see setup_dynamics warning).
-TORQUE_COEFF: Dict[str, float] = {
-    # ---- Fafu arm actual motors (measured, authoritative) ----
-    "M5036_02": 0.67,     # J1, J4
-    "M6036_02": 0.677,    # J2, J3
-    "M4438_30": 0.5256,   # J5, J6, J7  (vendor motor_tqe_adj value)
-    # ---- legacy / other Hightorque models ----
-    "M3536_32": 0.458105,
-    "M4438_32": 0.485565,
-    "M4538_19": 0.493835,
-    "M5043_20": 0.966,
-    "M5046_20": 0.533654,
-    "M5047_09": 0.547474,
-    "M5047_36": 0.803,
-    "M6056_36": 0.677,
-    "M7256_35": 0.676524,
-    "M60SG_35": 0.7942,
-    "M60BM_35": 0.7942,
-}
+# Per-motor torque coefficient (Nm per raw-int16 LSB).  The firmware torque
+# command is a raw int16; the driver converts a desired Nm to raw via
+# ``raw = round(tau_nm / (coeff * 0.01))``.  An unknown / empty model maps to
+# coeff 1.0 (raw == Nm, i.e. essentially unscaled -- see setup_dynamics
+# warning).
+#
+# Single source of truth is the C++ ``TORQUE_COEFF`` in hightorque_protocol.cpp,
+# re-exported by the pybind11 module.  This used to be a duplicated literal
+# here; the two copies drifted once and the resulting torque was off by 100x,
+# so a stale/missing export is a hard error rather than a silent fallback.
+try:
+    TORQUE_COEFF: Dict[str, float] = dict(pm.TORQUE_COEFF)
+except AttributeError as _exc:      # pragma: no cover - build/version mismatch
+    raise ImportError(
+        "fafu_motor is missing TORQUE_COEFF -- the compiled extension is older "
+        "than this controller. Rebuild the C++ extension (fafu_robot_cpp) so "
+        "the torque coefficients come from a single source."
+    ) from _exc
 
 
 # ============================================================================
@@ -724,8 +719,9 @@ class FafuRobotController:
         self._eef_frame_name: Optional[str] = None
         self._dyn_gravity_vec: np.ndarray = np.array([0.0, 0.0, -9.81])
         # Per-joint motor model strings used to convert Nm -> raw int16
-        # inside set_pos_vel_tqe_kp_kd. None => "" (coeff 1.0, see
-        # setup_dynamics docstring for why that is unsafe-but-quiet).
+        # (apply_compensation_torque / tau_to_raw) and to scale servo
+        # kp/kd. None => "" (coeff 1.0, see setup_dynamics docstring for
+        # why that is unsafe-but-quiet).
         self._dyn_motor_models: Optional[List[str]] = None
         # Per-joint torque clip (Nm). Defaults applied in setup_dynamics.
         self._dyn_tau_limit: Optional[np.ndarray] = None
@@ -2410,11 +2406,12 @@ class FafuRobotController:
             if the arm is wall- or ceiling-mounted.
         motor_models : list of str, optional
             One motor-model key **per joint** (in :attr:`joint_motor_ids`
-            order) used by ``set_pos_vel_tqe_kp_kd`` to convert the
-            commanded torque from Nm to the raw int16 the firmware wants.
+            order) used to convert the commanded torque from Nm to the raw
+            int16 the firmware wants (and to scale servo kp/kd).
             Valid keys are the ones in the driver's ``TORQUE_COEFF`` table
-            (e.g. ``"M7256_35"``, ``"M60BM_35"``, ``"M4438_32"``,
-            ``"M3536_32"`` ...).  When ``None`` every joint uses ``""``
+            (e.g. ``"M5036_02"``, ``"M6036_02"``, ``"M4438_30"`` -- this
+            arm's three models -- plus the rest of the fdcan_h730
+            ``motor_tqe_adj`` list).  When ``None`` every joint uses ``""``
             (coefficient ``1.0``): the loop still runs but the torque is
             *not* physically scaled, so the arm will merely sag — safe,
             but you must fill these in for real compensation.
@@ -2489,18 +2486,32 @@ class FafuRobotController:
         if self._dyn_gravity_vec.shape != (3,):
             raise ValueError("gravity_vec must have exactly 3 elements")
 
+        if motor_models is None:
+            motor_models = self._motor_models_from_cfg()
+            if motor_models is not None:
+                print("[FafuRobot] setup_dynamics: motor_models taken from "
+                      f"robot.cfg motor_type.* -> {motor_models}")
+
         if motor_models is not None:
             if len(motor_models) != self.num_joints:
                 raise ValueError(
                     f"motor_models must have {self.num_joints} entries "
                     f"(one per joint), got {len(motor_models)}")
             self._dyn_motor_models = [str(m) for m in motor_models]
+            unknown = [m for m in self._dyn_motor_models
+                       if m and m not in TORQUE_COEFF]
+            if unknown:
+                print("[FafuRobot] setup_dynamics: WARNING unknown motor "
+                      f"model(s) {unknown}; those joints fall back to "
+                      "coeff=1.0 and will under-drive. Valid keys: "
+                      f"{sorted(TORQUE_COEFF)}")
         else:
             self._dyn_motor_models = None
-            print("[FafuRobot] setup_dynamics: WARNING no motor_models given; "
-                  "torque will NOT be physically scaled (coeff=1.0). The arm "
-                  "will under-drive / sag. Pass motor_models for real "
-                  "compensation.")
+            print("[FafuRobot] setup_dynamics: WARNING no motor_models given "
+                  "and robot.cfg has no motor_type.* for every joint; torque "
+                  "will NOT be physically scaled (coeff=1.0). The arm will "
+                  "under-drive / sag. Pass motor_models or fill in "
+                  "motor_type.<id> for real compensation.")
 
         if tau_limit is not None:
             tl = np.asarray(list(tau_limit), dtype=float)
@@ -4518,6 +4529,21 @@ class FafuRobotController:
     # ==================================================================
     #  Internals
     # ==================================================================
+    def _motor_models_from_cfg(self) -> Optional[List[str]]:
+        """Per-joint motor models declared as ``motor_type.<id>`` in robot.cfg.
+
+        Returns ``None`` unless *every* joint is named, so the caller keeps its
+        "torque is unscaled" warning instead of silently compensating only part
+        of the arm.
+        """
+        try:
+            types = dict(self._cfg.motor_types)
+        except AttributeError:      # extension older than this controller
+            return None
+        models = [str(types.get(mid, "")).strip()
+                  for mid in self._joint_motor_ids]
+        return models if all(models) else None
+
     @staticmethod
     def _rad_to_turns(rad: float) -> float:
         return float(rad) / _TWO_PI
