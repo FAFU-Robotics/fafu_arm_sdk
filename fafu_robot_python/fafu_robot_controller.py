@@ -76,7 +76,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -266,6 +266,7 @@ _CMD_CONTINUITY_TOL_T = 0.05
 
 # 1 turn = 2*pi rad
 _TWO_PI = 2.0 * math.pi
+_MOVE_J_TOLERANCE_RAD = math.radians(0.1)  # move_j(block=True) 到位带, 0.1°
 
 # Per-motor torque coefficient (Nm per raw-int16 LSB).  The firmware torque
 # command is a raw int16; the driver converts a desired Nm to raw via
@@ -285,6 +286,58 @@ except AttributeError as _exc:      # pragma: no cover - build/version mismatch
         "than this controller. Rebuild the C++ extension (fafu_robot_cpp) so "
         "the torque coefficients come from a single source."
     ) from _exc
+
+
+# Motor fault codes (vendor table 3), re-exported from the C++ ``FAULT_TABLE``
+# in hightorque_protocol.cpp.  Same single-source rule as TORQUE_COEFF: the
+# names and descriptions live in C++ only, this side just mirrors them, so a
+# stale extension is a hard error rather than a silently wrong fault string.
+try:
+    _FAULT_TABLE = dict(pm.FAULT_TABLE)
+    describe_fault = pm.describe_fault
+except AttributeError as _exc:      # pragma: no cover - build/version mismatch
+    raise ImportError(
+        "fafu_motor is missing FAULT_TABLE / describe_fault -- the compiled "
+        "extension is older than this controller. Rebuild the C++ extension "
+        "(fafu_robot_cpp)."
+    ) from _exc
+
+
+# Symbolic names for the codes the host actually reacts to.  Built from the
+# C++ table rather than typed out, so it cannot drift; the vendor's Chinese
+# names do not make legal Python identifiers, hence the explicit mapping of
+# just the codes worth branching on.  Everything else is still decodable via
+# :func:`describe_fault`.
+MotorFault = IntEnum("MotorFault", {
+    "OK":                    0,
+    "CALIBRATION":          32,
+    "MOTOR_DRIVER":         33,
+    "OVER_VOLTAGE":         34,
+    "ENCODER":              35,
+    "NOT_CALIBRATED":       36,
+    "PWM_CYCLE_OVERRUN":    37,
+    "OVER_TEMPERATURE":     38,
+    "START_OUT_OF_RANGE":   39,
+    "UNDER_VOLTAGE":        40,
+    "CONFIG_CHANGED":       41,
+    "INVALID_ANGLE":        42,
+    "INVALID_POSITION":     43,
+    "DRIVER_ENABLE":        44,
+    "STOP_POSITION_MISUSE": 45,
+    "TIMING":               46,
+    "BEMF_FEEDFORWARD":     47,
+})
+
+# Guard against the C++ table and the enum above drifting apart.  Codes 1-7
+# (DMA / UART) are deliberately absent from the enum -- nothing branches on
+# them -- so only check that every enum member does exist in the C++ table.
+_missing = [f.name for f in MotorFault if int(f) not in _FAULT_TABLE]
+if _missing:                        # pragma: no cover - build/version mismatch
+    raise ImportError(
+        "MotorFault has codes the C++ FAULT_TABLE does not: "
+        + ", ".join(_missing)
+        + " -- rebuild the C++ extension."
+    )
 
 
 # ============================================================================
@@ -419,7 +472,8 @@ class ServoOpts:
     # for production safety, but not for diagnostic scripts).
     lag_abort_consecutive: int = 0
     # ---- control channel ----
-    # True (default): send on the group-MIT channel (0x8093, kp/kd + gravity
+    # True (default): send on the group-MIT channel (0x8093 by default, see
+    #   HightorqueSerial.set_group_mit_can_id; kp/kd + gravity
     #   feed-forward, like move_MIT) -- impedance tracking, softer feel, matches
     #   the vendor pos_vel_tqe_kp_kd streaming. Uses kp/kd (mit_kp/mit_kd) and,
     #   for heavy joints, a dynamics model for gravity feed-forward.
@@ -968,6 +1022,12 @@ class FafuRobotController:
               "           Motion is disabled and all streaming stopped. The arm "
               "will NOT move on power-return; call recover(confirm=True) after "
               "power / CAN is restored.")
+        # Whatever fault the motors last reported is the best clue as to *why*
+        # the link died (over-temperature and under-voltage both look like
+        # "stopped replying" from here).  Cached only -- the link is probably
+        # gone, so a blocking read would just stall the caller.
+        for mid, desc in self.get_faults(fresh=False).items():
+            print(f"           motor {mid} last fault: {desc}")
 
     def _stream_link_ok(self) -> bool:
         """Cheap per-tick liveness check for high-rate loops (servo_j /
@@ -1017,6 +1077,48 @@ class FafuRobotController:
             self._enter_dead("no motor responded to a state read "
                              "(power off / USB unplugged / CAN down?)")
         return alive
+
+    def get_faults(self, *, fresh: bool = True,
+                   timeout: float = 0.1) -> Dict[int, str]:
+        """Per-motor fault description, for the motors that report one.
+
+        Motors with ``fault == 0`` and motors that do not answer are simply
+        absent from the result, so a healthy arm returns ``{}`` and the
+        caller can just check truthiness.
+
+        Descriptions come from the vendor's fault table (table 3) via the C++
+        ``describe_fault``; unlisted codes come back as
+        ``未定义故障码 N (厂商表3 未收录)`` rather than being dropped.
+
+        Parameters
+        ----------
+        fresh : bool, optional
+            ``True`` (default) issues a blocking state read per motor.  Set
+            ``False`` to use the background-polling cache instead -- required
+            when the link may already be down (see :meth:`_enter_dead`).
+        timeout : float, optional
+            Per-motor read timeout in seconds.  Ignored when ``fresh=False``.
+
+        Returns
+        -------
+        dict
+            ``{motor_id: description}`` for faulted motors only.
+        """
+        out: Dict[int, str] = {}
+        if self._state is RobotState.DISCONNECTED:
+            return out
+        for mid in self._cfg.motor_ids:
+            try:
+                s = (self._ht.read_motor_state(mid, timeout) if fresh
+                     else self._ht.get_cached_state(mid))
+            except Exception:
+                continue
+            if s is None:
+                continue
+            code = int(getattr(s, "fault", 0))
+            if code:
+                out[mid] = describe_fault(code)
+        return out
 
     def recover(self, *, confirm: bool = False) -> bool:
         """Leave ``DEAD`` after motor power / CAN has been restored.
@@ -1346,10 +1448,12 @@ class FafuRobotController:
             if s is None:
                 print(f"  motor {mid}: NO RESPONSE (read timeout) — bus or motor power off?")
                 continue
-            fault_val = getattr(s, "fault", 0)
-            fault_tag = "fault=OK" if not fault_val else f"fault=0x{int(fault_val):02X} ★"
-            print(f"  motor {mid}: mode=0x{int(s.mode):02X}  {fault_tag}  "
+            fault_val = int(getattr(s, "fault", 0))
+            print(f"  motor {mid}: mode=0x{int(s.mode):02X}  "
+                  f"fault={'OK' if not fault_val else 'see below ★'}  "
                   f"pos={s.position:+.3f}t  vel={s.velocity:+.3f}t/s")
+            if fault_val:
+                print(f"      ★ {describe_fault(fault_val)}")
 
     def disable(self) -> None:
         """Switch every motor to free-spin mode (mode ``0x00``)."""
@@ -1385,8 +1489,8 @@ class FafuRobotController:
         is_radians: bool = True,
         speed: int = 50,
         block: bool = True,
-        tolerance: float = 0.01,
-        style: str = "scurve",
+        tolerance: float = _MOVE_J_TOLERANCE_RAD,
+        style: str = "acc",
         duration: Optional[float] = None,
         timeout: float = 10.0,
     ) -> None:
@@ -1405,44 +1509,71 @@ class FafuRobotController:
             target average velocity ``(speed / 100) * 0.5`` turns/s.
             Defaults to 50 (~ 90 deg/s average).
         block : bool, optional
-            * ``True`` (default): generate an S-curve trajectory and
-              run it through :meth:`HightorqueSerial.run_control_loop`
-              at ``cfg.control_rate_hz``; returns only after the
-              trajectory finishes (plus a short settle window).
-            * ``False``: send a single ``set_many_pos_vel_tqe`` frame
-              and return immediately.
+            * ``True`` (default): run the move to completion.  What that
+              means depends on ``style``: ``acc`` and ``linear`` poll
+              until every joint measures within ``tolerance`` (or
+              ``timeout`` expires), while ``scurve`` streams its
+              trajectory and returns on a fixed settle timer without
+              ever checking arrival.
+            * ``False``: send a single frame and return immediately
+              (``0x80AD`` for ``acc``, ``set_many_pos_vel_tqe`` for the
+              other two).
         tolerance : float, optional
-            Joint tolerance for the *fast* one-shot blocking fallback
-            used when TOPPRA / S-curve cannot run.  In radians (or
-            degrees, matching ``is_radians``).  Defaults to ``0.01``.
-        style : {"scurve", "linear", "acc"}, optional
-            Trajectory style for ``block=True``:
+            Arrival tolerance for the polling styles (``acc``,
+            ``linear``); ``scurve`` ignores it and returns on a timer.
+            In radians (or degrees, matching ``is_radians``).  Defaults
+            to 0.1 deg (``math.radians(0.1)`` when ``is_radians=True``).
+        style : {"acc", "scurve", "linear"}, optional
+            Trajectory style for ``block=True``.  Measured mean |error|
+            over 6 poses x 3 repeats at ``speed=40`` (see
+            ``tests/compare_move_styles.py``).  The encoder quantises to
+            0.036 deg (1e-4 turns), so read these against that floor:
 
-            * ``"scurve"`` (default): host-streamed cosine ease-in/out
-              profile via :meth:`_move_scurve` (smooth start/stop, uses
-              ``set_many_pos_vel_tqe`` == ``pos_vel_MAXtqe``, no
-              integral -> gravity steady-state error).
-            * ``"linear"``: synchronized-arrival mode —
-              compute ``v_i = (target_i - current_i)/duration``
-              for synchronized arrival, broadcast **one**
-              ``set_many_pos_vel_tqe`` frame, then poll until settled
-              (:meth:`_move_linear_sync`).  Same ``pos_vel_MAXtqe`` path
-              (no integral) so the gravity steady-state error is
-              **identical** to S-curve; harder start/stop.  A/B only.
-            * ``"acc"``: per-joint ``set_pos_vel_acc`` (firmware
-              trapezoidal *internal* position loop, MODE_POS_VEL_ACC).
-              This is
-              the channel the firmware drives with its own profile +
-              (likely) integral action, so it is the one path that may
-              reduce the gravity steady-state error for free.  Single
-              shot per joint, then poll until settled
-              (:meth:`_move_acc_sync`).
+                acc      0.031 deg  (0.9 count)   <- default
+                linear   0.022 deg  (0.6 count)
+                scurve   0.235 deg  (6.5 counts)
+
+            ``acc`` and ``linear`` both settle inside one encoder count
+            and are therefore indistinguishable in practice; ``scurve``
+            is ~7x worse and also slower (1.70 s vs 1.44 s average).
+
+            * ``"acc"`` (default): one broadcast ``set_pos_vel_acc``
+              frame (``0x80AD``, MODE_POS_VEL_ACC), then poll until
+              settled (:meth:`_move_acc_sync`).  The firmware generates
+              the trapezoidal profile itself, so a host stall cannot
+              strand the move half-way.  Start/stop is a jerk step.
+            * ``"scurve"``: host-streamed cosine ease-in/out via
+              :meth:`_move_scurve`.  Smoothest start/stop, so still the
+              right pick for a heavy payload or when jerk matters.  Its
+              cost: the profile ends with ``vel=0``, and on ``0x8090``
+              this firmware reads ``vel=0`` as "hold still", so the
+              joint freezes at whatever lag it had.  The residue (~0.4
+              deg at speed 40) points *against* the direction of travel
+              98% of the time and barely grows with travel distance.
+            * ``"linear"``: synchronized-arrival mode.  Broadcasts the
+              **final target** with per-joint velocities chosen so all
+              joints arrive together, and keeps re-sending that frame
+              until every joint measures in (:meth:`_move_linear_sync`).
+              The latched non-zero velocity is exactly what pushes it
+              through the freeze described above; it does *not* cause
+              creep (0.056 deg over 2 s, same as the other two).  Hard
+              start/stop.  Its real job is re-locking after a servo/MIT
+              session, where the arm has already sagged off the target
+              and must be driven back onto it.
         duration : float, optional
             Only used when ``style="linear"``.  Explicit move duration
             (seconds).  When ``None`` it is derived from ``speed``.
         timeout : float, optional
-            Only used when ``style="linear"`` and ``block=True``.  Max
-            seconds to wait for the joints to settle before giving up.
+            Only used by the polling styles (``acc``, ``linear``) with
+            ``block=True``.  Max seconds to wait for the joints to
+            settle before giving up on the *wait* (the motors keep their
+            last command; nothing is aborted).
+
+            A motor that sits in the joint list but cannot follow joint
+            commands -- most often an undeclared gripper -- never enters
+            tolerance and so burns the full timeout on *every* move.
+            Pass ``has_gripper`` / ``gripper_motor_id`` at construction
+            so it is excluded from joint space.
         """
         angles = self._validate_joint_angles(joint_angles, is_radians)
         targets_turns: Dict[int, float] = {
@@ -1625,11 +1756,17 @@ class FafuRobotController:
             )
         interpolated = interpolated[start_frame_id:]
         for jnt_values in interpolated:
+            # Pinned to scurve: these are densely interpolated waypoints
+            # streamed at control_frequency, so each one must be a plain
+            # set_many_pos_vel_tqe refresh on 0x8090.  The move_j default
+            # (acc) would instead kick off a fresh firmware trapezoidal
+            # profile per waypoint, which is not what a streamed path is.
             self.move_j(
                 joint_angles=jnt_values,
                 is_radians=is_radians,
                 speed=speed,
                 block=False,
+                style="scurve",
             )
             time.sleep(max(0.005, control_frequency))
 
@@ -2136,7 +2273,8 @@ class FafuRobotController:
         # (f) Defense 4 — soft limits handled inside set_many_pos_vel_tqe_partial.
 
         # (g) Send one frame on the configured channel.
-        #   - use_mit=True (DEFAULT): 0x8093 group MIT (kp/kd + gravity
+        #   - use_mit=True (DEFAULT): group MIT, CAN ID 0x8093 by default and
+        #     switchable via set_group_mit_can_id (kp/kd + gravity
         #     feed-forward). pos/vel here are already in turns / turns-per-sec,
         #     exactly what set_many_mit wants (PosUnit.Turns); kp/kd raw
         #     precomputed in servo_start; gravity tau computed from the target
@@ -3812,7 +3950,11 @@ class FafuRobotController:
             print("[FafuRobot] move_l: TOPPRA/wrs unavailable; falling back "
                   "to sequential move_j per waypoint.")
             for q in path_arr:
-                self.move_j(q, is_radians=True, speed=speed, block=True)
+                # Pinned to scurve: these are dense waypoints along one
+                # straight line.  The default (acc) would run a settle poll
+                # per waypoint, turning the line into a stop-start crawl.
+                self.move_j(q, is_radians=True, speed=speed, block=True,
+                            style="scurve")
         return path_arr
 
     # ------------------------------------------------------------------
@@ -5005,7 +5147,7 @@ class FafuRobotController:
         *,
         speed_pct: int,
         duration: Optional[float] = None,
-        tolerance_turns: float = 0.01,
+        tolerance_turns: float = _MOVE_J_TOLERANCE_RAD / _TWO_PI,
         timeout_s: float = 10.0,
         block: bool = True,
         abort_check: Optional[Callable[[], bool]] = None,
@@ -5129,12 +5271,12 @@ class FafuRobotController:
         *,
         speed_pct: int,
         acc_rpss: Optional[float] = None,
-        tolerance_turns: float = 0.01,
+        tolerance_turns: float = _MOVE_J_TOLERANCE_RAD / _TWO_PI,
         timeout_s: float = 10.0,
         block: bool = True,
         abort_check: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Per-joint ``set_pos_vel_acc`` move (firmware trapezoidal loop).
+        """One-to-many ``set_many_pos_vel_acc`` move (firmware trapezoidal loop).
 
         Unlike the ``pos_vel_MAXtqe`` paths (``move_j`` S-curve / linear),
         this commands each joint's **on-board** position profile
@@ -5146,10 +5288,10 @@ class FafuRobotController:
         feed-forward / calibration.  Provided as an A/B test against the
         ``pos_vel_MAXtqe`` paths.
 
-        One CAN frame per joint (no one-to-many ``set_pos_vel_acc`` exists),
-        all fired back-to-back; the firmware profiles handle synchronization
-        loosely (they finish near the same time because we share velocity /
-        acceleration caps).  Held / non-target motors are left untouched.
+        Sent as a **single** CAN frame (group channel ``0x80AD``), so every
+        joint starts its profile on the same bus event rather than a few
+        hundred microseconds apart.  Held / non-target motors are left
+        untouched: their slots carry the protocol's "no operation" marker.
         """
         v_max = (speed_pct / 100.0) * _VEL_AVG_MAX_TPS
         v_max = max(0.02, v_max)
@@ -5157,14 +5299,20 @@ class FafuRobotController:
         # so the start is not a hard step like style="linear".
         acc = float(acc_rpss) if acc_rpss is not None else max(0.05, v_max / 0.3)
 
-        for mid, tgt in targets_turns.items():
+        ids = [int(mid) for mid in targets_turns]
+        tgts = [float(v) for v in targets_turns.values()]
+        if ids:
             try:
-                self._ht.set_pos_vel_acc(
-                    int(mid), float(tgt), float(v_max), float(acc),
+                self._ht.set_many_pos_vel_acc(
+                    ids, tgts,
+                    [float(v_max)] * len(ids),
+                    [float(acc)] * len(ids),
                     pm.PosUnit.Turns,
+                    max(self._cfg.motor_ids),
+                    0.0,            # fire-and-forget; settling is polled below
                 )
             except Exception as e:
-                print(f"[FafuRobot] move_j(style=acc): motor {mid} failed: {e}")
+                print(f"[FafuRobot] move_j(style=acc): group frame failed: {e}")
 
         last_cmd: Dict[int, float] = {}
         cur = self._last_cmd_turns or {}
@@ -5293,11 +5441,15 @@ if __name__ == "__main__":
                 for i in range(40):
                     # Oscillate *around the current angle*, not around 0.
                     base[demo_idx] = q0[demo_idx] + amp * math.sin(i * math.pi / 20.0)
-                    arm.move_j(base, speed=args.speed, block=False)
+                    # scurve: this is a 20 Hz stream, so it belongs on the
+                    # 0x8090 refresh path rather than the default acc, which
+                    # would restart a firmware profile on every tick.
+                    arm.move_j(base, speed=args.speed, block=False,
+                               style="scurve")
                     time.sleep(0.05)
                 # Return that joint to where it started.
                 base[demo_idx] = q0[demo_idx]
-                arm.move_j(base, speed=args.speed, block=False)
+                arm.move_j(base, speed=args.speed, block=False, style="scurve")
 
             if has_gripper:
                 _print("\n--- Gripper demo (open -> close, using soft limits) ---")

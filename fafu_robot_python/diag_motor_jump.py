@@ -534,7 +534,11 @@ def run_movej(arm, duration_s: float, jump_threshold_deg: float, speed_pct: int)
     def _move_and_monitor(q_target: np.ndarray) -> None:
         """非阻塞 move_j，期间持续 poll 实测位置，记录 jump 事件。"""
         prev = arm.get_joint_values()
-        arm.move_j(joint_angles=q_target, is_radians=True, speed=speed_pct, block=False)
+        # 钉死 scurve: 这个诊断要复现的是 servo_j 在 0x8090 上看到的瞬变,
+        # 必须和 servo_j 走同一条通道。move_j 的默认值已改成 acc (0x80AD),
+        # 跟着变就不是同一个被测对象了。
+        arm.move_j(joint_angles=q_target, is_radians=True, speed=speed_pct,
+                   block=False, style="scurve")
         # 等待到位 / 超时
         t0 = time.time()
         while time.time() - t0 < 3.0:

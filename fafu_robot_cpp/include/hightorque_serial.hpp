@@ -308,7 +308,26 @@ public:
         int     max_motor_id = 0,
         double  timeout_s    = 0.0);
 
-    // ★ 每关节独立 tqe/kp/kd 的一拖多 MIT (CAN ID 0x8093). 这是重力补偿 /
+    // ★ 一拖多梯形 (CAN ID 0x80AD, MODE_POS_VEL_ACC).
+    //   和 set_many_pos_vel_tqe 的区别不在帧结构 (都是每电机 6 字节), 而在谁算
+    //   运动过程: 那条通道要主机按控制周期持续喂中间点位, 这条是"发一次, 电机
+    //   固件自己跑完梯形速度曲线", 主机卡顿也不会停在半路。代价是梯形的加加速度
+    //   是阶跃的, 起停比主机侧 S 曲线硬。
+    //
+    //   motor_ids/pos/vel_max_rps/acc_rpss 同长度 N (逐关节)。pos 走软限位;
+    //   vel_max 单位 turns/s, acc 单位 turns/s²。未参与的槽位按官方约定填
+    //   pos=0x8000 / vel=0 / acc=0。单帧最多 10 个电机 (>64B build 函数抛错)。
+    //   timeout_s <= 0 时只发不等回包。
+    std::map<int, MotorState> set_many_pos_vel_acc(
+        const std::vector<int>&    motor_ids,
+        const std::vector<double>& pos,
+        const std::vector<double>& vel_max_rps,
+        const std::vector<double>& acc_rpss,
+        PosUnit pos_unit     = PosUnit::Turns,
+        int     max_motor_id = 0,
+        double  timeout_s    = 0.05);
+
+    // ★ 每关节独立 tqe/kp/kd 的一拖多 MIT (CAN ID 默认 0x8093). 这是重力补偿 /
     //   拖动示教 / 回放的正式底层通道 (官方 pos_vel_tqe_kp_kd 的一拖多等价).
     //   motor_ids/pos/vel_rps/tqe_raw/kp_raw/kd_raw 同长度 N (逐关节).
     //   tqe/kp/kd 为原始 int16 (上层负责 Nm/增益换算); pos 走软限位, vel=turns/s.
@@ -345,6 +364,18 @@ public:
     std::optional<std::string> read_version(int motor_id);
     std::string set_timeout(int motor_id, int16_t timeout_ms);
 
+    // 同步读连续 int16 寄存器 (例如 0x23/0x24 = cmd.kp/kd, 0x2b/0x2c = MIT kp/kd).
+    // async_rx 开启时回包进 RX 线程、不会按寄存器解析, 会抛 runtime_error.
+    std::map<int, int16_t> read_registers_int16(int motor_id, uint8_t addr,
+                                                uint8_t count,
+                                                double timeout_s = 0.3);
+
+    // 同步发一条诊断文本 (默认补 '\\n') 并回收复.
+    // 同样要求 async_rx=False; 固件不支持诊断通道时返回 nullopt.
+    std::optional<std::string> diagnostic_query(int motor_id,
+                                                const std::string& command,
+                                                double timeout_s = 0.8);
+
     // -- 后台状态轮询 (可选) --
     //
     // start_state_polling: 启动后台线程, 以 rate_hz 频率轮询所有 motor_ids 的状态,
@@ -365,6 +396,17 @@ public:
     // 与 Stats::last_rx_age_ms 的区别: 后者是全局的 (任一电机回帧就刷新), 单个
     // 关节掉线时看不出来. 掉电/掉线判据应该逐关节用这个.
     double state_age_ms(int motor_id) const;
+
+    // -- 一拖多 MIT 通道选择 --
+    //
+    // 默认 0x8093 (group_can_id::kMitLegacy), 保持既有行为不变。厂商把 0x93 标注
+    // 为「不建议使用」的旧版 MIT (位置靠积分得到, 低频控制下容易出意外), 推荐
+    // 0x80B0 (kMitRecommended), 两者帧结构完全相同, 所以切换只改这一个 ID。
+    //
+    // ★ 要不要切必须在 torque_scale 重新标定**之前**定下来 —— 换通道之后标定
+    //   结果不一定还成立。
+    void set_group_mit_can_id(int can_id) { group_mit_can_id_ = can_id; }
+    int  group_mit_can_id() const { return group_mit_can_id_; }
 
 private:
     using RcvList = std::vector<std::pair<int, std::vector<uint8_t>>>;
@@ -404,6 +446,9 @@ private:
     struct Range { double lo = 0.0; double hi = 0.0; };
     std::map<int, Range>            limits_;
     mutable std::mutex              limits_mtx_;
+
+    // 一拖多 MIT 的 CAN ID. 默认保持历史行为 0x8093; 见 set_group_mit_can_id.
+    int                             group_mit_can_id_ = group_can_id::kMitLegacy;
 
     // 后台 *轮询* 线程 (老接口, 单线程从串口轮询)
     std::thread                     poll_thread_;

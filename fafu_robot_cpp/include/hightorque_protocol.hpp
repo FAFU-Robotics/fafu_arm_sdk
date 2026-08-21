@@ -63,8 +63,44 @@ inline constexpr uint8_t  PADDING   = 0x50;
 // CAN-FD DLC 对应的有效字节数
 extern const std::vector<std::size_t> CANFD_DLC_SIZES;
 
+// ---------------------------------------------------------------------------
+//  一拖多 CAN ID
+//
+//  规则: CAN ID = 0x8000 | MODE_xxx, 而 MODE_xxx >= 0x80 才是控制模式
+//  (per-motor 操作码 reset_zero 0x01 / conf_write 0x02 / stop 0x03 全 < 0x80)。
+//  完整模式表见 hightorque_protocol.cpp 里 build_many_pos_vel_tqe_int16 的注释。
+// ---------------------------------------------------------------------------
+namespace group_can_id {
+
+inline constexpr int kPosVelTqe      = 0x8090;  // MODE_POS_VEL_TQE        (6B/电机)
+inline constexpr int kPosVelAcc      = 0x80AD;  // MODE_POS_VEL_ACC        (6B/电机)
+inline constexpr int kMitLegacy      = 0x8093;  // MODE_POS_VEL_TQE_KP_KD  (10B/电机)
+inline constexpr int kMitRecommended = 0x80B0;  // MODE_POS_VEL_TQE_KP_KD2 (10B/电机)
+
+}  // namespace group_can_id
+
 // 力矩系数表: 实际标度 = coeff * 0.01 Nm/count (见 hightorque_protocol.cpp 注释)
 extern const std::map<std::string, double> TORQUE_COEFF;
+
+// ---------------------------------------------------------------------------
+//  故障码 (厂商表3「报错代码说明表」)
+// ---------------------------------------------------------------------------
+
+struct FaultInfo {
+    const char* name;    // 表3「名称」列原文
+    const char* detail;  // 表3「说明」列原文; 厂商没写的留空串
+    const char* hint;    // 本项目补充的排查建议; 无据可依时留空串
+};
+
+// 故障码 -> 描述. 唯一真源在 hightorque_protocol.cpp, Python 侧经 bindings 读这
+// 张表 (照 TORQUE_COEFF 的先例), 不许再抄一份字面量。
+//
+// 表3 把 8-31 标为「保留」, 这些码不进表, 由 describe_fault 回落处理。
+extern const std::map<int, FaultInfo> FAULT_TABLE;
+
+// 把故障码翻成人话. 表外的码返回「未定义故障码 N (厂商表3 未收录)」而不是空串,
+// 免得上层打出一行什么都没有的日志。
+std::string describe_fault(int code);
 
 // ---------------------------------------------------------------------------
 //  字节工具
@@ -99,6 +135,10 @@ double  int16_to_turns(int16_t val);
 
 int16_t rps_to_int16(double rps);
 double  int16_to_rps(int16_t val);
+
+// 加速度: LSB 0.001 转/秒²
+int16_t rpss_to_int16(double rpss);
+double  int16_to_rpss(int16_t val);
 
 int16_t rad_to_int16(double rad);
 double  int16_to_rad(int16_t val);
@@ -136,6 +176,16 @@ std::vector<uint8_t> build_many_pos_vel_tqe_int16(const std::vector<int16_t>& po
                                                   const std::vector<int16_t>& vel_arr,
                                                   const std::vector<int16_t>& tqe_arr);
 
+// 一拖多: 梯形模式 (CAN ID = 0x80AD, MODE_POS_VEL_ACC)
+//   帧结构和 build_many_pos_vel_tqe_int16 同构, 第三个字段从"力矩上限"换成
+//   "加速度限制": 发一次, 电机固件自己跑完梯形速度曲线, 不需要主机持续喂点位.
+//   未用槽位按官方 serial_struct.h 填 pos=NAN_INT16 / vel=0 / acc=0
+//   (注意和上面那个函数三字段全填 NAN_INT16 的老约定不同, 见 .cpp 注释).
+//   每电机 6 字节, 单帧最多 10 个电机, 超了抛 std::invalid_argument.
+std::vector<uint8_t> build_many_pos_vel_acc_int16(const std::vector<int16_t>& pos_arr,
+                                                  const std::vector<int16_t>& vel_arr,
+                                                  const std::vector<int16_t>& acc_arr);
+
 // 一拖多: MIT/PD 模式 (CAN ID = 0x8093).
 //   每电机 10 字节 (pos/vel/tqe/kp/kd), 单帧最多 6 个电机, 超了抛异常.
 std::vector<uint8_t> build_many_pos_vel_tqe_kp_kd_int16(
@@ -150,6 +200,17 @@ std::vector<uint8_t> build_conf_write();
 std::vector<uint8_t> build_set_zero();
 std::vector<uint8_t> build_read_version();
 std::vector<uint8_t> build_set_timeout_int16(int16_t timeout_ms);
+
+// 读连续 int16 寄存器 (moteus 风格子帧, 与 query_subframe 同一套 cmd 编码).
+//   count=1..3 走模式一 (cmd 低 2 位=个数); count=4..32 走模式二 (下一字节给个数).
+std::vector<uint8_t> build_read_int16(uint8_t addr, uint8_t count);
+// 从电机回包里抽出所有 int16 寄存器: {地址 -> raw}. 一个都没有则空 map.
+std::map<int, int16_t> parse_int16_registers(const std::vector<uint8_t>& can_data);
+
+// moteus 诊断通道 (0x40 写 / 0x41 读).
+std::vector<uint8_t> build_diagnostic_write(const std::string& text);
+std::vector<uint8_t> build_diagnostic_read(uint8_t max_bytes = 48);
+std::optional<std::string> parse_diagnostic_text(const std::vector<uint8_t>& can_data);
 
 // ---------------------------------------------------------------------------
 //  电机状态结构 + 解析

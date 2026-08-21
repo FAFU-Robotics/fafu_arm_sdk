@@ -452,7 +452,7 @@ std::optional<MotorState> HightorqueSerial::set_pos_vel_acc(int motor_id, double
                                                             double vel_max_rps, double acc_rpss,
                                                             PosUnit unit) {
     const auto [pos_t, flag] = apply_position_limit_(motor_id, to_turns(pos, unit));
-    const int16_t acc_int = saturate_to_i16(static_cast<long long>(acc_rpss / 0.001));
+    const int16_t acc_int = rpss_to_int16(acc_rpss);
     auto st = control_call(
         [&](int can_id, double t) {
             return send_can_and_recv_(can_id,
@@ -470,7 +470,7 @@ std::optional<MotorState> HightorqueSerial::set_vel_acc(int motor_id, double vel
     // 速度+加速度 (3.1.9): 不带位置限制, 不经过 apply_position_limit_ (没有 pos 参数).
     // acc LSB = 0.001 转/秒² (协议 2.8), 与 set_pos_vel_acc 一致.
     const int16_t v       = rps_to_int16(vel_rps);
-    const int16_t acc_int = saturate_to_i16(static_cast<long long>(acc_rpss / 0.001));
+    const int16_t acc_int = rpss_to_int16(acc_rpss);
     return control_call(
         [&](int can_id, double t) {
             return send_can_and_recv_(can_id, build_vel_acc_int16(v, acc_int), t);
@@ -528,7 +528,7 @@ std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_tqe(
     // 4) 发送 + 等待 N 个回复 (N = 实际有指令的电机数, 没指令的电机不会回包)
     const auto data = build_many_pos_vel_tqe_int16(pos_arr, vel_arr, tqe_arr);
     const int  expected = static_cast<int>(cmds.size());
-    auto replies = send_can_and_recv_(0x8090, data, timeout_s, expected);
+    auto replies = send_can_and_recv_(group_can_id::kPosVelTqe, data, timeout_s, expected);
 
     // 5) 解析: 反馈帧 ID 高 8 位 = 源地址 = 电机 ID, 低 8 位是目的地址 (主机=0).
     //    最高位是 "需要回复" 标志, 用 & 0x7F 去掉.
@@ -620,11 +620,11 @@ std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_tqe_partial(
     // 4) 发. timeout_s <= 0 直接异步发出去不等回包 (servo loop 用法).
     const auto data = build_many_pos_vel_tqe_int16(pos_arr, vel_arr, tqe_arr);
     if (timeout_s <= 0.0 || expected <= 0) {
-        (void)send_can_and_recv_(0x8090, data, 0.0, 0);
+        (void)send_can_and_recv_(group_can_id::kPosVelTqe, data, 0.0, 0);
         return out;     // 空 map
     }
 
-    auto replies = send_can_and_recv_(0x8090, data, timeout_s, expected);
+    auto replies = send_can_and_recv_(group_can_id::kPosVelTqe, data, timeout_s, expected);
     for (auto& [rid, rdata] : replies) {
         int motor_id = (rid >> 8) & 0x7F;
         if (motor_id == 0) motor_id = rid & 0x7F;
@@ -690,11 +690,11 @@ std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_tqe_kp_kd_partial(
     const auto data = build_many_pos_vel_tqe_kp_kd_int16(
         pos_arr, vel_arr, tqe_arr, kp_arr, kd_arr);
     if (timeout_s <= 0.0 || expected <= 0) {
-        (void)send_can_and_recv_(0x8093, data, 0.0, 0);
+        (void)send_can_and_recv_(group_mit_can_id_, data, 0.0, 0);
         return out;
     }
 
-    auto replies = send_can_and_recv_(0x8093, data, timeout_s, expected);
+    auto replies = send_can_and_recv_(group_mit_can_id_, data, timeout_s, expected);
     for (auto& [rid, rdata] : replies) {
         int motor_id = (rid >> 8) & 0x7F;
         if (motor_id == 0) motor_id = rid & 0x7F;
@@ -720,7 +720,8 @@ std::map<int, MotorState> HightorqueSerial::set_many_mit(
         const std::vector<int>&    kd_raw,
         PosUnit pos_unit, int max_motor_id, double timeout_s) {
 
-    // 每关节独立 tqe/kp/kd 的一拖多 MIT (CAN ID 0x8093). tqe/kp/kd 均为
+    // 每关节独立 tqe/kp/kd 的一拖多 MIT (CAN ID 默认 0x8093, 可用
+    // set_group_mit_can_id 切到 0x80B0). tqe/kp/kd 均为
     // 原始 int16, 不做 Nm / 增益换算 (上层负责转换, 见 diag_torque_ramp
     // 已在硬件上验证的 raw 语义). pos 走软限位; vel 单位 turns/s.
     // 帧内每电机 10 字节, 单帧最多 6 个电机 (build 函数会对 >64B 抛错).
@@ -766,11 +767,81 @@ std::map<int, MotorState> HightorqueSerial::set_many_mit(
     const auto data = build_many_pos_vel_tqe_kp_kd_int16(
         pos_arr, vel_arr, tqe_arr, kp_arr, kd_arr);
     if (timeout_s <= 0.0 || expected <= 0) {
-        (void)send_can_and_recv_(0x8093, data, 0.0, 0);
+        (void)send_can_and_recv_(group_mit_can_id_, data, 0.0, 0);
         return out;
     }
 
-    auto replies = send_can_and_recv_(0x8093, data, timeout_s, expected);
+    auto replies = send_can_and_recv_(group_mit_can_id_, data, timeout_s, expected);
+    for (auto& [rid, rdata] : replies) {
+        int motor_id = (rid >> 8) & 0x7F;
+        if (motor_id == 0) motor_id = rid & 0x7F;
+        if (motor_id < 1 || motor_id > n_slots) continue;
+        if (auto st = parse_motor_state_int16(rdata)) {
+            st->id = motor_id;
+            st->rx_time_s = now_seconds();
+            if (auto it = limit_flags.find(motor_id); it != limit_flags.end()) {
+                st->pos_limit_flag = it->second;
+            }
+            out[motor_id] = *st;
+        }
+    }
+    return out;
+}
+
+std::map<int, MotorState> HightorqueSerial::set_many_pos_vel_acc(
+        const std::vector<int>&    motor_ids,
+        const std::vector<double>& pos,
+        const std::vector<double>& vel_max_rps,
+        const std::vector<double>& acc_rpss,
+        PosUnit pos_unit, int max_motor_id, double timeout_s) {
+
+    // 一拖多梯形 (CAN ID 0x80AD). 和 set_many_pos_vel_tqe 的区别不在帧结构 (都是
+    // 每电机 6 字节), 而在谁算运动过程: 那条通道要主机按控制周期持续喂中间点位,
+    // 这条是"发一次, 电机固件自己跑完梯形速度曲线", 主机卡顿也不会停在半路。
+    // 代价是梯形的加加速度是阶跃的, 起停比主机侧 S 曲线硬。
+    std::map<int, MotorState> out;
+    const std::size_t n = motor_ids.size();
+    if (pos.size() != n || vel_max_rps.size() != n || acc_rpss.size() != n) {
+        throw std::invalid_argument(
+            "set_many_pos_vel_acc: motor_ids/pos/vel_max/acc 长度必须一致");
+    }
+    if (n == 0) return out;
+
+    int n_slots = max_motor_id;
+    if (n_slots <= 0) {
+        for (int id : motor_ids) n_slots = std::max(n_slots, id);
+    }
+    if (n_slots <= 0) return out;
+
+    // 未用槽位按官方 serial_struct.h 的约定: pos=0x8000 (无操作), vel/acc 归零。
+    // 注意这跟 set_many_pos_vel_tqe 那边三个数组全填 NAN_INT16 不一样, 是刻意的。
+    std::vector<int16_t> pos_arr(n_slots, NAN_INT16);
+    std::vector<int16_t> vel_arr(n_slots, 0);
+    std::vector<int16_t> acc_arr(n_slots, 0);
+
+    std::map<int, int> limit_flags;
+    int expected = 0;
+    for (std::size_t k = 0; k < n; ++k) {
+        const int mid = motor_ids[k];
+        if (mid < 1 || mid > n_slots) continue;
+
+        const auto [pos_t, flag] = apply_position_limit_(mid, to_turns(pos[k], pos_unit));
+        limit_flags[mid] = flag;
+
+        const std::size_t idx = static_cast<std::size_t>(mid - 1);
+        pos_arr[idx] = turns_to_int16(pos_t);
+        vel_arr[idx] = rps_to_int16(vel_max_rps[k]);
+        acc_arr[idx] = rpss_to_int16(acc_rpss[k]);
+        ++expected;
+    }
+
+    const auto data = build_many_pos_vel_acc_int16(pos_arr, vel_arr, acc_arr);
+    if (timeout_s <= 0.0 || expected <= 0) {
+        (void)send_can_and_recv_(group_can_id::kPosVelAcc, data, 0.0, 0);
+        return out;
+    }
+
+    auto replies = send_can_and_recv_(group_can_id::kPosVelAcc, data, timeout_s, expected);
     for (auto& [rid, rdata] : replies) {
         int motor_id = (rid >> 8) & 0x7F;
         if (motor_id == 0) motor_id = rid & 0x7F;
@@ -893,6 +964,61 @@ std::string HightorqueSerial::set_timeout(int motor_id, int16_t timeout_ms) {
     cmd << "can send " << std::hex << std::uppercase << can_id
         << " " << bytes_to_hex(build_set_timeout_int16(timeout_ms));
     return send_cmd_(cmd.str());
+}
+
+std::map<int, int16_t> HightorqueSerial::read_registers_int16(
+        int motor_id, uint8_t addr, uint8_t count, double timeout_s) {
+    if (async_rx_enabled_.load()) {
+        throw std::runtime_error(
+            "read_registers_int16 需要同步串口 (构造时 async_rx=False); "
+            "async 下回包进 RX 线程, 不会按寄存器解析");
+    }
+    auto replies = send_can_and_recv_(
+        0x8000 | motor_id, build_read_int16(addr, count), timeout_s, 1);
+    std::map<int, int16_t> out;
+    for (auto& [rid, rdata] : replies) {
+        (void)rid;
+        auto parsed = parse_int16_registers(rdata);
+        out.insert(parsed.begin(), parsed.end());
+    }
+    return out;
+}
+
+std::optional<std::string> HightorqueSerial::diagnostic_query(
+        int motor_id, const std::string& command, double timeout_s) {
+    if (async_rx_enabled_.load()) {
+        throw std::runtime_error(
+            "diagnostic_query 需要同步串口 (构造时 async_rx=False)");
+    }
+    std::string text = command;
+    if (text.empty() || text.back() != '\n') text.push_back('\n');
+    if (text.size() > 60) {
+        throw std::invalid_argument("diagnostic_query: command 太长");
+    }
+
+    const int can_id = 0x8000 | motor_id;
+    (void)send_can_and_recv_(can_id, build_diagnostic_write(text), 0.15, 1);
+
+    std::string acc;
+    const double deadline = now_seconds() + std::max(0.1, timeout_s);
+    while (now_seconds() < deadline) {
+        auto replies = send_can_and_recv_(
+            can_id, build_diagnostic_read(48), 0.12, 1);
+        for (auto& [rid, rdata] : replies) {
+            (void)rid;
+            if (auto chunk = parse_diagnostic_text(rdata)) {
+                acc += *chunk;
+            }
+        }
+        if (acc.find('\n') != std::string::npos) break;
+    }
+    if (acc.empty()) return std::nullopt;
+    while (!acc.empty() && (acc.back() == '\n' || acc.back() == '\r'
+                            || acc.back() == ' ' || acc.back() == '\t')) {
+        acc.pop_back();
+    }
+    if (acc.empty()) return std::nullopt;
+    return acc;
 }
 
 // ===========================================================================

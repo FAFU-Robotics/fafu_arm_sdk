@@ -105,6 +105,71 @@ const std::map<std::string, double> TORQUE_COEFF = {
     {"M60SG_35", 0.7942},
 };
 
+// ---------------------------------------------------------------------------
+//  故障码表 (厂商表3「报错代码说明表」)
+// ---------------------------------------------------------------------------
+//
+// name / detail 两列**逐字照抄厂商表3**, 不改写不补充。表3 没给说明的格子就留
+// 空串 —— 宁可显示不全, 也不要在这里编一个看起来很像真的解释, 因为这张表会被
+// 直接打进故障日志, 编出来的话会把排查带偏。
+//
+// hint 是本项目自己补的排查建议, 只在**有实据**时才填 (目前只有 41 和 45 两条),
+// 其余一律空串。
+//
+// 表3 的 1-7 是一个合并单元格: 说明「硬件问题…」只写在 1 号那一行, 2-7 的格子
+// 是空的。这里给 1-7 都填同一句, 因为它在原表里就是跨行覆盖这一组的。
+const std::map<int, FaultInfo> FAULT_TABLE = {
+    {0,  {"正常", "操作成功，没有错误发生", ""}},
+
+    // ---- 1-7: DMA / UART 通信层 ----
+    {1,  {"DMA 数据流传输错误",   "硬件问题…", ""}},
+    {2,  {"DMA 数据流 FIFO 错误", "硬件问题…", ""}},
+    {3,  {"UART 溢出错误",        "硬件问题…", ""}},
+    {4,  {"UART 帧错误",          "硬件问题…", ""}},
+    {5,  {"UART 噪声错误",        "硬件问题…", ""}},
+    {6,  {"UART 缓冲区溢出错误",  "硬件问题…", ""}},
+    {7,  {"UART 奇偶校验错误",    "硬件问题…", ""}},
+
+    // 8-31 表3 标「保留」, 故意不列 —— 交给 describe_fault 回落。
+
+    // ---- 32-47: 电机层 ----
+    {32, {"校准故障",       "校准过程中，编码器无法感知到磁铁", ""}},
+    {33, {"电机驱动故障",   "多为欠压，电流不足", ""}},
+    {34, {"过压",           "母线电压过大", ""}},
+    {35, {"编码器故障",     "编码器读数错误", ""}},
+    {36, {"电机未校准",     "电机还未进行校准（电机出厂都会校准一次）", ""}},
+    {37, {"PWM周期过限",    "一般是内部固件错误", ""}},
+    {38, {"温度过高",       "已超过最大配置温度", ""}},
+    {39, {"起始位置超出限制", "在位置界限之外尝试启动位置控制（出厂默认无位置限制）", ""}},
+    {40, {"电压过低",       "电压太低", ""}},
+    {41, {"配置已更改",     "在操作期间更改了需要停止的配置值",
+          "改完配置要 conf write 再重启电机才生效"}},
+    {42, {"角度无效",       "没有可用的有效换相编码器", ""}},
+    {43, {"位置无效",       "没有可用的有效输出编码器", ""}},
+    {44, {"驱动器使能故障", "驱动芯片异常", ""}},
+    {45, {"停止位置使用错误", "程序不支持在设置停止位置的同时，还设置加速度或速度限制",
+          "0x28/0x29 全局限速是持久的, 和 build_pos_vel_tqe_int16 用的停止位置 "
+          "0x26 冲突; 先走 set_pos_vel_acc 再走 pos_vel_tqe 就会撞上"}},
+    {46, {"时序错误",       "系统检测到操作或事件未在预期的时间窗口内完成", ""}},
+    {47, {"反电动势前馈错误", "使用反电动势前馈必须使用加速度限制", ""}},
+};
+
+std::string describe_fault(int code) {
+    const auto it = FAULT_TABLE.find(code);
+    if (it == FAULT_TABLE.end()) {
+        std::ostringstream oss;
+        oss << "未定义故障码 " << code << " (厂商表3 未收录)";
+        return oss.str();
+    }
+    const FaultInfo& info = it->second;
+
+    std::ostringstream oss;
+    oss << code << " " << info.name;
+    if (info.detail && info.detail[0] != '\0') oss << ": " << info.detail;
+    if (info.hint   && info.hint[0]   != '\0') oss << " [" << info.hint << "]";
+    return oss.str();
+}
+
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
@@ -203,6 +268,8 @@ int16_t turns_to_int16(double turns)  { return saturate_to_i16(static_cast<long 
 double  int16_to_turns(int16_t val)   { return val * 0.0001; }
 int16_t rps_to_int16(double rps)      { return saturate_to_i16(static_cast<long long>(rps  / 0.00025)); }
 double  int16_to_rps(int16_t val)     { return val * 0.00025; }
+int16_t rpss_to_int16(double rpss)    { return saturate_to_i16(static_cast<long long>(rpss / 0.001)); }
+double  int16_to_rpss(int16_t val)    { return val * 0.001; }
 int16_t rad_to_int16(double rad)      { return turns_to_int16(rad / (2.0 * kPi)); }
 double  int16_to_rad(int16_t val)     { return int16_to_turns(val) * 2.0 * kPi; }
 int16_t rad_s_to_int16(double rad_s)  { return rps_to_int16(rad_s / (2.0 * kPi)); }
@@ -416,6 +483,53 @@ std::vector<uint8_t> build_many_pos_vel_tqe_int16(const std::vector<int16_t>& po
     return data;
 }
 
+// ---------------------------------------------------------------------------
+//  一拖多梯形 (MODE_POS_VEL_ACC 0xAD -> CAN ID 0x80AD)
+//
+//  帧结构和上面的 pos_vel_tqe 版本完全同构 (每电机 6 字节 + 尾部 [0x17,0x01]),
+//  区别只在第三个字段的语义: 那边是力矩上限, 这边是加速度限制。
+//
+//  语义上的区别更要紧: pos_vel_tqe 要主机按控制周期不停喂中间点位, 而这条通道
+//  是"发一次, 电机固件自己跑完梯形速度曲线", 主机卡顿时电机照样把这段路走完。
+//
+//  ★ 未用槽位的填法和 build_many_pos_vel_tqe_int16 **不一样**: 这里按官方
+//    serial_struct.h 填 pos=NAN_INT16 / vel=0 / acc=0, 而那边三个字段全填
+//    NAN_INT16。老函数的填法是既成事实 (已跑通, 不动它), 新函数按官方来。
+//    调用方负责按这个约定填数组, 本函数不代填。
+// ---------------------------------------------------------------------------
+std::vector<uint8_t> build_many_pos_vel_acc_int16(const std::vector<int16_t>& pos_arr,
+                                                  const std::vector<int16_t>& vel_arr,
+                                                  const std::vector<int16_t>& acc_arr) {
+    if (pos_arr.size() != vel_arr.size() || pos_arr.size() != acc_arr.size()) {
+        throw std::invalid_argument("build_many_pos_vel_acc_int16: pos/vel/acc size mismatch");
+    }
+    const std::size_t n = pos_arr.size();
+
+    std::vector<uint8_t> data;
+    data.reserve(n * 6 + 16);
+    for (std::size_t i = 0; i < n; ++i) {
+        push_le_i16(data, pos_arr[i]);
+        push_le_i16(data, vel_arr[i]);
+        push_le_i16(data, acc_arr[i]);
+    }
+
+    const std::size_t need = data.size() + 2;
+    // 每电机 6 字节, CAN-FD 数据段最大 64 字节 => 一帧最多 10 个电机 (10*6+2=62)
+    if (need > 64) {
+        throw std::invalid_argument(
+            "build_many_pos_vel_acc_int16: frame > 64 bytes "
+            "(一拖多 pos/vel/acc 单帧最多 10 个电机; 减少 max_motor_id / 槽位数)");
+    }
+    std::size_t target = 64;
+    for (std::size_t s : CANFD_DLC_SIZES) {
+        if (s >= need) { target = s; break; }
+    }
+    data.insert(data.end(), target - need, PADDING);
+    data.push_back(0x17);
+    data.push_back(0x01);
+    return data;
+}
+
 std::vector<uint8_t> build_many_pos_vel_tqe_kp_kd_int16(
         const std::vector<int16_t>& pos_arr,
         const std::vector<int16_t>& vel_arr,
@@ -493,6 +607,88 @@ std::vector<uint8_t> build_set_timeout_int16(int16_t timeout_ms) {
     std::vector<uint8_t> p = {0x05, 0x1f};
     push_le_i16(p, timeout_ms);
     return p;
+}
+
+// cmd 编码 (与 parse_motor_state_int16 一致):
+//   高 4 位 = 操作 (0=写, 1=读, 2=回复)
+//   中 2 位 = 类型 (0=int8, 1=int16, 2=int32, 3=float)
+//   低 2 位 = 个数 (0=变长, 下一字节给个数; 1/2/3=模式一)
+// 读 int16 的基值是 0x14.
+std::vector<uint8_t> build_read_int16(uint8_t addr, uint8_t count) {
+    if (count < 1 || count > 32) {
+        throw std::invalid_argument(
+            "build_read_int16: count 必须在 1..32");
+    }
+    if (count <= 3) {
+        return {static_cast<uint8_t>(0x14 | count), addr};
+    }
+    return {0x14, count, addr};
+}
+
+std::map<int, int16_t> parse_int16_registers(const std::vector<uint8_t>& can_data) {
+    std::map<int, int16_t> out;
+    if (can_data.size() < 2) return out;
+
+    std::size_t offset = 0;
+    while (offset < can_data.size()) {
+        if (can_data[offset] == PADDING) {
+            ++offset;
+            continue;
+        }
+        const uint8_t cmd = can_data[offset];
+        const uint8_t op    = (cmd >> 4) & 0x0F;
+        const uint8_t dtype = (cmd >> 2) & 0x03;
+        const uint8_t count =  cmd       & 0x03;
+        if (op != 2) break;
+        ++offset;
+        if (offset >= can_data.size()) break;
+
+        const std::size_t type_size_arr[4] = {1, 2, 4, 4};
+        const std::size_t type_size = type_size_arr[dtype];
+        uint8_t num = count;
+        uint8_t addr = 0;
+        if (count == 0) {
+            if (offset >= can_data.size()) break;
+            num = can_data[offset++];
+            if (offset >= can_data.size()) break;
+            addr = can_data[offset++];
+        } else {
+            addr = can_data[offset++];
+        }
+
+        for (uint8_t i = 0; i < num; ++i) {
+            if (offset + type_size > can_data.size()) break;
+            if (dtype == 1) {
+                out[static_cast<int>(addr) + i] = read_le_i16(can_data, offset);
+            } else {
+                offset += type_size;
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<uint8_t> build_diagnostic_write(const std::string& text) {
+    if (text.size() > 60) {
+        throw std::invalid_argument("build_diagnostic_write: text > 60 bytes");
+    }
+    std::vector<uint8_t> p = {0x40, 0x01, static_cast<uint8_t>(text.size())};
+    p.insert(p.end(), text.begin(), text.end());
+    return canfd_pad(p);
+}
+
+std::vector<uint8_t> build_diagnostic_read(uint8_t max_bytes) {
+    if (max_bytes < 1) max_bytes = 1;
+    return canfd_pad({0x41, 0x01, max_bytes});
+}
+
+std::optional<std::string> parse_diagnostic_text(const std::vector<uint8_t>& can_data) {
+    if (can_data.size() < 3) return std::nullopt;
+    if (can_data[0] != 0x41 && can_data[0] != 0x40) return std::nullopt;
+    std::size_t n = can_data[2];
+    if (can_data.size() < 3 + n) n = can_data.size() - 3;
+    if (n == 0) return std::string{};
+    return std::string(can_data.begin() + 3, can_data.begin() + 3 + static_cast<std::ptrdiff_t>(n));
 }
 
 // ---------------------------------------------------------------------------

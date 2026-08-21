@@ -6,9 +6,12 @@
 //
 //  覆盖的 C++ 接口:
 //    - 枚举: PosUnit, CanFault
-//    - 结构体: MotorState, CanStatus, PortInfo, Stats, RobotConfig, ManyMotorCmd
+//    - 结构体: MotorState, CanStatus, PortInfo, Stats, RobotConfig, ManyMotorCmd,
+//              FaultInfo
 //    - 自由函数: list_serial_ports, find_likely_debug_boards,
-//                to_turns / from_turns, parse_motor_state_int16
+//                to_turns / from_turns, parse_motor_state_int16, describe_fault,
+//                build_many_pos_vel_acc_int16
+//    - 数据表: TORQUE_COEFF, FAULT_TABLE (唯一真源在 C++, Python 侧只读)
 //    - 类 HightorqueSerial: 全部 public 方法 (含 set_motor_mode / run_control_loop)
 // =============================================================================
 
@@ -178,6 +181,72 @@ PYBIND11_MODULE(fafu_motor, m) {
     // 力矩系数表 (唯一真源在 src/hightorque_protocol.cpp). Python 侧不要再抄一份字面量,
     // 直接读这个属性 —— 两份表漂移过一次, 后果是力矩差 100 倍.
     m.attr("TORQUE_COEFF") = TORQUE_COEFF;
+
+    // ----------------------------------------------------------------------
+    //  故障码表 (厂商表3). 同样是唯一真源在 C++, Python 侧只读不抄.
+    //  FaultInfo 的三个字段是 const char*, 用 def_property_readonly 显式转成
+    //  std::string, 让 pybind11 走 UTF-8 解码 (def_readonly 对 const char*
+    //  的处理不如这样明确).
+    // ----------------------------------------------------------------------
+    py::class_<FaultInfo>(m, "FaultInfo", "厂商表3 的一条故障码说明")
+        .def_property_readonly("name",   [](const FaultInfo& f) { return std::string(f.name); },
+                               "表3「名称」列原文")
+        .def_property_readonly("detail", [](const FaultInfo& f) { return std::string(f.detail); },
+                               "表3「说明」列原文; 厂商没写就是空串")
+        .def_property_readonly("hint",   [](const FaultInfo& f) { return std::string(f.hint); },
+                               "本项目补充的排查建议; 无据可依时为空串")
+        .def("__repr__", [](const FaultInfo& f) {
+            return std::string("FaultInfo(name='") + f.name + "')";
+        });
+
+    m.attr("FAULT_TABLE") = FAULT_TABLE;
+    m.def("describe_fault", &describe_fault, py::arg("code"),
+          "把故障码翻成人话; 表外的码返回「未定义故障码 N (厂商表3 未收录)」");
+
+    // ----------------------------------------------------------------------
+    //  一拖多 CAN ID 常量 + 梯形帧构建
+    //
+    //  build_many_pos_vel_acc_int16 导出成 bytes 是为了让 offline_checks.py 能
+    //  在没有硬件的情况下把帧结构钉住 (长度/尾部/填充/未用槽位约定). 这是协议层
+    //  导出的一个最小子集, 不是全量导出.
+    // ----------------------------------------------------------------------
+    m.attr("GROUP_CAN_ID_POS_VEL_TQE")      = group_can_id::kPosVelTqe;
+    m.attr("GROUP_CAN_ID_POS_VEL_ACC")      = group_can_id::kPosVelAcc;
+    m.attr("GROUP_CAN_ID_MIT_LEGACY")       = group_can_id::kMitLegacy;
+    m.attr("GROUP_CAN_ID_MIT_RECOMMENDED")  = group_can_id::kMitRecommended;
+
+    m.def("build_many_pos_vel_acc_int16",
+          [](const std::vector<int16_t>& pos_arr,
+             const std::vector<int16_t>& vel_arr,
+             const std::vector<int16_t>& acc_arr) {
+              const auto data = build_many_pos_vel_acc_int16(pos_arr, vel_arr, acc_arr);
+              return py::bytes(reinterpret_cast<const char*>(data.data()), data.size());
+          },
+          py::arg("pos_arr"), py::arg("vel_arr"), py::arg("acc_arr"),
+          "构建一拖多梯形帧 (0x80AD) 的 payload; 每电机 6 字节, 单帧最多 10 个电机");
+
+    m.def("build_read_int16",
+          [](int addr, int count) {
+              const auto data = build_read_int16(
+                  static_cast<uint8_t>(addr), static_cast<uint8_t>(count));
+              return py::bytes(reinterpret_cast<const char*>(data.data()), data.size());
+          },
+          py::arg("addr"), py::arg("count"),
+          "构建读连续 int16 寄存器的子帧 (脱机可测)");
+    m.def("parse_int16_registers",
+          [](py::buffer buf) {
+              const py::buffer_info info = buf.request();
+              const auto* p = static_cast<const uint8_t*>(info.ptr);
+              const auto n = static_cast<std::size_t>(info.size);
+              std::vector<uint8_t> can_data(p, p + n);
+              std::map<int, int> out;
+              for (const auto& [k, v] : parse_int16_registers(can_data)) {
+                  out[k] = static_cast<int>(v);
+              }
+              return out;
+          },
+          py::arg("can_data"),
+          "从电机回包抽出 int16 寄存器 {地址: raw}");
 
     // ----------------------------------------------------------------------
     //  RobotConfig
@@ -464,6 +533,15 @@ PYBIND11_MODULE(fafu_motor, m) {
              py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.05,
              py::call_guard<py::gil_scoped_release>())
 
+        // 一拖多梯形 (0x80AD): 发一次, 电机固件自己跑完梯形速度曲线, 不需要主机
+        // 按控制周期喂中间点位. vel_max/acc 单位随 pos_unit (turns/s, turns/s²).
+        .def("set_many_pos_vel_acc", &HightorqueSerial::set_many_pos_vel_acc,
+             py::arg("motor_ids"), py::arg("pos"), py::arg("vel_max_rps"),
+             py::arg("acc_rpss"),
+             py::arg("pos_unit") = PosUnit::Turns,
+             py::arg("max_motor_id") = 0, py::arg("timeout_s") = 0.05,
+             py::call_guard<py::gil_scoped_release>())
+
         .def("set_torque",  &HightorqueSerial::set_torque,
              py::arg("motor_id"), py::arg("tqe_nm"), py::arg("motor_model") = "",
              py::call_guard<py::gil_scoped_release>())
@@ -492,6 +570,25 @@ PYBIND11_MODULE(fafu_motor, m) {
         .def("set_timeout", &HightorqueSerial::set_timeout,
              py::arg("motor_id"), py::arg("timeout_ms"),
              py::call_guard<py::gil_scoped_release>())
+        .def("read_registers_int16",
+             [](HightorqueSerial& self, int motor_id, int addr, int count,
+                double timeout_s) {
+                 auto raw = self.read_registers_int16(
+                     motor_id, static_cast<uint8_t>(addr),
+                     static_cast<uint8_t>(count), timeout_s);
+                 std::map<int, int> out;
+                 for (const auto& [k, v] : raw) out[k] = static_cast<int>(v);
+                 return out;
+             },
+             py::arg("motor_id"), py::arg("addr"), py::arg("count"),
+             py::arg("timeout_s") = 0.3,
+             py::call_guard<py::gil_scoped_release>(),
+             "同步读连续 int16 寄存器; 需要 async_rx=False")
+        .def("diagnostic_query", &HightorqueSerial::diagnostic_query,
+             py::arg("motor_id"), py::arg("command"),
+             py::arg("timeout_s") = 0.8,
+             py::call_guard<py::gil_scoped_release>(),
+             "同步发 moteus 诊断文本; 需要 async_rx=False")
 
         // 固定频率控制环 (内部 steady_clock 定时 + 可选 HighResolutionTimer).
         // on_tick(tick, dt_ms) 返回 False 则正常结束. abort_check 可选, 返回 True 则紧急退出.
@@ -550,5 +647,11 @@ PYBIND11_MODULE(fafu_motor, m) {
         .def("is_polling",          &HightorqueSerial::is_polling)
         .def("get_cached_state",    &HightorqueSerial::get_cached_state, py::arg("motor_id"))
         .def("state_age_ms",        &HightorqueSerial::state_age_ms, py::arg("motor_id"),
-             "该电机缓存状态距今多少 ms; 从未收到过返回 -1 (逐关节掉线判据)");
+             "该电机缓存状态距今多少 ms; 从未收到过返回 -1 (逐关节掉线判据)")
+
+        .def("set_group_mit_can_id", &HightorqueSerial::set_group_mit_can_id,
+             py::arg("can_id"),
+             "切换一拖多 MIT 通道; 默认 0x8093, 厂商推荐的等价通道是 0x80B0")
+        .def("group_mit_can_id",     &HightorqueSerial::group_mit_can_id,
+             "当前一拖多 MIT 通道的 CAN ID");
 }

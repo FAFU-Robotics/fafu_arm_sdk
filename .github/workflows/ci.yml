@@ -39,7 +39,8 @@ jobs:
       # 目前 CMake 里没有注册任何 ctest 用例, 所以没有 "Run native tests" 步骤。
       # 等 hightorque_protocol 的 golden test 落地后再加回来。
 
-      # 不需要硬件的检查: 导出面是否齐全、力矩系数有没有漂、robot.cfg 能不能解析。
+      # 不需要硬件的检查: 导出面是否齐全、力矩系数有没有漂、robot.cfg 能不能解析、
+      # 故障表是否照厂商表3 收全、一拖多梯形帧结构对不对。
       # 本地也可以直接跑: python fafu_robot_python/tests/offline_checks.py
       - name: Hardware-free checks
         run: python fafu_robot_python/tests/offline_checks.py

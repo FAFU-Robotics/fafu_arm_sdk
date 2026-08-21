@@ -126,13 +126,26 @@ arm.close_connection(joint_release="stop",
 
 ```python
 arm.move_j([j1, j2, ..., jn], is_radians=True,
-           speed=50, block=True, tolerance=0.01)
+           speed=50, block=True, tolerance=0.01,
+           style="acc")      # "acc" (默认) / "scurve" / "linear"
 arm.go_home(speed=20)
 arm.move_jntspace_path(path, speed=50)            # 需要 wrs (TOPPRA)
 arm.get_joint_values()                            # → numpy array, 弧度
 arm.get_joint_velocities()                        # → numpy array, rad/s
 arm.get_motor_states()                            # → dict[int, MotorState]
 ```
+
+`style` 怎么选（实测 6 位姿 × 3 遍 @ speed 40%，编码器量化 0.036°）：
+
+| style | 平均 \|误差\| | 说明 |
+|---|---|---|
+| `acc`（默认） | 0.031° | 单帧交给固件跑梯形，主机卡顿也不会断在半路。日常点到点用它 |
+| `linear` | 0.022° | 持续重发最终目标直到到位。专门用于 servo/MIT 会话后把下垂的臂**顶回目标** |
+| `scurve` | 0.235° | 起停最柔和，带负载或在意冲击时选它；代价是收尾会冻在约 0.4° 的滞后上 |
+
+`acc` 和 `linear` 都在一个编码器格以内，精度上分不出高下。`acc` / `linear` 会轮询到位，
+所以**务必**在构造时声明夹爪（`has_gripper` / `gripper_motor_id`），否则夹爪会被当成关节，
+永远进不了容差，每次运动都耗满 `timeout`。
 
 ### servoJ（在线流式控制，100~200Hz）
 
