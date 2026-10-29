@@ -64,13 +64,13 @@ fafu_robot_cpp/
 构建产物 (Release):
 
 ```
-build/bin/Release/fafu_motor.cpXY-win_amd64.pyd     ← 自动 copy 到 ../fafu_robot_python/
-build/bin/Release/serial_cmake.dll                       ← 自动 copy 到 ../fafu_robot_python/
-build/sdk/Release/fafu_robot_sdk.lib                     ← 原生 C++ SDK 静态库
-build/bin/Release/01_smoke.exe                           ← 已带 robot.cfg + serial_cmake.dll
-build/bin/Release/02_move_j.exe                          ← 已带 robot.cfg + serial_cmake.dll
-build/bin/Release/03_gripper.exe                         ← 已带 robot.cfg + serial_cmake.dll
-build/bin/Release/04_servo_j.exe                         ← 已带 robot.cfg + serial_cmake.dll
+build-cpXY/bin/Release/fafu_motor.cpXY-win_amd64.pyd     ← 自动 copy 到 ../fafu_robot_python/
+build-cpXY/bin/Release/serial_cmake.dll                       ← 自动 copy 到 ../fafu_robot_python/
+build-cpXY/sdk/Release/fafu_robot_sdk.lib                     ← 原生 C++ SDK 静态库
+build-cpXY/bin/Release/01_smoke.exe                           ← 已带 robot.cfg + serial_cmake.dll
+build-cpXY/bin/Release/02_move_j.exe                          ← 已带 robot.cfg + serial_cmake.dll
+build-cpXY/bin/Release/03_gripper.exe                         ← 已带 robot.cfg + serial_cmake.dll
+build-cpXY/bin/Release/04_servo_j.exe                         ← 已带 robot.cfg + serial_cmake.dll
 ```
 
 Python 侧不用配置 PYTHONPATH, 直接
@@ -87,8 +87,8 @@ Python 侧不用配置 PYTHONPATH, 直接
 |---|---|---|
 | CMake | 3.18+ | `cmake --version` |
 | Visual Studio | 2019 / 2022 | 含 "C++ 桌面开发" workload (Windows) |
-| Python | 3.7+ | 装在哪个环境, `.pyd` 就给哪个 ABI 编 |
-| pybind11 | `pip install pybind11` | `build.bat` 会自动找它的 cmake_dir |
+| Python | 3.8+（测试 3.10 / 3.12） | 装在哪个环境, `.pyd` 就给哪个 ABI 编 |
+| pybind11 | `python -m pip install "pybind11>=2.12"` | `build.bat` 会自动找它的 cmake_dir |
 
 > **不需要任何外部仓库**. 所有源码已 vendor 到本目录.
 
@@ -100,6 +100,7 @@ Python 侧不用配置 PYTHONPATH, 直接
 cd fafu_robot_sdk\fafu_robot_cpp
 build.bat           REM Release (推荐)
 build.bat Debug     REM Debug
+build.bat Release "C:\path to\Python312\python.exe"  REM 指定 Python 3.12
 ```
 
 成功后会自动:
@@ -145,6 +146,7 @@ bash linux/build.sh                 # 编 fafu_motor.so + 静态库 + 4 个例�
 
 | 参数 | 默认值 | 含义 |
 |---|---|---|
+| `-DPython3_EXECUTABLE=<python>` | 当前环境 | 指定 Python 解释器及对应开发文件 |
 | `-Dpybind11_DIR=<cmake_dir>` | 由 build.bat 自动定位 | pybind11 cmake 配置目录 |
 | `-DFAFU_ROBOT_PYTHON_DIR=<path>` | `../fafu_robot_python` | 产物 (.pyd + dll) 复制目标 |
 | `-DCMAKE_BUILD_TYPE=Debug` | `Release` | 调试构建 |
@@ -166,7 +168,9 @@ pip install pybind11
 .\build.bat
 ```
 
-`build.bat` 会用 *当前激活的 Python* 重新编一份, 输出名就是该环境的 ABI tag.
+`build.bat` 调用 `build.ps1`，默认使用 *当前激活的 Python*，也可通过第二个参数指定解释器。
+构建目录按 ABI 分开（如 `build-cp310` / `build-cp312`），产物名包含相应的 ABI tag。
+CMake 使用 `FindPython3` 同时选择解释器、头文件和开发库，支持 Python 3.12 与 CMake 4。
 
 ---
 

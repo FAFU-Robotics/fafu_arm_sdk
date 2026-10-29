@@ -35,6 +35,8 @@ option(FAFU_BUILD_SDK_EXAMPLES     "Build sdk/examples/*.exe"                   
 set(CMAKE_CXX_STANDARD          17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS        OFF)
+# fafu_motor is a shared module; static helpers must be PIC on Linux.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if(MSVC)
     add_compile_options(/utf-8 /W3 /bigobj)
@@ -52,7 +54,15 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 #  pybind11 (仅当 FAFU_BUILD_PYBIND11_MODULE=ON 才需要)
 # -----------------------------------------------------------------------------
 if(FAFU_BUILD_PYBIND11_MODULE)
-    find_package(pybind11 CONFIG REQUIRED)
+    # Use FindPython3 instead of the removed FindPythonInterp/FindPythonLibs
+    # modules. Select the interpreter before pybind11 so headers, import library
+    # and extension suffix all belong to the same Python (including 3.12).
+    if(DEFINED PYTHON_EXECUTABLE AND NOT DEFINED Python3_EXECUTABLE)
+        set(Python3_EXECUTABLE "${PYTHON_EXECUTABLE}")
+    endif()
+    set(PYBIND11_FINDPYTHON ON)
+    find_package(Python3 3.8 REQUIRED COMPONENTS Interpreter Development.Module)
+    find_package(pybind11 2.12 CONFIG REQUIRED)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -142,7 +152,7 @@ message(STATUS "   FAFU_BUILD_NATIVE_SDK      = ${FAFU_BUILD_NATIVE_SDK}")
 message(STATUS "   FAFU_BUILD_SDK_EXAMPLES    = ${FAFU_BUILD_SDK_EXAMPLES}")
 if(FAFU_BUILD_PYBIND11_MODULE)
     message(STATUS "   pybind11_DIR               = ${pybind11_DIR}")
-    message(STATUS "   Python                     = ${PYTHON_EXECUTABLE} (${PYTHON_VERSION_STRING})")
+    message(STATUS "   Python                     = ${Python3_EXECUTABLE} (${Python3_VERSION})")
     message(STATUS "   FAFU_ROBOT_PYTHON_DIR      = ${FAFU_ROBOT_PYTHON_DIR}")
 endif()
 message(STATUS "   Vendored serial_cmake      = ${_SERIAL_CMAKE_DIR}")

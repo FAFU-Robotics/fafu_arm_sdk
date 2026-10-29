@@ -68,6 +68,7 @@ pip install -r requirements.txt
 # 2. 确认 fafu_motor.cpXX-win_amd64.pyd 的 ABI 与你的 Python 匹配
 python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"
 # 输出 cp310 → 用 fafu_motor.cp310-win_amd64.pyd
+# 输出 cp312 → 用 fafu_motor.cp312-win_amd64.pyd
 # 输出 cp38  → 进 fafu_robot_cpp/ 用 cp38 环境重 build 一份
 
 # 3. 跑烟雾测试 (不需要连机器人)
@@ -271,7 +272,7 @@ arm.emergency_stop() / arm.resume()
 | 现象 | 处理 |
 |---|---|
 | `ImportError: DLL load failed`（导入 `fafu_motor` 时） | 看 `serial_cmake.dll` 是否在本目录；装 VC++ 2015-2022 Redistributable |
-| `ModuleNotFoundError: fafu_motor` | `.pyd` 不在本目录，或 ABI tag (cp310 / cp38) 与当前 Python 不匹配；去 `../fafu_robot_cpp/` 重 build |
+| `ModuleNotFoundError: fafu_motor` | `.pyd` 不在本目录，或 ABI tag (cp310 / cp312 等) 与当前 Python 不匹配；去 `../fafu_robot_cpp/` 重 build |
 | 连接失败 / 串口打开失败 | `robot.cfg` 里 `port = auto`，或显式写 `COMxx`；端口被其它程序占着也会失败 |
 | 所有电机 `mode 0 / fault ≠ 0` | 调试板→电机的 CAN 没通：检查 24V / 终端电阻 / `motor_ids` 是否对得上 |
 | 夹爪不响应 | 确认构造时传了 `has_gripper=True, gripper_motor_id=N`，且 N 在 `cfg.motor_ids` 列表里 |

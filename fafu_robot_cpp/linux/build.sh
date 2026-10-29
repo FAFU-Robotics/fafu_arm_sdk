@@ -108,10 +108,16 @@ if [ "$NO_PYTHON" -eq 0 ]; then
         fi
     fi
 
-    if ! command -v "$PY_EXE" >/dev/null 2>&1; then
+    if [ -x "$PY_EXE" ]; then
+        PY_ABS="$PY_EXE"
+    else
+        PY_ABS="$(command -v "$PY_EXE" || true)"
+    fi
+    if [ -z "$PY_ABS" ] || [ ! -x "$PY_ABS" ]; then
         echo "[build] 错误: $PY_EXE 没装. 装它, 或者用 --no-python." >&2
         exit 1
     fi
+    PY_EXE="$PY_ABS"
 
     # PYBIND11_DIR 没定时, 从 Python 里问
     if [ -z "$PYBIND11_DIR" ]; then
@@ -124,11 +130,33 @@ if [ "$NO_PYTHON" -eq 0 ]; then
         PYBIND11_DIR=$("$PY_EXE" -c "import pybind11; print(pybind11.get_cmake_dir())")
     fi
 
+    PY_ROOT="$(cd "$(dirname "$PY_EXE")/.." && pwd)"
+    PY_LIB="$(ls "$PY_ROOT"/lib/libpython3*.so 2>/dev/null | head -n1 || true)"
+    PY_INC=""
+    for d in "$PY_ROOT"/include/python3*; do
+        if [ -d "$d" ]; then
+            PY_INC="$d"
+            break
+        fi
+    done
     CMAKE_ARGS+=(
-        "-DPython3_EXECUTABLE=$(command -v "$PY_EXE")"
-        "-DPYTHON_EXECUTABLE=$(command -v "$PY_EXE")"
+        "-DPython3_EXECUTABLE=$PY_EXE"
+        "-DPython3_ROOT_DIR=$PY_ROOT"
+        "-DPYTHON_EXECUTABLE=$PY_EXE"
         "-Dpybind11_DIR=$PYBIND11_DIR"
+        "-DCMAKE_BUILD_RPATH=${PY_ROOT}/lib"
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"
     )
+    if [ -n "$PY_LIB" ]; then
+        CMAKE_ARGS+=("-DPython3_LIBRARY=$PY_LIB")
+        echo "  Python lib:    $PY_LIB"
+    fi
+    if [ -n "$PY_INC" ]; then
+        CMAKE_ARGS+=("-DPython3_INCLUDE_DIR=$PY_INC")
+        echo "  Python inc:    $PY_INC"
+    fi
+    export LIBRARY_PATH="${PY_ROOT}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+    export LD_LIBRARY_PATH="${PY_ROOT}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
 echo "============================================================"

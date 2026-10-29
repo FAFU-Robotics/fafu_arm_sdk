@@ -51,7 +51,9 @@ fafu_robot_sdk/
 
 ### 情况 A — `.pyd` 已经在 `fafu_robot_python/` 里 (大多数用户)
 
-仓库里已经带好了 `fafu_motor.cp310-win_amd64.pyd`，只要你的 Python 是 cp310：
+Windows x64 提供 Python 3.10 / 3.12 扩展，分别为
+`fafu_motor.cp310-win_amd64.pyd` / `fafu_motor.cp312-win_amd64.pyd`。
+Python 会自动选择与当前解释器 ABI 匹配的文件；两个版本可以共存：
 
 ```bash
 cd fafu_robot_sdk/fafu_robot_python
@@ -76,13 +78,16 @@ with FafuRobotController(cfg_path="robot.cfg",
 ### 情况 B — 需要重新构建 `.pyd` (换了 Python 版本 / 改了 bindings.cpp)
 
 ```bat
-REM 前置: 装 VS2022 + CMake 3.18+ + pybind11
+REM 前置: 装 VS2022 C++ 工具 + CMake 3.18+ + pybind11 >= 2.12
 cd fafu_robot_sdk\fafu_robot_cpp
 .\build.bat
+REM 或指定目标 Python（路径可包含空格）
+.\build.bat Release "C:\path to\Python312\python.exe"
 ```
 
-`build.bat` 会自动把新的 `.pyd` 拷到 `..\fafu_robot_python\` 下，
-然后跑一次 import 验证。
+`build.bat` 调用 `build.ps1`，为目标解释器使用独立的 `build-cp310` /
+`build-cp312` 目录，避免不同 Python 的 CMake 缓存混用。它会自动把新的 `.pyd`
+拷到 `..\fafu_robot_python\` 下，并验证底层扩展和高层控制器的导入。
 
 构建完后再走 **情况 A** 的步骤。
 
